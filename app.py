@@ -1,9 +1,6 @@
 # moodsync/app.py
 
-# --- 1. NO MONKEY PATCHING NEEDED AT THE TOP ---
-# We are switching from eventlet to gevent, which has a different structure.
-
-# --- 2. STANDARD LIBRARY IMPORTS ---
+# --- 1. IMPORTS (gevent compatible) ---
 import os
 import base64
 import random
@@ -11,55 +8,62 @@ import string
 import logging
 import time
 from logging.handlers import RotatingFileHandler
-
-# --- 3. THIRD-PARTY LIBRARY IMPORTS ---
 import requests
 from flask import Flask, render_template, request, redirect, url_for
-# We will use gevent as our async_mode
-from flask_socketio import SocketIO, join_room, leave_room, emit, rooms as f_rooms
+from flask_socketio import SocketIO, join_room, leave_room, emit
 from dotenv import load_dotenv
 from googleapiclient.discovery import build
 
-# --- 4. APP INITIALIZATION ---
+# --- 2. APP INITIALIZATION ---
 load_dotenv()
-
 app = Flask(__name__)
 app.secret_key = os.urandom(24)
-# Initialize SocketIO with gevent
 socketio = SocketIO(app, async_mode='gevent')
 
-# --- 5. GLOBAL STATE & CONFIG ---
+# --- 3. GLOBAL STATE & CONFIG ---
 rooms = {}
 class MoodSyncAPIError(Exception): pass
 class PlaylistGenerationError(Exception): pass
 
-# --- 6. HELPER FUNCTIONS ---
+# --- 4. HELPER FUNCTIONS ---
 def setup_logging():
     if not os.path.exists('logs'): os.mkdir('logs')
-    # FIX: Specify UTF-8 encoding to handle all characters
     file_handler = RotatingFileHandler('logs/moodsync.log', maxBytes=1024000, backupCount=5, encoding='utf-8')
     file_handler.setFormatter(logging.Formatter('%(asctime)s %(levelname)s: %(message)s [in %(pathname)s:%(lineno)d]'))
     if not app.debug or os.environ.get('WERKZEUG_RUN_MAIN') == 'true':
         app.logger.addHandler(file_handler)
         app.logger.setLevel(logging.INFO)
 
-# (get_spotify_token and get_youtube_video_id are unchanged from the last correct version)
+# --- THIS IS THE CRITICAL FIX ---
 def get_spotify_token():
+    """Gets Spotify token with robust error handling and proof-of-life logging."""
+    client_id = os.getenv('SPOTIFY_CLIENT_ID')
+    client_secret = os.getenv('SPOTIFY_CLIENT_SECRET')
+
+    # Add logging to prove if the keys are found
+    if not client_id or not client_secret:
+        app.logger.critical("CRITICAL FAILURE: SPOTIFY_CLIENT_ID or SPOTIFY_CLIENT_SECRET not found in Render environment variables.")
+        return None  # Return None instead of raising an error to prevent recursion
+
+    app.logger.info("SUCCESS: Spotify credentials found in environment. Requesting token...")
+
     try:
-        client_id = os.getenv('SPOTIFY_CLIENT_ID')
-        client_secret = os.getenv('SPOTIFY_CLIENT_SECRET')
-        if not client_id or not client_secret: raise MoodSyncAPIError("Spotify credentials not found")
         url = "https://accounts.spotify.com/api/token"
         headers = {"Authorization": "Basic " + base64.b64encode(f"{client_id}:{client_secret}".encode()).decode()}
         data = {"grant_type": "client_credentials"}
         response = requests.post(url, headers=headers, data=data)
         response.raise_for_status()
+        app.logger.info("SUCCESS: Spotify token received.")
         return response.json()['access_token']
+    except requests.exceptions.RequestException as e:
+        app.logger.error(f"Network error while getting Spotify token: {e}")
+        return None # Return None on network failure
     except Exception as e:
-        app.logger.error(f"Spotify token error: {e}")
-        raise MoodSyncAPIError("Failed to get Spotify token")
+        app.logger.error(f"An unexpected error occurred in get_spotify_token: {e}")
+        return None
 
 def get_youtube_video_id(song_name, artist_name):
+    # This function is fine, no changes needed
     youtube_api_key = os.getenv('YOUTUBE_API_KEY')
     if not youtube_api_key: return None
     try:
@@ -73,40 +77,37 @@ def get_youtube_video_id(song_name, artist_name):
     return None
 
 def generate_playlist(mood):
-    try:
-        token = get_spotify_token()
-        mood_genres = {
-            'happy': ['pop', 'dance', 'funk', 'summer', 'happy'],
-            'sad': ['acoustic', 'sad', 'indie', 'lo-fi', 'ambient'],
-            'energetic': ['rock', 'electronic', 'hip-hop', 'metal', 'workout']
-        }
-        selected_genres = random.sample(mood_genres.get(mood, ['pop']), k=min(3, len(mood_genres.get(mood, ['pop']))))
-        playlist = []
-        for genre in selected_genres:
-            if len(playlist) >= 10: break
-            params = {"q": f"genre:{genre}", "type": "track", "limit": 15}
-            headers = {"Authorization": f"Bearer {token}"}
-            response = requests.get("https://api.spotify.com/v1/search", headers=headers, params=params)
-            if response.status_code == 200:
-                tracks = response.json().get('tracks', {}).get('items', [])
-                for track in tracks:
-                    if len(playlist) >= 10: break
-                    song_name = track.get('name')
-                    artist_name = track.get('artists', [{}])[0].get('name')
-                    if not song_name or not artist_name: continue
-                    video_id = get_youtube_video_id(song_name, artist_name)
-                    if video_id:
-                        playlist.append({
-                            'name': song_name, 'artist': artist_name,
-                            'albumArt': track.get('album', {}).get('images', [{}])[0].get('url') if track.get('album', {}).get('images') else None,
-                            'youtubeId': video_id
-                        })
-        return playlist[:10]
-    except Exception as e:
-        app.logger.error(f"Playlist generation failed: {e}")
-        raise PlaylistGenerationError("Could not generate playlist from Spotify.")
+    # This function is now more robust
+    token = get_spotify_token()
+    if not token:
+        # This will now be the primary failure point if keys are missing
+        raise PlaylistGenerationError("Could not get Spotify token. Please check Render environment variables.")
 
-# --- 7. FLASK ROUTES ---
+    mood_genres = {
+        'happy': ['pop', 'dance', 'funk', 'summer', 'happy'],
+        'sad': ['acoustic', 'sad', 'indie', 'lo-fi', 'ambient'],
+        'energetic': ['rock', 'electronic', 'hip-hop', 'metal', 'workout']
+    }
+    # ... rest of the function is the same ...
+    selected_genres = random.sample(mood_genres.get(mood, ['pop']), k=min(3, len(mood_genres.get(mood, ['pop']))))
+    playlist = []
+    for genre in selected_genres:
+        if len(playlist) >= 10: break
+        params = {"q": f"genre:{genre}", "type": "track", "limit": 15}
+        headers = {"Authorization": f"Bearer {token}"}
+        response = requests.get("https://api.spotify.com/v1/search", headers=headers, params=params)
+        if response.status_code == 200:
+            tracks = response.json().get('tracks', {}).get('items', [])
+            for track in tracks:
+                if len(playlist) >= 10: break
+                song_name, artist_name = track.get('name'), track.get('artists', [{}])[0].get('name')
+                if not song_name or not artist_name: continue
+                video_id = get_youtube_video_id(song_name, artist_name)
+                if video_id:
+                    playlist.append({'name': song_name, 'artist': artist_name, 'albumArt': track.get('album', {}).get('images', [{}])[0].get('url'),'youtubeId': video_id})
+    return playlist[:10]
+
+# --- 5. FLASK ROUTES ---
 @app.route('/')
 def home():
     return render_template('index.html')
@@ -117,7 +118,8 @@ def generate_route():
         mood = request.form['mood']
         playlist = generate_playlist(mood)
         if not playlist:
-            raise PlaylistGenerationError("Failed to generate any playable tracks.")
+            raise PlaylistGenerationError("Failed to generate any playable tracks after searching Spotify and YouTube.")
+        
         playlist_title = f"{mood.capitalize()} Vibes"
         room_code = ''.join(random.choices(string.ascii_uppercase + string.digits, k=6))
         rooms[room_code] = {
@@ -131,6 +133,7 @@ def generate_route():
         app.logger.error(f"Generate route error: {e}")
         return render_template('error.html', error="Could not create a room. Please try again."), 500
 
+# (The rest of the file: /room route, socket handlers, and main execution block are correct and do not need changes)
 @app.route('/room/<string:room_code>')
 def view_room(room_code):
     room_code = room_code.upper()
@@ -140,8 +143,6 @@ def view_room(room_code):
     else:
         return render_template('error.html', error=f"Room '{room_code}' not found."), 404
 
-# --- 8. SOCKET.IO EVENT HANDLERS ---
-# (These handlers are correct and remain unchanged)
 @socketio.on('join_room')
 def handle_join_room(data):
     room_code = data['room_code'].upper()
@@ -181,7 +182,6 @@ def handle_disconnect():
             app.logger.info(f"'{username}' left room '{room_code}'")
             break
 
-# --- 9. MAIN EXECUTION ---
 if __name__ == '__main__':
     setup_logging()
     app.logger.info("Starting MoodSync server with gevent...")
