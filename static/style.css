@@ -1,0 +1,366 @@
+@import url('https://fonts.googleapis.com/css2?family=Poppins:wght@300;400;600;700&display=swap');
+
+:root {
+    --primary-gradient: linear-gradient(135deg, #6A5ACD, #8E6BFF);
+    --happy-gradient: linear-gradient(135deg, #FFD700, #FF6B6B);
+    --sad-gradient: linear-gradient(135deg, #4A90E2, #5BCAFF);
+    --energetic-gradient: linear-gradient(135deg, #FF6B6B, #FF9A3C);
+    --background-gradient: linear-gradient(45deg, #1a1a2e, #16213e);
+}
+
+* {
+    margin: 0;
+    padding: 0;
+    box-sizing: border-box;
+    scrollbar-width: thin;
+    scrollbar-color: rgba(0, 242, 96, 0.5) transparent;
+}
+
+*::-webkit-scrollbar {
+    width: 8px;
+}
+
+*::-webkit-scrollbar-track {
+    background: rgba(0, 0, 0, 0.1);
+    border-radius: 10px;
+}
+
+*::-webkit-scrollbar-thumb {
+    background: linear-gradient(45deg, #00f260, #0575e6);
+    border-radius: 10px;
+    transition: all 0.3s ease;
+}
+
+*::-webkit-scrollbar-thumb:hover {
+    background: linear-gradient(45deg, #0575e6, #00f260);
+}
+
+html, body {
+    font-family: 'Poppins', sans-serif;
+    background: var(--background-gradient);
+    min-height: 100vh;
+    overflow-x: hidden;
+    overflow-y: auto;
+    max-width: 100%;
+    color: white;
+}
+
+.mood-visualizer-container {
+    display: flex;
+    justify-content: center;
+    align-items: center;
+    height: 100vh;
+    position: relative;
+}
+
+.mood-canvas {
+    position: absolute;
+    top: 0;
+    left: 0;
+    width: 100%;
+    height: 100%;
+    z-index: 1;
+}
+
+.mood-selector {
+    position: relative;
+    z-index: 10;
+    text-align: center;
+    color: white;
+    width: 100%;
+    max-width: 600px;
+    padding: 30px;
+    background: rgba(255, 255, 255, 0.1);
+    border-radius: 20px;
+    backdrop-filter: blur(10px);
+}
+
+.app-title {
+    font-size: 3rem;
+    margin-bottom: 10px;
+    background: linear-gradient(45deg, #00f260, #0575e6);
+    background-clip: text;
+    -webkit-background-clip: text;
+    color: transparent;
+    -webkit-text-fill-color: transparent;
+}
+
+.subtitle {
+    color: rgba(255, 255, 255, 0.7);
+    margin-bottom: 20px;
+}
+
+.mood-options {
+    display: flex;
+    justify-content: space-between;
+    margin-bottom: 30px;
+}
+
+.mood-option {
+    position: relative;
+    flex: 1;
+    margin: 0 10px;
+}
+
+.mood-option input {
+    display: none;
+}
+
+.mood-label {
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    cursor: pointer;
+    padding: 20px;
+    border-radius: 15px;
+    transition: all 0.3s ease;
+    background: rgba(255, 255, 255, 0.1);
+}
+
+.mood-emoji {
+    font-size: 4rem;
+    margin-bottom: 10px;
+    opacity: 0.6;
+    transition: all 0.3s ease;
+}
+
+.mood-text {
+    color: rgba(255, 255, 255, 0.7);
+    transition: all 0.3s ease;
+}
+
+.mood-option input:checked + .mood-label {
+    background: rgba(255, 255, 255, 0.2);
+}
+
+.mood-option input:checked + .mood-label .mood-emoji,
+.mood-option input:checked + .mood-label .mood-text {
+    opacity: 1;
+    color: white;
+}
+
+.generate-btn {
+    position: relative;
+    background: linear-gradient(45deg, #00f260, #0575e6);
+    color: white;
+    border: none;
+    padding: 15px 30px;
+    border-radius: 50px;
+    font-size: 1.1rem;
+    cursor: pointer;
+    overflow: hidden;
+    transition: all 0.3s ease;
+    box-shadow: 0 10px 20px rgba(0, 242, 96, 0.2);
+}
+
+.btn-particle-flow {
+    position: absolute;
+    bottom: 0;
+    left: 0;
+    width: 100%;
+    height: 100px;
+    background: linear-gradient(90deg, 
+        transparent, 
+        rgba(255,255,255,0.4), 
+        rgba(255,255,255,0.6), 
+        transparent
+    );
+    background-size: 200% 100%;
+    animation: particleFlow 2s infinite linear;
+}
+
+@keyframes particleFlow {
+    0% { 
+        background-position: -100% 0;
+        opacity: 0.6;
+    }
+    50% {
+        opacity: 0.8;
+    }
+    100% { 
+        background-position: 100% 0;
+        opacity: 0.6;
+    }
+}
+
+.generate-btn:hover {
+    transform: translateY(-3px);
+    box-shadow: 0 15px 25px rgba(0, 242, 96, 0.3);
+}
+
+.generate-btn:active {
+    transform: translateY(1px);
+    box-shadow: 0 5px 10px rgba(0, 242, 96, 0.2);
+}
+
+.playlist-container {
+    position: relative;
+    height: 100vh;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    background: var(--background-gradient);
+    overflow: hidden;
+}
+
+.playlist-canvas {
+    position: absolute;
+    top: 0;
+    left: 0;
+    width: 100%;
+    height: 100%;
+    z-index: 1;
+}
+
+.playlist-content {
+    position: relative;
+    z-index: 10;
+    width: 100%;
+    max-width: 800px;
+    background: rgba(255, 255, 255, 0.1);
+    backdrop-filter: blur(10px);
+    border-radius: 20px;
+    padding: 30px;
+    max-height: 80vh;
+    overflow-y: auto;
+}
+
+.playlist-title {
+    font-size: 2.5rem;
+    margin-bottom: 20px;
+    background: linear-gradient(45deg, #00f260, #0575e6);
+    background-clip: text;
+    -webkit-background-clip: text;
+    color: transparent;
+    -webkit-text-fill-color: transparent;
+}
+
+.weather-info {
+    display: flex;
+    align-items: center;
+    margin-bottom: 20px;
+    background: rgba(255, 255, 255, 0.1);
+    padding: 10px;
+    border-radius: 10px;
+}
+
+.playlist-tracks {
+    display: flex;
+    flex-direction: column;
+    gap: 15px;
+}
+
+.track-link {
+    text-decoration: none;
+    color: inherit;
+}
+
+.track {
+    display: flex;
+    align-items: center;
+    background: rgba(255, 255, 255, 0.1);
+    border-radius: 15px;
+    padding: 15px;
+    transition: all 0.3s ease;
+    position: relative;
+    overflow: hidden;
+}
+
+.track:hover {
+    transform: scale(1.02);
+    box-shadow: 0 10px 20px rgba(0, 242, 96, 0.1);
+}
+
+.track-album-art {
+    width: 80px;
+    height: 80px;
+    border-radius: 15px;
+    margin-right: 20px;
+    overflow: hidden;
+    flex-shrink: 0;
+}
+
+.track-album-art img {
+    width: 100%;
+    height: 100%;
+    object-fit: cover;
+}
+
+.placeholder-art {
+    width: 100%;
+    height: 100%;
+    background: linear-gradient(45deg, #00f260, #0575e6);
+    display: flex;
+    justify-content: center;
+    align-items: center;
+    font-size: 2rem;
+    color: white;
+}
+
+.track-info {
+    flex-grow: 1;
+}
+
+.track-name {
+    font-size: 1.1rem;
+    margin-bottom: 5px;
+    color: white;
+}
+
+.track-artist {
+    font-size: 0.9rem;
+    color: rgba(255, 255, 255, 0.7);
+}
+
+.track-spotify-icon {
+    width: 40px;
+    height: 40px;
+    background: #1DB954;
+    border-radius: 50%;
+    display: flex;
+    justify-content: center;
+    align-items: center;
+    transition: all 0.3s ease;
+}
+
+.track-spotify-icon svg {
+    width: 24px;
+    height: 24px;
+    fill: white;
+}
+
+.track-spotify-icon:hover {
+    transform: scale(1.1);
+}
+
+.back-btn {
+    display: inline-block;
+    position: relative;
+    background: linear-gradient(45deg, #00f260, #0575e6);
+    color: white;
+    text-decoration: none;
+    padding: 15px 30px;
+    border-radius: 50px;
+    font-size: 1.1rem;
+    cursor: pointer;
+    overflow: hidden;
+    transition: all 0.3s ease;
+    box-shadow: 0 10px 20px rgba(0, 242, 96, 0.2);
+    margin-top: 20px;
+}
+
+.back-btn .btn-particle-flow {
+    position: absolute;
+    bottom: 0;
+    left: 0;
+    width: 100%;
+    height: 100px;
+    background: linear-gradient(90deg, 
+        transparent, 
+        rgba(255,255,255,0.4), 
+        rgba(255,255,255,0.6), 
+        transparent
+    );
+    background-size: 200% 100%;
+    animation: particleFlow 2s infinite linear;
+}

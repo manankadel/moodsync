@@ -1,0 +1,63 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <title>MoodSync - Your Playlist</title>
+    <link rel="stylesheet" href="{{ url_for('static', filename='style.css') }}">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+</head>
+<body>
+    <div class="playlist-container">
+        <canvas id="playlistCanvas" class="playlist-canvas"></canvas>
+        
+        <div class="playlist-content">
+            <h1 class="playlist-title">{{ playlist_title }}</h1>
+            
+            <div class="weather-info">
+                <span class="weather-icon">
+                    {% if weather.main == 'Clear' %}☀️{% endif %}
+                    {% if weather.main == 'Clouds' %}☁️{% endif %}
+                    {% if weather.main == 'Rain' %}🌧️{% endif %}
+                </span>
+                <span class="weather-details">
+                    {{ weather.main }} | {{ weather.temperature }}°C
+                </span>
+            </div>
+
+            <div class="playlist-tracks">
+                {% for song in songs %}
+                <a href="{{ song.external_urls.spotify }}" target="_blank" class="track-link">
+                    <div class="track">
+                        <div class="track-album-art">
+                            {% if song.album and song.album.get('images') and song.album['images'] %}
+                            <img src="{{ song.album['images'][0]['url'] }}" alt="{{ song.name }}">
+                            {% else %}
+                            <div class="placeholder-art">🎵</div>
+                            {% endif %}
+                        </div>
+                        <div class="track-info">
+                            <h3 class="track-name">{{ song.name }}</h3>
+                            <p class="track-artist">
+                                {{ song.artists[0].name if song.artists else 'Unknown Artist' }}
+                            </p>
+                        </div>
+                        <div class="track-spotify-icon">
+                            <svg viewBox="0 0 24 24">
+                                <path d="M12 0C5.4 0 0 5.4 0 12s5.4 12 12 12 12-5.4 12-12S18.6 0 12 0zm5.5 17.3c-.2.3-.6.4-.9.2-2.5-1.5-5.6-1.9-9.3-1.1-.4.1-.7-.2-.8-.5-.1-.4.2-.7.5-.8 4-.7 7.4-.2 10.2 1.3.4.2.5.6.3 1zm1.5-3.5c-.3.3-.8.4-1.1.2-2.8-1.7-7-2.2-10.3-1.2-.4.1-.9-.1-1-.5-.1-.4.1-.9.5-1 3.7-1.1 8.2-.6 11.3 1.4.4.2.5.8.6 1.1zm.1-3.7c-3.3-2-8.8-2.2-12 1.2-.4.3-1 .2-1.3-.2-.3-.4-.2-1 .2-1.3 3.8-3.5 10.1-3.3 14 1.4.4.3.5.9.2 1.3-.3.4-.9.5-1.3.2z"/>
+                            </svg>
+                        </div>
+                    </div>
+                </a>
+                {% endfor %}
+            </div>
+
+            <a href="/" class="back-btn">
+                Generate Another Playlist
+                <div class="btn-particle-flow"></div>
+            </a>
+        </div>
+    </div>
+
+    <script src="{{ url_for('static', filename='playlist-visualizer.js') }}"></script>
+</body>
+</html>
