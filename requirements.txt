@@ -2,3 +2,7 @@ flask
 requests
 python-dotenv
 logging
+google-api-python-client
+Flask-SocketIO
+gevent
+gevent-websocket

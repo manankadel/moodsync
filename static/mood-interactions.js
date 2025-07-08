@@ -1,45 +1,38 @@
 document.addEventListener('DOMContentLoaded', () => {
-    const moodOptions = document.querySelectorAll('.mood-option input');
-    const generateBtn = document.getElementById('generatePlaylist');
-    let selectedMood = null;
-
-    // Mood selection
-    moodOptions.forEach(option => {
+    // --- Mood selection for visualizer (unchanged) ---
+    document.querySelectorAll('.mood-option input').forEach(option => {
         option.addEventListener('change', (e) => {
-            selectedMood = e.target.value;
-            moodVisualizer.setMood(selectedMood);
+            moodVisualizer.setMood(e.target.value);
         });
     });
 
-    // Generate playlist
-    generateBtn.addEventListener('click', (e) => {
+    // --- Form for CREATING a room ---
+    const generateForm = document.getElementById('generate-form');
+    generateForm.addEventListener('submit', (e) => {
+        // Check if a mood is selected
+        const selectedMood = document.querySelector('input[name="mood"]:checked');
         if (!selectedMood) {
-            alert('Please select a mood first!');
+            e.preventDefault(); // Stop form submission
+            alert('Please select a mood to create a room!');
             return;
         }
+        // Set the current hour before submitting
+        document.getElementById('hour-input').value = new Date().getHours();
+    });
 
-        // Create form dynamically
-        const form = document.createElement('form');
-        form.method = 'POST';
-        form.action = '/generate';
+    // --- Form for JOINING a room ---
+    const joinForm = document.getElementById('join-form');
+    joinForm.addEventListener('submit', (e) => {
+        e.preventDefault(); // We'll handle the redirect ourselves
+        const roomCodeInput = document.getElementById('room-code-input');
+        const roomCode = roomCodeInput.value.trim().toUpperCase();
 
-        // Mood input
-        const moodInput = document.createElement('input');
-        moodInput.type = 'hidden';
-        moodInput.name = 'mood';
-        moodInput.value = selectedMood;
-        form.appendChild(moodInput);
-
-        // Hour input
-        const hourInput = document.createElement('input');
-        hourInput.type = 'hidden';
-        hourInput.name = 'hour';
-        hourInput.value = new Date().getHours();
-        form.appendChild(hourInput);
-
-        // Append and submit
-        document.body.appendChild(form);
-        form.submit();
+        if (roomCode) {
+            // Redirect the user to the room URL
+            window.location.href = `/room/${roomCode}`;
+        } else {
+            alert('Please enter a room code.');
+        }
     });
 
     // Initial animation

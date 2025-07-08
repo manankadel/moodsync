@@ -1,0 +1,1188 @@
+
+
+========== C:\Users\manan\OneDrive\Desktop\moodsync\app.py ==========
+import os
+import requests
+import base64
+import random
+import logging
+import traceback
+from logging.handlers import RotatingFileHandler
+from datetime import datetime
+from flask import Flask, render_template, request, jsonify
+from dotenv import load_dotenv
+
+# Load environment variables
+load_dotenv()
+
+# Create Flask application
+app = Flask(__name__)
+app.secret_key = os.urandom(24)
+
+# Custom Exception Classes
+class MoodSyncAPIError(Exception):
+    """Exception raised for API-related errors"""
+    pass
+
+class PlaylistGenerationError(Exception):
+    """Exception raised during playlist generation"""
+    pass
+
+# Logging Setup
+def setup_logging():
+    # Create logs directory if it doesn't exist
+    if not os.path.exists('logs'):
+        os.mkdir('logs')
+
+    # Configure logging
+    file_handler = RotatingFileHandler(
+        'logs/moodsync.log', 
+        maxBytes=10240, 
+        backupCount=10
+    )
+    file_handler.setFormatter(logging.Formatter(
+        '%(asctime)s %(levelname)s: %(message)s [in %(pathname)s:%(lineno)d]'
+    ))
+    file_handler.setLevel(logging.INFO)
+
+    # Add handler to app logger
+    app.logger.addHandler(file_handler)
+    app.logger.setLevel(logging.INFO)
+    app.logger.info('MoodSync Application Startup')
+
+# Spotify Token Function
+def get_spotify_token():
+    """
+    Retrieve Spotify API access token
+    
+    Returns:
+        str: Access token for Spotify API
+    """
+    try:
+        client_id = os.getenv('SPOTIFY_CLIENT_ID')
+        client_secret = os.getenv('SPOTIFY_CLIENT_SECRET')
+        
+        if not client_id or not client_secret:
+            raise MoodSyncAPIError("Spotify credentials not found")
+        
+        url = "https://accounts.spotify.com/api/token"
+        headers = {
+            "Authorization": "Basic " + base64.b64encode(f"{client_id}:{client_secret}".encode()).decode(),
+            "Content-Type": "application/x-www-form-urlencoded"
+        }
+        data = {"grant_type": "client_credentials"}
+
+        response = requests.post(url, headers=headers, data=data)
+        response.raise_for_status()
+        
+        return response.json()['access_token']
+    
+    except requests.RequestException as e:
+        app.logger.error(f"Spotify Token Request Error: {e}")
+        raise MoodSyncAPIError(f"Failed to retrieve Spotify token: {e}")
+
+# Weather Function
+def get_weather(city='London'):
+    """
+    Retrieve current weather information
+    
+    Args:
+        city (str): City name for weather lookup
+    
+    Returns:
+        dict: Weather information
+    """
+    try:
+        api_key = os.getenv('OPENWEATHERMAP_API_KEY')
+        
+        if not api_key:
+            raise MoodSyncAPIError("OpenWeatherMap API key not found")
+        
+        url = f"http://api.openweathermap.org/data/2.5/weather?q={city}&appid={api_key}&units=metric"
+        
+        response = requests.get(url)
+        response.raise_for_status()
+        
+        weather_data = response.json()
+        return {
+            'main': weather_data['weather'][0]['main'],
+            'description': weather_data['weather'][0]['description'],
+            'temperature': round(weather_data['main']['temp'], 1),
+            'icon': weather_data['weather'][0]['icon']
+        }
+    
+    except requests.RequestException as e:
+        app.logger.warning(f"Weather API Error: {e}. Using fallback.")
+        return {
+            'main': 'Clear',
+            'description': 'clear sky',
+            'temperature': 20,
+            'icon': '01d'
+        }
+
+# Playlist Generation Function
+def generate_playlist(mood, weather, time_of_day):
+    """
+    Generate personalized playlist based on mood, weather, and time
+    
+    Args:
+        mood (str): User's current mood
+        weather (dict): Current weather information
+        time_of_day (str): Time of day
+    
+    Returns:
+        list: Curated playlist of tracks
+    """
+    try:
+        # Validate mood
+        if mood not in ['happy', 'sad', 'energetic']:
+            raise ValueError("Invalid mood selection")
+
+        # Log the start of playlist generation
+        app.logger.info(f"Generating playlist - Mood: {mood}, Weather: {weather}, Time: {time_of_day}")
+
+        token = get_spotify_token()
+        
+        # Enhanced genre mapping with more specific genres
+        mood_genres = {
+            'happy': [
+                'pop', 'dance', 'funk', 
+                'latin', 'disco', 'reggaeton',
+                'summer hits', 'feel good'
+            ],
+            'sad': [
+                'acoustic', 'blues', 'indie', 
+                'lo-fi', 'classical', 'ambient',
+                'sad songs', 'emotional'
+            ],
+            'energetic': [
+                'rock', 'electronic', 'hip hop', 
+                'metal', 'punk', 'drum and bass',
+                'workout', 'motivation'
+            ]
+        }
+        
+        # Spotify API Search
+        url = "https://api.spotify.com/v1/search"
+        headers = {"Authorization": f"Bearer {token}"}
+        
+        playlist = []
+        
+        # Shuffle and select genres
+        genres = random.sample(mood_genres.get(mood, ['pop']), k=3)
+        
+        for genre in genres:
+            params = {
+                "q": f"genre:{genre}",
+                "type": "track",
+                "limit": 10,  # Increased limit
+                "offset": random.randint(0, 50)
+            }
+            
+            try:
+                response = requests.get(url, headers=headers, params=params)
+                response.raise_for_status()
+                
+                tracks = response.json().get('tracks', {}).get('items', [])
+                
+                # Log number of tracks found
+                app.logger.info(f"Tracks found for genre {genre}: {len(tracks)}")
+                
+                # Add unique tracks
+                for track in tracks:
+                    # Check if track is already in playlist
+                    if track['id'] not in [p.get('id') for p in playlist]:
+                        playlist.append({
+                            'id': track['id'],
+                            'name': track.get('name', 'Unknown Track'),
+                            'artists': track.get('artists', [{'name': 'Unknown Artist'}]),
+                            'album': track.get('album', {}),
+                            'external_urls': track.get('external_urls', {'spotify': '#'})
+                        })
+                    
+                    # Break if we have 10 tracks
+                    if len(playlist) >= 10:
+                        break
+            
+            except requests.RequestException as e:
+                app.logger.error(f"Error fetching tracks for genre {genre}: {e}")
+                continue
+        
+        # If not enough tracks, add fallback
+        while len(playlist) < 10:
+            playlist.append({
+                'id': f'fallback_{len(playlist)}',
+                'name': 'Mood Booster Track',
+                'artists': [{'name': 'MoodSync'}],
+                'album': {},
+                'external_urls': {'spotify': '#'}
+            })
+        
+        # Log final playlist
+        app.logger.info(f"Generated playlist with {len(playlist)} tracks")
+        
+        return playlist[:10]
+    
+    except Exception as e:
+        # Log the full error details
+        app.logger.error(f"Playlist Generation Error: {e}")
+        app.logger.error(f"Traceback: {traceback.format_exc()}")
+        raise PlaylistGenerationError(f"Failed to generate playlist: {e}")
+
+# Routes
+@app.route('/')
+def home():
+    """Render home page"""
+    return render_template('index.html')
+
+@app.route('/generate', methods=['POST'])
+def generate():
+    """Generate personalized playlist"""
+    try:
+        # Get user inputs
+        mood = request.form['mood']
+        hour = int(request.form['hour'])
+        
+        # Log incoming request
+        app.logger.info(f"Playlist generation request - Mood: {mood}, Hour: {hour}")
+        
+        # Validate inputs
+        if not mood or mood not in ['happy', 'sad', 'energetic']:
+            raise ValueError("Invalid mood selection")
+        
+        # Determine time of day
+        if 5 <= hour < 12:
+            time_of_day = 'morning'
+        elif 12 <= hour < 17:
+            time_of_day = 'afternoon'
+        elif 17 <= hour < 21:
+            time_of_day = 'evening'
+        else:
+            time_of_day = 'night'
+        
+        # Get weather
+        weather = get_weather()
+        
+        # Generate playlist
+        playlist = generate_playlist(mood, weather, time_of_day)
+        
+        # Create playlist title
+        playlist_title = f"{mood.capitalize()} {weather['main']} {time_of_day.capitalize()} Vibes"
+        
+        return render_template('result.html', 
+                               songs=playlist, 
+                               playlist_title=playlist_title,
+                               weather=weather)
+    
+    except ValueError as ve:
+        app.logger.warning(f"Validation Error: {str(ve)}")
+        return render_template('error.html', 
+            error="Please select a valid mood."
+        ), 400
+    except PlaylistGenerationError as pge:
+        app.logger.error(f"Playlist Generation Error: {str(pge)}")
+        return render_template('error.html', 
+            error="We couldn't generate your playlist. Please try a different mood or check your connection."
+        ), 500
+    except Exception as e:
+        # Log the error
+        app.logger.error(f"Unexpected Error in Playlist Generation: {str(e)}")
+        app.logger.error(f"Traceback: {traceback.format_exc()}")
+        return render_template('error.html', 
+            error="An unexpected error occurred. Our team has been notified."
+        ), 500
+
+# Error Handlers
+@app.errorhandler(MoodSyncAPIError)
+def handle_api_error(error):
+    app.logger.error(f"API Error: {str(error)}")
+    return render_template('error.html', 
+        error="We're having trouble connecting to our music services. Please try again later."
+    ), 500
+
+@app.errorhandler(PlaylistGenerationError)
+def handle_playlist_error(error):
+    app.logger.error(f"Playlist Generation Error: {str(error)}")
+    return render_template('error.html', 
+        error="We couldn't generate your playlist. Please select a different mood."
+    ), 500
+
+@app.errorhandler(Exception)
+def handle_unexpected_error(error):
+    # Log the full traceback
+    app.logger.error(
+        f"Unexpected Error: {str(error)}\n"
+        f"Traceback: {traceback.format_exc()}"
+    )
+    return render_template('error.html', 
+        error="An unexpected error occurred. Our team has been notified."
+    ), 500
+
+# Application Startup
+if __name__ == '__main__':
+    # Setup logging before running
+    setup_logging()
+    
+    # Run the application
+    app.run(
+        debug=True, 
+        host='0.0.0.0',  # Make accessible on all network interfaces
+        port=5000
+    )
+============================================================
+
+
+========== C:\Users\manan\OneDrive\Desktop\moodsync\generate_structure.py ==========
+import os
+
+IGNORE_DIRS = {
+    ".git", "__pycache__", "venv", "env", "node_modules", ".next", ".vercel",
+    ".idea", ".vscode", "dist", "build", ".pytest_cache", ".mypy_cache", "__pypackages__"
+}
+
+IGNORE_FILES = {
+    ".DS_Store", "Thumbs.db", ".env", ".env.local", ".gitignore", "structure.txt", "code_dump.txt"
+}
+
+VALID_EXTENSIONS = {".py", ".html", ".js", ".css"}
+
+def generate_structure_and_code(root_dir):
+    structure_path = os.path.join(root_dir, "structure.txt")
+    code_path = os.path.join(root_dir, "code_dump.txt")
+
+    with open(structure_path, "w", encoding="utf-8") as sf, open(code_path, "w", encoding="utf-8") as cf:
+        for root, dirs, files in os.walk(root_dir):
+            dirs[:] = [d for d in dirs if d not in IGNORE_DIRS]
+            files = [file for file in files if file not in IGNORE_FILES]
+
+            level = root.replace(root_dir, "").count(os.sep)
+            indent = "    " * level
+            sf.write(f"{indent}{os.path.basename(root)}/\n")
+
+            subindent = "    " * (level + 1)
+            for file in files:
+                sf.write(f"{subindent}{file}\n")
+
+                ext = os.path.splitext(file)[1]
+                if ext in VALID_EXTENSIONS:
+                    file_path = os.path.join(root, file)
+                    try:
+                        with open(file_path, "r", encoding="utf-8") as source:
+                            cf.write(f"\n\n========== {file_path} ==========\n")
+                            cf.write(source.read())
+                            cf.write("\n" + "="*60 + "\n")
+                    except Exception as e:
+                        print(f"⚠️ Skipped {file_path}: {e}")
+
+    print("✅ structure.txt and code_dump.txt generated.")
+
+if __name__ == "__main__":
+    root_directory = os.path.dirname(os.path.abspath(__file__))
+    generate_structure_and_code(root_directory)
+
+============================================================
+
+
+========== C:\Users\manan\OneDrive\Desktop\moodsync\spotify_test.py ==========
+import requests
+import base64
+import os
+from dotenv import load_dotenv
+
+load_dotenv()
+
+client_id = os.getenv('SPOTIFY_CLIENT_ID')
+client_secret = os.getenv('SPOTIFY_CLIENT_SECRET')
+
+url = "https://accounts.spotify.com/api/token"
+headers = {
+    "Authorization": "Basic " + base64.b64encode(f"{client_id}:{client_secret}".encode()).decode(),
+    "Content-Type": "application/x-www-form-urlencoded"
+}
+data = {"grant_type": "client_credentials"}
+
+response = requests.post(url, headers=headers, data=data)
+print(response.json())
+============================================================
+
+
+========== C:\Users\manan\OneDrive\Desktop\moodsync\weather_test.py ==========
+import requests
+
+api_key = '12bbc3118dc24fdd071e4fa87cc1aef7'
+city = 'London'
+url = f"http://api.openweathermap.org/data/2.5/weather?q={city}&appid={api_key}&units=metric"
+
+try:
+    response = requests.get(url)
+    weather_data = response.json()
+    
+    # Extract key weather information
+    main_weather = weather_data['weather'][0]['main']
+    description = weather_data['weather'][0]['description']
+    temperature = weather_data['main']['temp']
+    
+    print(f"Weather in {city}:")
+    print(f"Condition: {main_weather}")
+    print(f"Description: {description}")
+    print(f"Temperature: {temperature}°C")
+
+except Exception as e:
+    print(f"An error occurred: {e}")
+============================================================
+
+
+========== C:\Users\manan\OneDrive\Desktop\moodsync\static\mood-interactions.js ==========
+document.addEventListener('DOMContentLoaded', () => {
+    const moodOptions = document.querySelectorAll('.mood-option input');
+    const generateBtn = document.getElementById('generatePlaylist');
+    let selectedMood = null;
+
+    // Mood selection
+    moodOptions.forEach(option => {
+        option.addEventListener('change', (e) => {
+            selectedMood = e.target.value;
+            moodVisualizer.setMood(selectedMood);
+        });
+    });
+
+    // Generate playlist
+    generateBtn.addEventListener('click', (e) => {
+        if (!selectedMood) {
+            alert('Please select a mood first!');
+            return;
+        }
+
+        // Create form dynamically
+        const form = document.createElement('form');
+        form.method = 'POST';
+        form.action = '/generate';
+
+        // Mood input
+        const moodInput = document.createElement('input');
+        moodInput.type = 'hidden';
+        moodInput.name = 'mood';
+        moodInput.value = selectedMood;
+        form.appendChild(moodInput);
+
+        // Hour input
+        const hourInput = document.createElement('input');
+        hourInput.type = 'hidden';
+        hourInput.name = 'hour';
+        hourInput.value = new Date().getHours();
+        form.appendChild(hourInput);
+
+        // Append and submit
+        document.body.appendChild(form);
+        form.submit();
+    });
+
+    // Initial animation
+    moodVisualizer.animate();
+});
+============================================================
+
+
+========== C:\Users\manan\OneDrive\Desktop\moodsync\static\mood-visualizer.js ==========
+class MoodVisualizer {
+    constructor(canvasId) {
+        this.canvas = document.getElementById(canvasId);
+        this.ctx = this.canvas.getContext('2d');
+        this.particles = [];
+        this.setupCanvas();
+        this.currentMood = null;
+    }
+
+    setupCanvas() {
+        this.canvas.width = window.innerWidth;
+        this.canvas.height = window.innerHeight;
+        window.addEventListener('resize', () => this.resizeCanvas());
+    }
+
+    resizeCanvas() {
+        this.canvas.width = window.innerWidth;
+        this.canvas.height = window.innerHeight;
+    }
+
+    createParticles(mood) {
+        this.particles = [];
+        const particleCount = 100;
+        const colors = {
+            'happy': ['#FFD700', '#FF6B6B', '#4ECDC4'],
+            'sad': ['#4A90E2', '#5BCAFF', '#1A2980'],
+            'energetic': ['#FF4500', '#FF6B6B', '#FF9A3C']
+        };
+
+        for (let i = 0; i < particleCount; i++) {
+            this.particles.push({
+                x: Math.random() * this.canvas.width,
+                y: Math.random() * this.canvas.height,
+                radius: Math.random() * 3 + 1,
+                color: colors[mood][Math.floor(Math.random() * colors[mood].length)],
+                speedX: (Math.random() - 0.5) * 2,
+                speedY: (Math.random() - 0.5) * 2,
+                alpha: 0.7
+            });
+        }
+    }
+
+    animate(mood) {
+        this.ctx.clearRect(0, 0, this.canvas.width, this.canvas.height);
+        
+        this.particles.forEach((particle, index) => {
+            // Update particle position
+            particle.x += particle.speedX;
+            particle.y += particle.speedY;
+
+            // Bounce off walls
+            if (particle.x < 0 || particle.x > this.canvas.width) particle.speedX *= -1;
+            if (particle.y < 0 || particle.y > this.canvas.height) particle.speedY *= -1;
+
+            // Draw particle
+            this.ctx.beginPath();
+            this.ctx.arc(particle.x, particle.y, particle.radius, 0, Math.PI * 2);
+            this.ctx.fillStyle = particle.color;
+            this.ctx.globalAlpha = particle.alpha;
+            this.ctx.fill();
+        });
+
+        requestAnimationFrame(() => this.animate(mood));
+    }
+
+    setMood(mood) {
+        this.currentMood = mood;
+        this.createParticles(mood);
+    }
+}
+
+// Initialize mood visualizer
+const moodVisualizer = new MoodVisualizer('moodCanvas');
+============================================================
+
+
+========== C:\Users\manan\OneDrive\Desktop\moodsync\static\playlist-visualizer.js ==========
+class PlaylistVisualizer {
+    constructor(canvasId) {
+        this.canvas = document.getElementById(canvasId);
+        this.ctx = this.canvas.getContext('2d');
+        this.particles = [];
+        this.setupCanvas();
+    }
+
+    setupCanvas() {
+        this.canvas.width = window.innerWidth;
+        this.canvas.height = window.innerHeight;
+        window.addEventListener('resize', () => this.resizeCanvas());
+    }
+
+    resizeCanvas() {
+        this.canvas.width = window.innerWidth;
+        this.canvas.height = window.innerHeight;
+    }
+
+    createMusicWaveParticles() {
+        this.particles = [];
+        const particleCount = 200;
+        const colors = ['#00f260', '#0575e6', '#4ECDC4'];
+
+        for (let i = 0; i < particleCount; i++) {
+            this.particles.push({
+                x: Math.random() * this.canvas.width,
+                y: this.canvas.height / 2 + Math.sin(i * 0.1) * 100,
+                radius: Math.random() * 3 + 1,
+                color: colors[Math.floor(Math.random() * colors.length)],
+                speed: Math.random() * 2 + 1,
+                amplitude: Math.random() * 50 + 20
+            });
+        }
+    }
+
+    animate() {
+        this.ctx.clearRect(0, 0, this.canvas.width, this.canvas.height);
+        
+        this.particles.forEach((particle, index) => {
+            // Update particle position with wave-like motion
+            particle.x -= particle.speed;
+            particle.y = this.canvas.height / 2 + 
+                         Math.sin(particle.x * 0.01) * particle.amplitude;
+
+            // Reset particle position when it goes off-screen
+            if (particle.x < 0) {
+                particle.x = this.canvas.width;
+            }
+
+            // Draw particle
+            this.ctx.beginPath();
+            this.ctx.arc(particle.x, particle.y, particle.radius, 0, Math.PI * 2);
+            this.ctx.fillStyle = particle.color;
+            this.ctx.globalAlpha = 0.7;
+            this.ctx.fill();
+        });
+
+        requestAnimationFrame(() => this.animate());
+    }
+
+    init() {
+        this.createMusicWaveParticles();
+        this.animate();
+    }
+}
+
+// Initialize playlist visualizer
+document.addEventListener('DOMContentLoaded', () => {
+    const playlistVisualizer = new PlaylistVisualizer('playlistCanvas');
+    playlistVisualizer.init();
+});
+============================================================
+
+
+========== C:\Users\manan\OneDrive\Desktop\moodsync\static\style.css ==========
+@import url('https://fonts.googleapis.com/css2?family=Poppins:wght@300;400;600;700&display=swap');
+
+:root {
+    --primary-gradient: linear-gradient(135deg, #6A5ACD, #8E6BFF);
+    --happy-gradient: linear-gradient(135deg, #FFD700, #FF6B6B);
+    --sad-gradient: linear-gradient(135deg, #4A90E2, #5BCAFF);
+    --energetic-gradient: linear-gradient(135deg, #FF6B6B, #FF9A3C);
+    --background-gradient: linear-gradient(45deg, #1a1a2e, #16213e);
+}
+
+* {
+    margin: 0;
+    padding: 0;
+    box-sizing: border-box;
+    scrollbar-width: thin;
+    scrollbar-color: rgba(0, 242, 96, 0.5) transparent;
+}
+
+*::-webkit-scrollbar {
+    width: 8px;
+}
+
+*::-webkit-scrollbar-track {
+    background: rgba(0, 0, 0, 0.1);
+    border-radius: 10px;
+}
+
+*::-webkit-scrollbar-thumb {
+    background: linear-gradient(45deg, #00f260, #0575e6);
+    border-radius: 10px;
+    transition: all 0.3s ease;
+}
+
+*::-webkit-scrollbar-thumb:hover {
+    background: linear-gradient(45deg, #0575e6, #00f260);
+}
+
+html, body {
+    font-family: 'Poppins', sans-serif;
+    background: var(--background-gradient);
+    min-height: 100vh;
+    overflow-x: hidden;
+    overflow-y: auto;
+    max-width: 100%;
+    color: white;
+}
+
+.mood-visualizer-container {
+    display: flex;
+    justify-content: center;
+    align-items: center;
+    height: 100vh;
+    position: relative;
+}
+
+.mood-canvas {
+    position: absolute;
+    top: 0;
+    left: 0;
+    width: 100%;
+    height: 100%;
+    z-index: 1;
+}
+
+.mood-selector {
+    position: relative;
+    z-index: 10;
+    text-align: center;
+    color: white;
+    width: 100%;
+    max-width: 600px;
+    padding: 30px;
+    background: rgba(255, 255, 255, 0.1);
+    border-radius: 20px;
+    backdrop-filter: blur(10px);
+}
+
+.app-title {
+    font-size: 3rem;
+    margin-bottom: 10px;
+    background: linear-gradient(45deg, #00f260, #0575e6);
+    background-clip: text;
+    -webkit-background-clip: text;
+    color: transparent;
+    -webkit-text-fill-color: transparent;
+}
+
+.subtitle {
+    color: rgba(255, 255, 255, 0.7);
+    margin-bottom: 20px;
+}
+
+.mood-options {
+    display: flex;
+    justify-content: space-between;
+    margin-bottom: 30px;
+}
+
+.mood-option {
+    position: relative;
+    flex: 1;
+    margin: 0 10px;
+}
+
+.mood-option input {
+    display: none;
+}
+
+.mood-label {
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    cursor: pointer;
+    padding: 20px;
+    border-radius: 15px;
+    transition: all 0.3s ease;
+    background: rgba(255, 255, 255, 0.1);
+}
+
+.mood-emoji {
+    font-size: 4rem;
+    margin-bottom: 10px;
+    opacity: 0.6;
+    transition: all 0.3s ease;
+}
+
+.mood-text {
+    color: rgba(255, 255, 255, 0.7);
+    transition: all 0.3s ease;
+}
+
+.mood-option input:checked + .mood-label {
+    background: rgba(255, 255, 255, 0.2);
+}
+
+.mood-option input:checked + .mood-label .mood-emoji,
+.mood-option input:checked + .mood-label .mood-text {
+    opacity: 1;
+    color: white;
+}
+
+.generate-btn {
+    position: relative;
+    background: linear-gradient(45deg, #00f260, #0575e6);
+    color: white;
+    border: none;
+    padding: 15px 30px;
+    border-radius: 50px;
+    font-size: 1.1rem;
+    cursor: pointer;
+    overflow: hidden;
+    transition: all 0.3s ease;
+    box-shadow: 0 10px 20px rgba(0, 242, 96, 0.2);
+}
+
+.btn-particle-flow {
+    position: absolute;
+    bottom: 0;
+    left: 0;
+    width: 100%;
+    height: 100px;
+    background: linear-gradient(90deg, 
+        transparent, 
+        rgba(255,255,255,0.4), 
+        rgba(255,255,255,0.6), 
+        transparent
+    );
+    background-size: 200% 100%;
+    animation: particleFlow 2s infinite linear;
+}
+
+@keyframes particleFlow {
+    0% { 
+        background-position: -100% 0;
+        opacity: 0.6;
+    }
+    50% {
+        opacity: 0.8;
+    }
+    100% { 
+        background-position: 100% 0;
+        opacity: 0.6;
+    }
+}
+
+.generate-btn:hover {
+    transform: translateY(-3px);
+    box-shadow: 0 15px 25px rgba(0, 242, 96, 0.3);
+}
+
+.generate-btn:active {
+    transform: translateY(1px);
+    box-shadow: 0 5px 10px rgba(0, 242, 96, 0.2);
+}
+
+.playlist-container {
+    position: relative;
+    height: 100vh;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    background: var(--background-gradient);
+    overflow: hidden;
+}
+
+.playlist-canvas {
+    position: absolute;
+    top: 0;
+    left: 0;
+    width: 100%;
+    height: 100%;
+    z-index: 1;
+}
+
+.playlist-content {
+    position: relative;
+    z-index: 10;
+    width: 100%;
+    max-width: 800px;
+    background: rgba(255, 255, 255, 0.1);
+    backdrop-filter: blur(10px);
+    border-radius: 20px;
+    padding: 30px;
+    max-height: 80vh;
+    overflow-y: auto;
+}
+
+.playlist-title {
+    font-size: 2.5rem;
+    margin-bottom: 20px;
+    background: linear-gradient(45deg, #00f260, #0575e6);
+    background-clip: text;
+    -webkit-background-clip: text;
+    color: transparent;
+    -webkit-text-fill-color: transparent;
+}
+
+.weather-info {
+    display: flex;
+    align-items: center;
+    margin-bottom: 20px;
+    background: rgba(255, 255, 255, 0.1);
+    padding: 10px;
+    border-radius: 10px;
+}
+
+.playlist-tracks {
+    display: flex;
+    flex-direction: column;
+    gap: 15px;
+}
+
+.track-link {
+    text-decoration: none;
+    color: inherit;
+}
+
+.track {
+    display: flex;
+    align-items: center;
+    background: rgba(255, 255, 255, 0.1);
+    border-radius: 15px;
+    padding: 15px;
+    transition: all 0.3s ease;
+    position: relative;
+    overflow: hidden;
+}
+
+.track:hover {
+    transform: scale(1.02);
+    box-shadow: 0 10px 20px rgba(0, 242, 96, 0.1);
+}
+
+.track-album-art {
+    width: 80px;
+    height: 80px;
+    border-radius: 15px;
+    margin-right: 20px;
+    overflow: hidden;
+    flex-shrink: 0;
+}
+
+.track-album-art img {
+    width: 100%;
+    height: 100%;
+    object-fit: cover;
+}
+
+.placeholder-art {
+    width: 100%;
+    height: 100%;
+    background: linear-gradient(45deg, #00f260, #0575e6);
+    display: flex;
+    justify-content: center;
+    align-items: center;
+    font-size: 2rem;
+    color: white;
+}
+
+.track-info {
+    flex-grow: 1;
+}
+
+.track-name {
+    font-size: 1.1rem;
+    margin-bottom: 5px;
+    color: white;
+}
+
+.track-artist {
+    font-size: 0.9rem;
+    color: rgba(255, 255, 255, 0.7);
+}
+
+.track-spotify-icon {
+    width: 40px;
+    height: 40px;
+    background: #1DB954;
+    border-radius: 50%;
+    display: flex;
+    justify-content: center;
+    align-items: center;
+    transition: all 0.3s ease;
+}
+
+.track-spotify-icon svg {
+    width: 24px;
+    height: 24px;
+    fill: white;
+}
+
+.track-spotify-icon:hover {
+    transform: scale(1.1);
+}
+
+.back-btn {
+    display: inline-block;
+    position: relative;
+    background: linear-gradient(45deg, #00f260, #0575e6);
+    color: white;
+    text-decoration: none;
+    padding: 15px 30px;
+    border-radius: 50px;
+    font-size: 1.1rem;
+    cursor: pointer;
+    overflow: hidden;
+    transition: all 0.3s ease;
+    box-shadow: 0 10px 20px rgba(0, 242, 96, 0.2);
+    margin-top: 20px;
+}
+
+.back-btn .btn-particle-flow {
+    position: absolute;
+    bottom: 0;
+    left: 0;
+    width: 100%;
+    height: 100px;
+    background: linear-gradient(90deg, 
+        transparent, 
+        rgba(255,255,255,0.4), 
+        rgba(255,255,255,0.6), 
+        transparent
+    );
+    background-size: 200% 100%;
+    animation: particleFlow 2s infinite linear;
+}
+============================================================
+
+
+========== C:\Users\manan\OneDrive\Desktop\moodsync\templates\error.html ==========
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <title>MoodSync - Error</title>
+    <link rel="stylesheet" href="{{ url_for('static', filename='style.css') }}">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <style>
+        .error-container {
+            display: flex;
+            flex-direction: column;
+            justify-content: center;
+            align-items: center;
+            height: 100vh;
+            text-align: center;
+            background: linear-gradient(45deg, #ff416c, #ff4b2b);
+            color: white;
+            padding: 20px;
+        }
+        .error-icon {
+            font-size: 5rem;
+            margin-bottom: 20px;
+        }
+        .error-message {
+            max-width: 600px;
+            font-size: 1.2rem;
+            margin-bottom: 30px;
+        }
+        .error-action {
+            display: inline-block;
+            padding: 10px 20px;
+            background: white;
+            color: #ff416c;
+            text-decoration: none;
+            border-radius: 50px;
+            transition: all 0.3s ease;
+        }
+        .error-action:hover {
+            transform: scale(1.05);
+            box-shadow: 0 10px 20px rgba(0,0,0,0.1);
+        }
+    </style>
+</head>
+<body>
+    <div class="error-container">
+        <div class="error-icon">🚫</div>
+        <h1>Oops! Something Went Wrong</h1>
+        <p class="error-message">
+            {{ error or "An unexpected error occurred. Please try again later." }}
+        </p>
+        <a href="/" class="error-action">Back to Home</a>
+    </div>
+</body>
+</html>
+============================================================
+
+
+========== C:\Users\manan\OneDrive\Desktop\moodsync\templates\index.html ==========
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <title>MoodSync - Musical Mood Generator</title>
+    <link rel="stylesheet" href="{{ url_for('static', filename='style.css') }}">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+</head>
+<body>
+    <div class="mood-visualizer-container">
+        <canvas id="moodCanvas" class="mood-canvas"></canvas>
+        
+        <div class="mood-selector">
+            <h1 class="app-title">MoodSync</h1>
+            <p class="subtitle">What's your musical vibe today?</p>
+            
+            <div class="mood-options">
+                <div class="mood-option" data-mood="happy">
+                    <input type="radio" name="mood" value="happy" id="happy-mood">
+                    <label for="happy-mood" class="mood-label">
+                        <span class="mood-emoji">😊</span>
+                        <span class="mood-text">Happy</span>
+                    </label>
+                </div>
+                
+                <div class="mood-option" data-mood="sad">
+                    <input type="radio" name="mood" value="sad" id="sad-mood">
+                    <label for="sad-mood" class="mood-label">
+                        <span class="mood-emoji">😢</span>
+                        <span class="mood-text">Sad</span>
+                    </label>
+                </div>
+                
+                <div class="mood-option" data-mood="energetic">
+                    <input type="radio" name="mood" value="energetic" id="energetic-mood">
+                    <label for="energetic-mood" class="mood-label">
+                        <span class="mood-emoji">⚡</span>
+                        <span class="mood-text">Energetic</span>
+                    </label>
+                </div>
+            </div>
+            
+            <button id="generatePlaylist" class="generate-btn">
+                Generate My Playlist
+                <div class="btn-particle-flow"></div>
+            </button>
+        </div>
+    </div>
+
+    <script src="{{ url_for('static', filename='mood-visualizer.js') }}"></script>
+    <script src="{{ url_for('static', filename='mood-interactions.js') }}"></script>
+</body>
+</html>
+============================================================
+
+
+========== C:\Users\manan\OneDrive\Desktop\moodsync\templates\result.html ==========
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <title>MoodSync - Your Playlist</title>
+    <link rel="stylesheet" href="{{ url_for('static', filename='style.css') }}">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+</head>
+<body>
+    <div class="playlist-container">
+        <canvas id="playlistCanvas" class="playlist-canvas"></canvas>
+        
+        <div class="playlist-content">
+            <h1 class="playlist-title">{{ playlist_title }}</h1>
+            
+            <div class="weather-info">
+                <span class="weather-icon">
+                    {% if weather.main == 'Clear' %}☀️{% endif %}
+                    {% if weather.main == 'Clouds' %}☁️{% endif %}
+                    {% if weather.main == 'Rain' %}🌧️{% endif %}
+                </span>
+                <span class="weather-details">
+                    {{ weather.main }} | {{ weather.temperature }}°C
+                </span>
+            </div>
+
+            <div class="playlist-tracks">
+                {% for song in songs %}
+                <a href="{{ song.external_urls.spotify }}" target="_blank" class="track-link">
+                    <div class="track">
+                        <div class="track-album-art">
+                            {% if song.album and song.album.get('images') and song.album['images'] %}
+                            <img src="{{ song.album['images'][0]['url'] }}" alt="{{ song.name }}">
+                            {% else %}
+                            <div class="placeholder-art">🎵</div>
+                            {% endif %}
+                        </div>
+                        <div class="track-info">
+                            <h3 class="track-name">{{ song.name }}</h3>
+                            <p class="track-artist">
+                                {{ song.artists[0].name if song.artists else 'Unknown Artist' }}
+                            </p>
+                        </div>
+                        <div class="track-spotify-icon">
+                            <svg viewBox="0 0 24 24">
+                                <path d="M12 0C5.4 0 0 5.4 0 12s5.4 12 12 12 12-5.4 12-12S18.6 0 12 0zm5.5 17.3c-.2.3-.6.4-.9.2-2.5-1.5-5.6-1.9-9.3-1.1-.4.1-.7-.2-.8-.5-.1-.4.2-.7.5-.8 4-.7 7.4-.2 10.2 1.3.4.2.5.6.3 1zm1.5-3.5c-.3.3-.8.4-1.1.2-2.8-1.7-7-2.2-10.3-1.2-.4.1-.9-.1-1-.5-.1-.4.1-.9.5-1 3.7-1.1 8.2-.6 11.3 1.4.4.2.5.8.6 1.1zm.1-3.7c-3.3-2-8.8-2.2-12 1.2-.4.3-1 .2-1.3-.2-.3-.4-.2-1 .2-1.3 3.8-3.5 10.1-3.3 14 1.4.4.3.5.9.2 1.3-.3.4-.9.5-1.3.2z"/>
+                            </svg>
+                        </div>
+                    </div>
+                </a>
+                {% endfor %}
+            </div>
+
+            <a href="/" class="back-btn">
+                Generate Another Playlist
+                <div class="btn-particle-flow"></div>
+            </a>
+        </div>
+    </div>
+
+    <script src="{{ url_for('static', filename='playlist-visualizer.js') }}"></script>
+</body>
+</html>
+============================================================

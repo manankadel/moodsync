@@ -14,36 +14,39 @@
             <h1 class="app-title">MoodSync</h1>
             <p class="subtitle">What's your musical vibe today?</p>
             
-            <div class="mood-options">
-                <div class="mood-option" data-mood="happy">
-                    <input type="radio" name="mood" value="happy" id="happy-mood">
-                    <label for="happy-mood" class="mood-label">
-                        <span class="mood-emoji">😊</span>
-                        <span class="mood-text">Happy</span>
-                    </label>
+            <!-- This form now submits to /generate -->
+            <form id="generate-form" method="POST" action="/generate">
+                <div class="mood-options">
+                    <!-- ... mood options (happy, sad, energetic) are the same ... -->
+                    <div class="mood-option" data-mood="happy">
+                        <input type="radio" name="mood" value="happy" id="happy-mood" required>
+                        <label for="happy-mood" class="mood-label"><span class="mood-emoji">😊</span><span class="mood-text">Happy</span></label>
+                    </div>
+                    <div class="mood-option" data-mood="sad">
+                        <input type="radio" name="mood" value="sad" id="sad-mood">
+                        <label for="sad-mood" class="mood-label"><span class="mood-emoji">😢</span><span class="mood-text">Sad</span></label>
+                    </div>
+                    <div class="mood-option" data-mood="energetic">
+                        <input type="radio" name="mood" value="energetic" id="energetic-mood">
+                        <label for="energetic-mood" class="mood-label"><span class="mood-emoji">⚡</span><span class="mood-text">Energetic</span></label>
+                    </div>
                 </div>
-                
-                <div class="mood-option" data-mood="sad">
-                    <input type="radio" name="mood" value="sad" id="sad-mood">
-                    <label for="sad-mood" class="mood-label">
-                        <span class="mood-emoji">😢</span>
-                        <span class="mood-text">Sad</span>
-                    </label>
-                </div>
-                
-                <div class="mood-option" data-mood="energetic">
-                    <input type="radio" name="mood" value="energetic" id="energetic-mood">
-                    <label for="energetic-mood" class="mood-label">
-                        <span class="mood-emoji">⚡</span>
-                        <span class="mood-text">Energetic</span>
-                    </label>
-                </div>
-            </div>
-            
-            <button id="generatePlaylist" class="generate-btn">
-                Generate My Playlist
-                <div class="btn-particle-flow"></div>
-            </button>
+                <!-- Hidden input for the hour, will be set by JS -->
+                <input type="hidden" name="hour" id="hour-input">
+                <button type="submit" id="generatePlaylist" class="generate-btn">
+                    Create a Listening Room
+                    <div class="btn-particle-flow"></div>
+                </button>
+            </form>
+
+            <div class="divider">OR</div>
+
+            <!-- NEW: Join Room Form -->
+            <form id="join-form" class="join-room-form">
+                <input type="text" id="room-code-input" placeholder="Enter Room Code" required>
+                <button type="submit" class="join-btn">Join Room</button>
+            </form>
+
         </div>
     </div>
 

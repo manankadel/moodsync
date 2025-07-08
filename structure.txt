@@ -4,7 +4,6 @@ moodsync/
     moodsync.log
     requirements.txt
     spotify_test.py
-    structure.txt
     weather_test.py
     logs/
         moodsync.log
