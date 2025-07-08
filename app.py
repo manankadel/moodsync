@@ -57,10 +57,11 @@ def get_spotify_token():
         return response.json()['access_token']
     except requests.exceptions.RequestException as e:
         app.logger.error(f"Network error while getting Spotify token: {e}")
-        return None # Return None on network failure
+        return None
     except Exception as e:
         app.logger.error(f"An unexpected error occurred in get_spotify_token: {e}")
         return None
+
 
 def get_youtube_video_id(song_name, artist_name):
     # This function is fine, no changes needed
