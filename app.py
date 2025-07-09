@@ -47,6 +47,7 @@ def get_spotify_credentials():
 
 def get_spotify_token():
     """Get cached Spotify token or fetch new one"""
+    # Check if we have a valid cached token
     if time.time() < spotify_token_cache['expires'] and spotify_token_cache['token']:
         return spotify_token_cache['token']
     
@@ -56,22 +57,44 @@ def get_spotify_token():
         return None
     
     try:
+        # Create base64 encoded auth string
         auth_str = base64.b64encode(f"{client_id}:{client_secret}".encode()).decode()
+        
+        # Make token request
         response = requests.post(
             "https://accounts.spotify.com/api/token",
-            headers={"Authorization": f"Basic {auth_str}"},
+            headers={
+                "Authorization": f"Basic {auth_str}",
+                "Content-Type": "application/x-www-form-urlencoded"
+            },
             data={"grant_type": "client_credentials"},
             timeout=10
         )
-        response.raise_for_status()
+        
+        # Check if request was successful
+        if response.status_code != 200:
+            app.logger.error(f"Spotify token request failed: {response.status_code} - {response.text}")
+            return None
         
         data = response.json()
-        spotify_token_cache['token'] = data['access_token']
-        spotify_token_cache['expires'] = time.time() + data['expires_in'] - 60  # 60s buffer
         
+        # Validate response has required fields
+        if 'access_token' not in data:
+            app.logger.error(f"Invalid token response: {data}")
+            return None
+        
+        # Cache the token
+        spotify_token_cache['token'] = data['access_token']
+        spotify_token_cache['expires'] = time.time() + data.get('expires_in', 3600) - 60  # 60s buffer
+        
+        app.logger.info("Successfully obtained Spotify token")
         return data['access_token']
+        
+    except requests.exceptions.RequestException as e:
+        app.logger.error(f"Spotify token request exception: {e}")
+        return None
     except Exception as e:
-        app.logger.error(f"Spotify token error: {e}")
+        app.logger.error(f"Unexpected error getting Spotify token: {e}")
         return None
 
 def get_spotify_recommendations(mood, limit=15):
