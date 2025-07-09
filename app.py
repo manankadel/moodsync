@@ -1,4 +1,4 @@
-# moodsync/app.py - Optimized Version
+# moodsync/app.py - Fixed Version with No Recursion Issues
 
 import os, base64, random, string, logging, time, requests
 from functools import lru_cache
@@ -17,6 +17,10 @@ socketio = SocketIO(app, cors_allowed_origins="*")
 rooms = {}
 spotify_token_cache = {'token': None, 'expires': 0}
 youtube_cache = {}  # Cache YouTube searches to save quota
+
+# Circuit breaker for Spotify token failures
+token_failure_count = 0
+last_token_failure = 0
 
 # --- MOOD CONFIGURATIONS ---
 # Using valid Spotify seed genres only
@@ -46,14 +50,21 @@ def get_spotify_credentials():
     return os.getenv('SPOTIFY_CLIENT_ID'), os.getenv('SPOTIFY_CLIENT_SECRET')
 
 def get_spotify_token():
-    """Get cached Spotify token or fetch new one"""
+    """Get cached Spotify token or fetch new one with circuit breaker"""
+    global token_failure_count, last_token_failure
+    
+    # Circuit breaker: if we've failed recently, don't try again immediately
+    if token_failure_count >= 3 and time.time() - last_token_failure < 300:  # 5 minute cooldown
+        app.logger.warning("Spotify token circuit breaker active - too many recent failures")
+        return None
+    
     # Check if we have a valid cached token
     if time.time() < spotify_token_cache['expires'] and spotify_token_cache['token']:
         return spotify_token_cache['token']
     
     client_id, client_secret = get_spotify_credentials()
     if not client_id or not client_secret:
-        app.logger.error("Spotify credentials missing")
+        app.logger.error("Spotify credentials missing from environment variables")
         return None
     
     try:
@@ -74,6 +85,8 @@ def get_spotify_token():
         # Check if request was successful
         if response.status_code != 200:
             app.logger.error(f"Spotify token request failed: {response.status_code} - {response.text}")
+            token_failure_count += 1
+            last_token_failure = time.time()
             return None
         
         data = response.json()
@@ -81,26 +94,36 @@ def get_spotify_token():
         # Validate response has required fields
         if 'access_token' not in data:
             app.logger.error(f"Invalid token response: {data}")
+            token_failure_count += 1
+            last_token_failure = time.time()
             return None
         
         # Cache the token
         spotify_token_cache['token'] = data['access_token']
         spotify_token_cache['expires'] = time.time() + data.get('expires_in', 3600) - 60  # 60s buffer
         
+        # Reset failure count on success
+        token_failure_count = 0
+        
         app.logger.info("Successfully obtained Spotify token")
         return data['access_token']
         
     except requests.exceptions.RequestException as e:
         app.logger.error(f"Spotify token request exception: {e}")
+        token_failure_count += 1
+        last_token_failure = time.time()
         return None
     except Exception as e:
         app.logger.error(f"Unexpected error getting Spotify token: {e}")
+        token_failure_count += 1
+        last_token_failure = time.time()
         return None
 
 def get_spotify_recommendations(mood, limit=15):
     """Get Spotify recommendations using seed genres and audio features"""
     token = get_spotify_token()
     if not token:
+        app.logger.error("No Spotify token available for recommendations")
         return []
     
     config = MOOD_CONFIGS.get(mood, MOOD_CONFIGS['happy'])
@@ -127,14 +150,21 @@ def get_spotify_recommendations(mood, limit=15):
             timeout=10
         )
         response.raise_for_status()
-        return response.json().get('tracks', [])
+        tracks = response.json().get('tracks', [])
+        app.logger.info(f"Got {len(tracks)} tracks from Spotify recommendations")
+        return tracks
     except Exception as e:
         app.logger.error(f"Spotify recommendations error: {e}")
-        # Fallback: try with just one genre
+        # Fallback: try with just one genre - PASS THE TOKEN TO AVOID RECURSION
+        app.logger.info("Trying fallback search with existing token")
         return get_spotify_fallback(mood, token, limit)
 
 def get_spotify_fallback(mood, token, limit=15):
-    """Fallback method using search instead of recommendations"""
+    """Fallback method using search instead of recommendations - USES PROVIDED TOKEN"""
+    if not token:
+        app.logger.error("No token provided to fallback function")
+        return []
+        
     try:
         config = MOOD_CONFIGS.get(mood, MOOD_CONFIGS['happy'])
         genre = random.choice(config['seeds'])
@@ -154,112 +184,18 @@ def get_spotify_fallback(mood, token, limit=15):
             timeout=10
         )
         response.raise_for_status()
-        return response.json().get('tracks', {}).get('items', [])
+        tracks = response.json().get('tracks', {}).get('items', [])
+        app.logger.info(f"Got {len(tracks)} tracks from Spotify fallback search")
+        return tracks
     except Exception as e:
         app.logger.error(f"Spotify fallback error: {e}")
         return []
 
-# --- YOUTUBE FUNCTIONS ---
-def get_youtube_video_id(song_name, artist_name):
-    """Get YouTube video ID with caching to save quota"""
-    cache_key = f"{song_name}_{artist_name}".lower()
-    
-    # Check cache first
-    if cache_key in youtube_cache:
-        return youtube_cache[cache_key]
-    
-    youtube_api_key = os.getenv('YOUTUBE_API_KEY')
-    if not youtube_api_key:
-        return None
-    
-    try:
-        youtube = build('youtube', 'v3', developerKey=youtube_api_key)
-        search_query = f"{song_name} {artist_name} official audio"
-        
-        search_request = youtube.search().list(
-            q=search_query,
-            part='snippet',
-            maxResults=1,
-            type='video',
-            videoCategoryId='10'  # Music category
-        )
-        
-        response = search_request.execute()
-        video_id = None
-        
-        if response.get('items'):
-            video_id = response['items'][0]['id']['videoId']
-        
-        # Cache result (even if None) to avoid repeated API calls
-        youtube_cache[cache_key] = video_id
-        return video_id
-        
-    except Exception as e:
-        app.logger.warning(f"YouTube search failed for '{song_name}': {e}")
-        youtube_cache[cache_key] = None
-        return None
-
-# --- PLAYLIST GENERATION ---
-def generate_playlist(mood):
-    """Generate optimized playlist with minimal YouTube API calls"""
-    app.logger.info(f"Generating {mood} playlist...")
-    
-    # Get Spotify recommendations
-    tracks = get_spotify_recommendations(mood, limit=20)
-    
-    # If no tracks, try a simple search approach
-    if not tracks:
-        app.logger.warning("No tracks from recommendations, trying simple search...")
-        tracks = get_simple_spotify_search(mood)
-    
-    if not tracks:
-        raise Exception("No tracks found from Spotify")
-    
-    # Sort by popularity to prioritize likely-to-exist YouTube videos
-    tracks.sort(key=lambda x: x.get('popularity', 0), reverse=True)
-    
-    playlist = []
-    youtube_calls = 0
-    max_youtube_calls = 15  # Limit YouTube API calls
-    
-    for track in tracks:
-        if len(playlist) >= 10:  # Target playlist size
-            break
-            
-        song_name = track.get('name')
-        artist_name = track.get('artists', [{}])[0].get('name')
-        
-        if not song_name or not artist_name:
-            continue
-        
-        # Check cache first, then make API call if needed
-        video_id = youtube_cache.get(f"{song_name}_{artist_name}".lower())
-        
-        if video_id is None and youtube_calls < max_youtube_calls:
-            video_id = get_youtube_video_id(song_name, artist_name)
-            youtube_calls += 1
-        
-        if video_id:
-            album_art = None
-            if track.get('album', {}).get('images'):
-                album_art = track['album']['images'][0]['url']
-            
-            playlist.append({
-                'name': song_name,
-                'artist': artist_name,
-                'albumArt': album_art,
-                'youtubeId': video_id,
-                'duration': track.get('duration_ms', 0) // 1000,
-                'popularity': track.get('popularity', 0)
-            })
-    
-    app.logger.info(f"Generated playlist with {len(playlist)} tracks using {youtube_calls} YouTube API calls")
-    return playlist
-
 def get_simple_spotify_search(mood):
-    """Simple search fallback when recommendations fail"""
+    """Simple search fallback when recommendations fail - GET TOKEN ONCE"""
     token = get_spotify_token()
     if not token:
+        app.logger.error("No Spotify token available for simple search")
         return []
     
     # Simple mood-based search queries
@@ -289,11 +225,126 @@ def get_simple_spotify_search(mood):
             response.raise_for_status()
             tracks = response.json().get('tracks', {}).get('items', [])
             all_tracks.extend(tracks)
+            app.logger.info(f"Simple search '{query}' returned {len(tracks)} tracks")
         except Exception as e:
             app.logger.error(f"Search query '{query}' failed: {e}")
             continue
     
+    app.logger.info(f"Simple search returned {len(all_tracks)} total tracks")
     return all_tracks
+
+# --- YOUTUBE FUNCTIONS ---
+def get_youtube_video_id(song_name, artist_name):
+    """Get YouTube video ID with caching to save quota"""
+    cache_key = f"{song_name}_{artist_name}".lower()
+    
+    # Check cache first
+    if cache_key in youtube_cache:
+        return youtube_cache[cache_key]
+    
+    youtube_api_key = os.getenv('YOUTUBE_API_KEY')
+    if not youtube_api_key:
+        app.logger.warning("YouTube API key not found in environment variables")
+        return None
+    
+    try:
+        youtube = build('youtube', 'v3', developerKey=youtube_api_key)
+        search_query = f"{song_name} {artist_name} official audio"
+        
+        search_request = youtube.search().list(
+            q=search_query,
+            part='snippet',
+            maxResults=1,
+            type='video',
+            videoCategoryId='10'  # Music category
+        )
+        
+        response = search_request.execute()
+        video_id = None
+        
+        if response.get('items'):
+            video_id = response['items'][0]['id']['videoId']
+            app.logger.debug(f"Found YouTube video for '{song_name}' by '{artist_name}': {video_id}")
+        else:
+            app.logger.debug(f"No YouTube video found for '{song_name}' by '{artist_name}'")
+        
+        # Cache result (even if None) to avoid repeated API calls
+        youtube_cache[cache_key] = video_id
+        return video_id
+        
+    except Exception as e:
+        app.logger.warning(f"YouTube search failed for '{song_name}' by '{artist_name}': {e}")
+        youtube_cache[cache_key] = None
+        return None
+
+# --- PLAYLIST GENERATION ---
+def generate_playlist(mood):
+    """Generate optimized playlist with minimal YouTube API calls - IMPROVED ERROR HANDLING"""
+    app.logger.info(f"Starting playlist generation for mood: {mood}")
+    
+    # Get Spotify recommendations
+    tracks = get_spotify_recommendations(mood, limit=20)
+    
+    # If no tracks, try a simple search approach
+    if not tracks:
+        app.logger.warning("No tracks from recommendations, trying simple search...")
+        tracks = get_simple_spotify_search(mood)
+    
+    if not tracks:
+        app.logger.error("No tracks found from any Spotify method")
+        raise Exception("No tracks found from Spotify")
+    
+    app.logger.info(f"Found {len(tracks)} tracks from Spotify")
+    
+    # Sort by popularity to prioritize likely-to-exist YouTube videos
+    tracks.sort(key=lambda x: x.get('popularity', 0), reverse=True)
+    
+    playlist = []
+    youtube_calls = 0
+    max_youtube_calls = 15  # Limit YouTube API calls
+    
+    for track in tracks:
+        if len(playlist) >= 10:  # Target playlist size
+            break
+            
+        song_name = track.get('name')
+        artist_name = track.get('artists', [{}])[0].get('name')
+        
+        if not song_name or not artist_name:
+            app.logger.debug(f"Skipping track with missing name or artist: {track}")
+            continue
+        
+        # Check cache first, then make API call if needed
+        cache_key = f"{song_name}_{artist_name}".lower()
+        video_id = youtube_cache.get(cache_key)
+        
+        if video_id is None and youtube_calls < max_youtube_calls:
+            video_id = get_youtube_video_id(song_name, artist_name)
+            youtube_calls += 1
+        
+        if video_id:
+            album_art = None
+            if track.get('album', {}).get('images'):
+                album_art = track['album']['images'][0]['url']
+            
+            playlist.append({
+                'name': song_name,
+                'artist': artist_name,
+                'albumArt': album_art,
+                'youtubeId': video_id,
+                'duration': track.get('duration_ms', 0) // 1000,
+                'popularity': track.get('popularity', 0)
+            })
+            
+            app.logger.debug(f"Added to playlist: '{song_name}' by '{artist_name}'")
+    
+    app.logger.info(f"Generated playlist with {len(playlist)} tracks using {youtube_calls} YouTube API calls")
+    
+    if not playlist:
+        app.logger.error("No valid tracks found after YouTube processing")
+        raise Exception("No valid tracks found after YouTube processing")
+        
+    return playlist
 
 # --- ROUTES ---
 @app.route('/')
@@ -305,8 +356,10 @@ def generate_route():
     try:
         mood = request.form.get('mood', 'happy').lower()
         if mood not in MOOD_CONFIGS:
+            app.logger.warning(f"Invalid mood '{mood}' provided, defaulting to 'happy'")
             mood = 'happy'
         
+        app.logger.info(f"Generating playlist for mood: {mood}")
         start_time = time.time()
         playlist = generate_playlist(mood)
         generation_time = time.time() - start_time
@@ -329,12 +382,12 @@ def generate_route():
             'created_at': time.time()
         }
         
-        app.logger.info(f"Room {room_code} created in {generation_time:.2f}s")
+        app.logger.info(f"Room {room_code} created successfully in {generation_time:.2f}s with {len(playlist)} tracks")
         return redirect(url_for('view_room', room_code=room_code))
         
     except Exception as e:
         app.logger.error(f"Generate error: {e}")
-        return render_template('error.html', error="Could not create playlist. Please try again."), 500
+        return render_template('error.html', error="Could not create playlist. Please try again later."), 500
 
 @app.route('/room/<string:room_code>')
 def view_room(room_code):
@@ -342,8 +395,10 @@ def view_room(room_code):
     room_data = rooms.get(room_code)
     
     if not room_data:
+        app.logger.warning(f"Room '{room_code}' not found")
         return render_template('error.html', error=f"Room '{room_code}' not found."), 404
     
+    app.logger.info(f"Serving room {room_code} with {len(room_data['playlist'])} tracks")
     return render_template('result.html', 
                          songs=room_data['playlist'], 
                          playlist_title=room_data['title'], 
@@ -391,7 +446,7 @@ def handle_join_room(data):
     emit('load_current_state', room['current_state'], to=sid)
     emit('update_user_list', list(room['users'].values()), to=room_code)
     
-    app.logger.info(f"User {username} joined room {room_code}")
+    app.logger.info(f"User {username} joined room {room_code} (admin: {is_admin})")
 
 @socketio.on('update_player_state')
 def handle_player_state_update(data):
@@ -418,6 +473,7 @@ def handle_disconnect():
     
     for room_code, room in rooms.items():
         if sid in room['users']:
+            user_name = room['users'][sid]['name']
             del room['users'][sid]
             
             # Transfer admin if needed
@@ -426,10 +482,13 @@ def handle_disconnect():
                     new_admin_sid = next(iter(room['users']))
                     room['admin_sid'] = new_admin_sid
                     room['users'][new_admin_sid]['isAdmin'] = True
+                    app.logger.info(f"Admin transferred to {room['users'][new_admin_sid]['name']} in room {room_code}")
                 else:
                     room['admin_sid'] = None
+                    app.logger.info(f"Room {room_code} now has no admin")
             
             emit('update_user_list', list(room['users'].values()), to=room_code)
+            app.logger.info(f"User {user_name} disconnected from room {room_code}")
             break
 
 # --- CLEANUP TASK ---
@@ -447,7 +506,21 @@ def cleanup_old_rooms():
 
 # --- MAIN ---
 if __name__ == '__main__':
-    logging.basicConfig(level=logging.INFO, 
-                       format='%(asctime)s %(levelname)s: %(message)s')
-    app.logger.info("Starting optimized MoodSync server...")
+    # Set up logging
+    logging.basicConfig(
+        level=logging.INFO, 
+        format='%(asctime)s %(levelname)s: %(message)s',
+        handlers=[
+            logging.StreamHandler(),
+            logging.FileHandler('moodsync.log')
+        ]
+    )
+    
+    # Log startup info
+    app.logger.info("=== Starting MoodSync Server ===")
+    app.logger.info(f"Spotify Client ID: {'✓' if os.getenv('SPOTIFY_CLIENT_ID') else '✗'}")
+    app.logger.info(f"Spotify Client Secret: {'✓' if os.getenv('SPOTIFY_CLIENT_SECRET') else '✗'}")
+    app.logger.info(f"YouTube API Key: {'✓' if os.getenv('YOUTUBE_API_KEY') else '✗'}")
+    
+    # Start server
     socketio.run(app, debug=True, host='0.0.0.0', port=5000)
