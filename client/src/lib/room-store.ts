@@ -1,10 +1,11 @@
+// client/src/lib/room-store.ts
+
 import { create } from 'zustand';
 import { io, Socket } from 'socket.io-client';
 
-// DEFINE THE API URL AT THE TOP
 const API_URL = process.env.NEXT_PUBLIC_API_URL || 'http://localhost:5001';
 
-// ... (rest of the interfaces are the same) ...
+// ... (Interfaces are the same)
 interface Song { name: string; artist: string; albumArt: string | null; youtubeId: string; }
 interface User { name: string; isAdmin: boolean; }
 declare global { interface Window { onYouTubeIframeAPIReady: () => void; YT: any; }}
@@ -60,8 +61,9 @@ interface RoomState {
   setCurrentTime: (time: number) => void;
 }
 
+
 export const useRoomStore = create<RoomState>((set, get) => ({
-  // ... (initial state is the same) ...
+  // ... (initial state is the same)
   roomCode: '', playlistTitle: '', playlist: [], users: [],
   currentTrackIndex: 0, isPlaying: false, volume: 80, isCollaborative: false, isLoading: true, error: null, player: null,
   socket: null, isAdmin: false, username: '',
@@ -70,9 +72,9 @@ export const useRoomStore = create<RoomState>((set, get) => ({
   currentTime: 0,
   lyrics: { lines: [], isLoading: false },
 
+
   connect: (roomCode, username) => {
     if (get().socket) return;
-    // USE THE API_URL VARIABLE HERE
     const socket = io(API_URL);
     set({ socket, username, roomCode });
     socket.on('connect', () => socket.emit('join_room', { room_code: roomCode, username }));
@@ -86,8 +88,8 @@ export const useRoomStore = create<RoomState>((set, get) => ({
     socket.on('sync_player_state', (state) => get().syncPlayerState(state));
   },
 
-  // ... (the rest of the store logic is the same) ...
   disconnect: () => { get().socket?.disconnect(); set({ socket: null }); },
+
   _connectAudioGraph: () => {
     const { player, audioNodes } = get();
     if (!player || !audioNodes.context || !audioNodes.bass || !audioNodes.mids || !audioNodes.treble) {
@@ -112,6 +114,7 @@ export const useRoomStore = create<RoomState>((set, get) => ({
       console.error("MoodSync: Failed to connect audio graph. Equalizer will not work.", e);
     }
   },
+
   initializePlayer: (domId) => {
     const onPlayerStateChange = (event: any) => {
       const state = get();
@@ -133,6 +136,7 @@ export const useRoomStore = create<RoomState>((set, get) => ({
         state.socket?.emit('update_player_state', { room_code: state.roomCode, state: { isPlaying: newIsPlaying }});
       }
     };
+
     const onPlayerReady = (event: any) => {
       const player = event.target;
       player.setVolume(get().volume);
@@ -171,9 +175,28 @@ export const useRoomStore = create<RoomState>((set, get) => ({
         player.cueVideoById(playlist[currentTrackIndex].youtubeId);
       }
     };
-    window.onYouTubeIframeAPIReady = () => { new window.YT.Player(domId, { height: '0', width: '0', events: { 'onReady': onPlayerReady, 'onStateChange': onPlayerStateChange } }); };
-    if (window.YT && window.YT.Player) window.onYouTubeIframeAPIReady();
+    
+    // THE FIX IS HERE
+    window.onYouTubeIframeAPIReady = () => {
+      new window.YT.Player(domId, {
+        height: '0',
+        width: '0',
+        playerVars: {
+          // This tells YouTube to trust your domain, fixing the security errors
+          origin: window.location.origin
+        },
+        events: {
+          'onReady': onPlayerReady,
+          'onStateChange': onPlayerStateChange
+        }
+      });
+    };
+    if (window.YT && window.YT.Player) {
+      window.onYouTubeIframeAPIReady();
+    }
   },
+
+  // ... (rest of the file is identical)
   setPlaylistData: (title, playlist) => {
     set({ playlistTitle: title, playlist, isLoading: false, error: null, currentTrackIndex: 0, isPlaying: false });
     const { player } = get();
@@ -276,7 +299,6 @@ export const useRoomStore = create<RoomState>((set, get) => ({
   fetchLyrics: async (youtubeId) => {
     set(state => ({ lyrics: { ...state.lyrics, isLoading: true } }));
     try {
-      // USE THE API_URL VARIABLE HERE
       const response = await fetch(`${API_URL}/api/lyrics/${youtubeId}`);
       if (!response.ok) throw new Error('Lyrics not found.');
       const lines: LyricLine[] = await response.json();

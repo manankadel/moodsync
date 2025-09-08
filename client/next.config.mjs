@@ -1,7 +1,8 @@
+// client/next.config.mjs
+
 /** @type {import('next').NextConfig} */
 const nextConfig = {
   reactStrictMode: true,
-  // Add this images block
   images: {
     remotePatterns: [
       {
