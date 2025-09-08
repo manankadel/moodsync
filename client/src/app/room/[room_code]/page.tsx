@@ -11,6 +11,10 @@ import { useRoomStore } from '@/lib/room-store';
 import { Users, Crown, Copy, Link as LinkIcon, Share2 } from 'lucide-react';
 import WaveButton from '@/components/ui/WaveButton';
 
+// DEFINE THE API URL AT THE TOP
+const API_URL = process.env.NEXT_PUBLIC_API_URL || 'http://localhost:5001';
+
+// ... (rest of the file is the same until fetchRoomData) ...
 const UsernameModal = ({ onSubmit }: { onSubmit: (name: string) => void }) => {
   const [name, setName] = useState('');
   return (
@@ -25,7 +29,6 @@ const UsernameModal = ({ onSubmit }: { onSubmit: (name: string) => void }) => {
     </motion.div>
   );
 };
-
 const RoomSidebar = ({ roomCode, users, isAdmin, isCollaborative, onToggleCollaborative }: { roomCode: string, users: {name: string, isAdmin: boolean}[], isAdmin: boolean, isCollaborative: boolean, onToggleCollaborative: () => void }) => {
     const [copied, setCopied] = useState(false);
     const copyToClipboard = () => {
@@ -85,11 +88,9 @@ export default function RoomPage() {
   const params = useParams();
   const roomCode = params.room_code as string;
   const [showNameModal, setShowNameModal] = useState(true);
-
   const { playlistTitle, playlist, currentTrackIndex, isLoading, error, users, isAdmin, volume, isCollaborative } = useRoomStore();
   const { player, isPlaying } = useRoomStore();
   const { initializePlayer, setPlaylistData, setLoading, setError, playPause, nextTrack, prevTrack, selectTrack, setVolume, connect, disconnect, toggleCollaborative, setCurrentTime } = useRoomStore.getState();
-  
   const currentTrack = playlist[currentTrackIndex];
   const animationFrameId = useRef<number | null>(null);
 
@@ -103,7 +104,8 @@ export default function RoomPage() {
     const fetchRoomData = async () => {
       setLoading(true);
       try {
-        const response = await fetch(`http://localhost:5001/api/room/${roomCode}`);
+        // USE THE API_URL VARIABLE HERE
+        const response = await fetch(`${API_URL}/api/room/${roomCode}`);
         if (!response.ok) throw new Error('Room not found or an error occurred.');
         const data = await response.json();
         setPlaylistData(data.playlist_title, data.playlist);
@@ -119,7 +121,6 @@ export default function RoomPage() {
       }
       animationFrameId.current = requestAnimationFrame(update);
     };
-
     if (isPlaying) {
       animationFrameId.current = requestAnimationFrame(update);
     } else {
@@ -127,7 +128,6 @@ export default function RoomPage() {
         cancelAnimationFrame(animationFrameId.current);
       }
     }
-
     return () => {
       if (animationFrameId.current) {
         cancelAnimationFrame(animationFrameId.current);
@@ -139,18 +139,17 @@ export default function RoomPage() {
     if (roomCode) { connect(roomCode, name); setShowNameModal(false); }
   };
 
+  // ... (rest of the file is the same) ...
   if (showNameModal) {
     return <AnimatePresence>{showNameModal && <UsernameModal onSubmit={handleNameSubmit} />}</AnimatePresence>;
   }
   if (isLoading) return <main className="flex min-h-screen items-center justify-center bg-black"><p className="text-gray-400">Crafting Sonic Space...</p></main>;
   if (error) return <main className="flex min-h-screen flex-col items-center justify-center bg-black p-8 text-center"><h1 className="text-3xl font-semibold text-red-500">Error</h1><p className="mt-2 text-gray-400">{error}</p><Link href="/" className="mt-8 text-cyan-400 hover:text-cyan-300">&larr; Go back home</Link></main>;
-
   return (
     <div className="min-h-screen bg-black text-white overflow-hidden">
       <Script src="https://www.youtube.com/iframe_api" />
       <div id="youtube-player-container" className="fixed -z-10 top-0 left-0"></div>
       <div className="absolute inset-0 z-0 opacity-50"><AnimatePresence>{currentTrack?.albumArt && (<motion.div key={currentTrack.youtubeId} initial={{ opacity: 0, scale: 1.1 }} animate={{ opacity: 1, scale: 1 }} exit={{ opacity: 0, scale: 1.1 }} transition={{ duration: 1.5, ease: "easeInOut" }} className="absolute inset-0"><Image src={currentTrack.albumArt} alt="background" layout="fill" objectFit="cover" className="blur-3xl saturate-50" /></motion.div>)}</AnimatePresence><div className="absolute inset-0 bg-black/70" /></div>
-      
       <main className="relative z-10 grid grid-cols-1 lg:grid-cols-[2fr_1fr] gap-8 xl:gap-16 max-w-7xl mx-auto p-4 sm:p-8 h-screen">
         <div className="flex flex-col h-full pt-8 pb-32">
           <motion.div initial={{ opacity: 0 }} animate={{ opacity: 1 }} transition={{ delay: 0.2 }}>
@@ -170,7 +169,6 @@ export default function RoomPage() {
             <RoomSidebar roomCode={roomCode} users={users} isAdmin={isAdmin} isCollaborative={isCollaborative} onToggleCollaborative={toggleCollaborative} />
         </div>
       </main>
-      
       <AnimatePresence>{currentTrack && (<Player albumArt={currentTrack.albumArt} title={currentTrack.name} artist={currentTrack.artist} isPlaying={isPlaying} onPlayPause={playPause} onNext={nextTrack} onPrev={prevTrack} volume={volume} onVolumeChange={setVolume} />)}</AnimatePresence>
     </div>
   );

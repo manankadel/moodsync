@@ -2,8 +2,11 @@
 import { motion, AnimatePresence } from "framer-motion";
 import { useRouter } from 'next/navigation';
 import { useState } from 'react';
-import WaveButton from "./ui/WaveButton"; // CORRECT IMPORT
+import WaveButton from "./ui/WaveButton";
 import { ArrowLeft, Check } from "lucide-react";
+
+// DEFINE THE API URL AT THE TOP
+const API_URL = process.env.NEXT_PUBLIC_API_URL || 'http://localhost:5001';
 
 const genres = {
   'House': ['deep-house', 'house', 'progressive-house', 'tech-house'],
@@ -14,7 +17,6 @@ const genres = {
 };
 type GenreCategory = keyof typeof genres;
 
-// Helper components are defined correctly
 const CategoryButton = ({ text, onClick, isSelected }: { text: string; onClick: () => void; isSelected: boolean; }) => (
   <button onClick={onClick} className={`p-4 rounded-lg transition-all duration-300 text-center text-white w-full ${isSelected ? 'bg-cyan-400/20 border border-cyan-400' : 'bg-white/5 border border-transparent hover:bg-white/10'}`}>
     {text}
@@ -40,7 +42,8 @@ export default function UIPanel() {
     if (!selectedGenre) return;
     setIsLoading(true);
     try {
-      const response = await fetch('http://localhost:5001/generate', {
+      // USE THE API_URL VARIABLE HERE
+      const response = await fetch(`${API_URL}/generate`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ mood: selectedGenre }),
@@ -66,19 +69,17 @@ export default function UIPanel() {
       setSelectedGenre(null);
   };
 
+  // ... (rest of the file is the same) ...
   return (
     <motion.div layout transition={{ duration: 0.5, type: "spring", bounce: 0.2 }} className="w-full max-w-md">
       <div className="relative rounded-2xl bg-black/40 p-8 shadow-2xl backdrop-blur-xl border border-white/10">
         <AnimatePresence mode="wait">
-          {/* STEP 0: Main Menu */}
           {step === 0 && (
             <motion.div key="step0" initial={{ opacity: 0 }} animate={{ opacity: 1 }} exit={{ opacity: 0 }} className="flex flex-col gap-4">
                 <WaveButton text="Create a Sonic Space" onClick={() => setStep(1)} />
                 <button onClick={() => setStep(2)} className="w-full px-8 py-4 text-lg font-bold text-gray-400 hover:text-white transition-colors">Join a Space</button>
             </motion.div>
           )}
-
-          {/* STEP 1: Create Room Flow */}
           {step === 1 && (
             <motion.div key="step1" initial={{ opacity: 0 }} animate={{ opacity: 1 }} exit={{ opacity: 0 }}>
               <button onClick={resetState} className="absolute top-4 left-4 flex items-center gap-2 text-gray-400 hover:text-white transition-colors text-sm"><ArrowLeft size={16}/> Back</button>
@@ -103,8 +104,6 @@ export default function UIPanel() {
               <WaveButton text={isLoading ? "Architecting..." : "Launch Space"} onClick={handleCreateRoom} disabled={!selectedGenre || isLoading} />
             </motion.div>
           )}
-
-          {/* STEP 2: Join Room Flow */}
           {step === 2 && (
             <motion.div key="step2" initial={{ opacity: 0 }} animate={{ opacity: 1 }} exit={{ opacity: 0 }}>
               <button onClick={resetState} className="absolute top-4 left-4 flex items-center gap-2 text-gray-400 hover:text-white transition-colors text-sm"><ArrowLeft size={16}/> Back</button>

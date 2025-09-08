@@ -1,12 +1,14 @@
 import { create } from 'zustand';
 import { io, Socket } from 'socket.io-client';
 
+// DEFINE THE API URL AT THE TOP
+const API_URL = process.env.NEXT_PUBLIC_API_URL || 'http://localhost:5001';
+
+// ... (rest of the interfaces are the same) ...
 interface Song { name: string; artist: string; albumArt: string | null; youtubeId: string; }
 interface User { name: string; isAdmin: boolean; }
 declare global { interface Window { onYouTubeIframeAPIReady: () => void; YT: any; }}
-
 interface EqualizerSettings { bass: number; mids: number; treble: number; }
-
 interface SyncState {
   isPlaying?: boolean;
   trackIndex?: number;
@@ -14,7 +16,6 @@ interface SyncState {
   isCollaborative?: boolean;
   equalizer?: EqualizerSettings;
 }
-
 interface AudioNodes {
   context: AudioContext | null;
   source: MediaElementAudioSourceNode | null;
@@ -22,12 +23,10 @@ interface AudioNodes {
   mids: BiquadFilterNode | null;
   treble: BiquadFilterNode | null;
 }
-
 interface LyricLine {
   time: number;
   text: string;
 }
-
 interface RoomState {
   roomCode: string; playlistTitle: string; playlist: Song[]; users: User[];
   currentTrackIndex: number; isPlaying: boolean; volume: number; isCollaborative: boolean;
@@ -62,6 +61,7 @@ interface RoomState {
 }
 
 export const useRoomStore = create<RoomState>((set, get) => ({
+  // ... (initial state is the same) ...
   roomCode: '', playlistTitle: '', playlist: [], users: [],
   currentTrackIndex: 0, isPlaying: false, volume: 80, isCollaborative: false, isLoading: true, error: null, player: null,
   socket: null, isAdmin: false, username: '',
@@ -72,7 +72,8 @@ export const useRoomStore = create<RoomState>((set, get) => ({
 
   connect: (roomCode, username) => {
     if (get().socket) return;
-    const socket = io('http://localhost:5001');
+    // USE THE API_URL VARIABLE HERE
+    const socket = io(API_URL);
     set({ socket, username, roomCode });
     socket.on('connect', () => socket.emit('join_room', { room_code: roomCode, username }));
     socket.on('disconnect', () => set({ users: [], isAdmin: false }));
@@ -85,8 +86,8 @@ export const useRoomStore = create<RoomState>((set, get) => ({
     socket.on('sync_player_state', (state) => get().syncPlayerState(state));
   },
 
+  // ... (the rest of the store logic is the same) ...
   disconnect: () => { get().socket?.disconnect(); set({ socket: null }); },
-
   _connectAudioGraph: () => {
     const { player, audioNodes } = get();
     if (!player || !audioNodes.context || !audioNodes.bass || !audioNodes.mids || !audioNodes.treble) {
@@ -111,7 +112,6 @@ export const useRoomStore = create<RoomState>((set, get) => ({
       console.error("MoodSync: Failed to connect audio graph. Equalizer will not work.", e);
     }
   },
-
   initializePlayer: (domId) => {
     const onPlayerStateChange = (event: any) => {
       const state = get();
@@ -133,7 +133,6 @@ export const useRoomStore = create<RoomState>((set, get) => ({
         state.socket?.emit('update_player_state', { room_code: state.roomCode, state: { isPlaying: newIsPlaying }});
       }
     };
-
     const onPlayerReady = (event: any) => {
       const player = event.target;
       player.setVolume(get().volume);
@@ -172,11 +171,9 @@ export const useRoomStore = create<RoomState>((set, get) => ({
         player.cueVideoById(playlist[currentTrackIndex].youtubeId);
       }
     };
-
     window.onYouTubeIframeAPIReady = () => { new window.YT.Player(domId, { height: '0', width: '0', events: { 'onReady': onPlayerReady, 'onStateChange': onPlayerStateChange } }); };
     if (window.YT && window.YT.Player) window.onYouTubeIframeAPIReady();
   },
-
   setPlaylistData: (title, playlist) => {
     set({ playlistTitle: title, playlist, isLoading: false, error: null, currentTrackIndex: 0, isPlaying: false });
     const { player } = get();
@@ -185,9 +182,7 @@ export const useRoomStore = create<RoomState>((set, get) => ({
       if (player) player.cueVideoById(playlist[0].youtubeId);
     }
   },
-  
   _canControl: () => get().isAdmin || get().isCollaborative,
-
   _changeTrack: (index: number) => {
     const { player, socket, roomCode, playlist } = get();
     if (player && get()._canControl() && playlist.length > 0) {
@@ -198,7 +193,6 @@ export const useRoomStore = create<RoomState>((set, get) => ({
       socket?.emit('update_player_state', { room_code: roomCode, state: { isPlaying: true, trackIndex: index }});
     }
   },
-
   playPause: () => {
     if (!get()._canControl()) return;
     const { player, isPlaying, audioNodes } = get();
@@ -211,19 +205,16 @@ export const useRoomStore = create<RoomState>((set, get) => ({
       player?.playVideo();
     }
   },
-  
   nextTrack: () => get()._changeTrack((get().currentTrackIndex + 1) % get().playlist.length),
   prevTrack: () => get()._changeTrack((get().currentTrackIndex - 1 + get().playlist.length) % get().playlist.length),
   selectTrack: (index) => {
     if (index !== get().currentTrackIndex) get()._changeTrack(index);
     else get().playPause();
   },
-  
   setVolume: (volume: number) => {
     get().player?.setVolume(volume);
     set({ volume });
   },
-
   setEqualizer: (settings, emit = true) => {
     const { audioNodes, socket, roomCode, _canControl } = get();
     
@@ -240,7 +231,6 @@ export const useRoomStore = create<RoomState>((set, get) => ({
         });
     }
   },
-
   toggleCollaborative: () => {
       const { isAdmin, socket, roomCode, isCollaborative } = get();
       if(isAdmin) {
@@ -249,7 +239,6 @@ export const useRoomStore = create<RoomState>((set, get) => ({
           socket?.emit('update_player_state', { room_code: roomCode, state: { isCollaborative: newState }});
       }
   },
-
   syncPlayerState: (state) => {
     const { player, playlist, currentTrackIndex, isPlaying, volume, isCollaborative, equalizer } = get();
     if (!player || !playlist || playlist.length === 0) return;
@@ -279,18 +268,16 @@ export const useRoomStore = create<RoomState>((set, get) => ({
         set({ volume: state.volume });
     }
   },
-
   setLoading: (loading) => set({ isLoading: loading }),
   setError: (error) => set({ error, isLoading: false }),
-
   setCurrentTime: (time) => {
     set({ currentTime: time });
   },
-
   fetchLyrics: async (youtubeId) => {
     set(state => ({ lyrics: { ...state.lyrics, isLoading: true } }));
     try {
-      const response = await fetch(`http://localhost:5001/api/lyrics/${youtubeId}`);
+      // USE THE API_URL VARIABLE HERE
+      const response = await fetch(`${API_URL}/api/lyrics/${youtubeId}`);
       if (!response.ok) throw new Error('Lyrics not found.');
       const lines: LyricLine[] = await response.json();
       set({ lyrics: { lines, isLoading: false } });
