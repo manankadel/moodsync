@@ -1,15 +1,14 @@
-// client/src/lib/room-store.ts
-
 import { create } from 'zustand';
 import { io, Socket } from 'socket.io-client';
 
 const API_URL = process.env.NEXT_PUBLIC_API_URL || 'http://localhost:5001';
 
-// ... (Interfaces are the same)
 interface Song { name: string; artist: string; albumArt: string | null; youtubeId: string; }
 interface User { name: string; isAdmin: boolean; }
 declare global { interface Window { onYouTubeIframeAPIReady: () => void; YT: any; }}
+
 interface EqualizerSettings { bass: number; mids: number; treble: number; }
+
 interface SyncState {
   isPlaying?: boolean;
   trackIndex?: number;
@@ -17,6 +16,7 @@ interface SyncState {
   isCollaborative?: boolean;
   equalizer?: EqualizerSettings;
 }
+
 interface AudioNodes {
   context: AudioContext | null;
   source: MediaElementAudioSourceNode | null;
@@ -24,10 +24,12 @@ interface AudioNodes {
   mids: BiquadFilterNode | null;
   treble: BiquadFilterNode | null;
 }
+
 interface LyricLine {
   time: number;
   text: string;
 }
+
 interface RoomState {
   roomCode: string; playlistTitle: string; playlist: Song[]; users: User[];
   currentTrackIndex: number; isPlaying: boolean; volume: number; isCollaborative: boolean;
@@ -61,9 +63,7 @@ interface RoomState {
   setCurrentTime: (time: number) => void;
 }
 
-
 export const useRoomStore = create<RoomState>((set, get) => ({
-  // ... (initial state is the same)
   roomCode: '', playlistTitle: '', playlist: [], users: [],
   currentTrackIndex: 0, isPlaying: false, volume: 80, isCollaborative: false, isLoading: true, error: null, player: null,
   socket: null, isAdmin: false, username: '',
@@ -71,7 +71,6 @@ export const useRoomStore = create<RoomState>((set, get) => ({
   audioNodes: { context: null, source: null, bass: null, mids: null, treble: null },
   currentTime: 0,
   lyrics: { lines: [], isLoading: false },
-
 
   connect: (roomCode, username) => {
     if (get().socket) return;
@@ -176,13 +175,11 @@ export const useRoomStore = create<RoomState>((set, get) => ({
       }
     };
     
-    // THE FIX IS HERE
     window.onYouTubeIframeAPIReady = () => {
       new window.YT.Player(domId, {
         height: '0',
         width: '0',
         playerVars: {
-          // This tells YouTube to trust your domain, fixing the security errors
           origin: window.location.origin
         },
         events: {
@@ -196,7 +193,6 @@ export const useRoomStore = create<RoomState>((set, get) => ({
     }
   },
 
-  // ... (rest of the file is identical)
   setPlaylistData: (title, playlist) => {
     set({ playlistTitle: title, playlist, isLoading: false, error: null, currentTrackIndex: 0, isPlaying: false });
     const { player } = get();
@@ -205,7 +201,9 @@ export const useRoomStore = create<RoomState>((set, get) => ({
       if (player) player.cueVideoById(playlist[0].youtubeId);
     }
   },
+  
   _canControl: () => get().isAdmin || get().isCollaborative,
+
   _changeTrack: (index: number) => {
     const { player, socket, roomCode, playlist } = get();
     if (player && get()._canControl() && playlist.length > 0) {
@@ -216,6 +214,7 @@ export const useRoomStore = create<RoomState>((set, get) => ({
       socket?.emit('update_player_state', { room_code: roomCode, state: { isPlaying: true, trackIndex: index }});
     }
   },
+
   playPause: () => {
     if (!get()._canControl()) return;
     const { player, isPlaying, audioNodes } = get();
@@ -228,16 +227,19 @@ export const useRoomStore = create<RoomState>((set, get) => ({
       player?.playVideo();
     }
   },
+  
   nextTrack: () => get()._changeTrack((get().currentTrackIndex + 1) % get().playlist.length),
   prevTrack: () => get()._changeTrack((get().currentTrackIndex - 1 + get().playlist.length) % get().playlist.length),
   selectTrack: (index) => {
     if (index !== get().currentTrackIndex) get()._changeTrack(index);
     else get().playPause();
   },
+  
   setVolume: (volume: number) => {
     get().player?.setVolume(volume);
     set({ volume });
   },
+
   setEqualizer: (settings, emit = true) => {
     const { audioNodes, socket, roomCode, _canControl } = get();
     
@@ -254,6 +256,7 @@ export const useRoomStore = create<RoomState>((set, get) => ({
         });
     }
   },
+
   toggleCollaborative: () => {
       const { isAdmin, socket, roomCode, isCollaborative } = get();
       if(isAdmin) {
@@ -262,6 +265,8 @@ export const useRoomStore = create<RoomState>((set, get) => ({
           socket?.emit('update_player_state', { room_code: roomCode, state: { isCollaborative: newState }});
       }
   },
+
+  // THIS IS THE CORRECTED FUNCTION
   syncPlayerState: (state) => {
     const { player, playlist, currentTrackIndex, isPlaying, volume, isCollaborative, equalizer } = get();
     if (!player || !playlist || playlist.length === 0) return;
@@ -270,32 +275,45 @@ export const useRoomStore = create<RoomState>((set, get) => ({
         get().setEqualizer(state.equalizer, false);
     }
     
-    if (state.isCollaborative !== undefined && state.isCollaborative !== isCollaborative) set({ isCollaborative: state.isCollaborative });
+    if (state.isCollaborative !== undefined && state.isCollaborative !== isCollaborative) {
+        set({ isCollaborative: state.isCollaborative });
+    }
     
     if (state.trackIndex !== undefined && state.trackIndex !== currentTrackIndex) {
       if(state.trackIndex >= 0 && state.trackIndex < playlist.length) {
-        get()._canControl() ? player.loadVideoById(playlist[state.trackIndex].youtubeId) : player.cueVideoById(playlist[state.trackIndex].youtubeId);
+        // Always use loadVideoById for sync, not cueVideoById.
+        player.loadVideoById(playlist[state.trackIndex].youtubeId);
         set({ currentTrackIndex: state.trackIndex });
+        get().fetchLyrics(playlist[state.trackIndex].youtubeId);
       }
     }
-    if (state.isPlaying !== undefined && state.isPlaying !== isPlaying) {
-      const playerState = player.getPlayerState();
-      setTimeout(() => {
-          if (state.isPlaying && playerState !== window.YT.PlayerState.PLAYING) get().playPause();
-          else if (!state.isPlaying && playerState !== window.YT.PlayerState.PAUSED) get().playPause();
-      }, 100);
-      set({ isPlaying: state.isPlaying });
-    }
+    
     if (state.volume !== undefined && state.volume !== volume) {
         player.setVolume(state.volume);
         set({ volume: state.volume });
     }
+
+    // This is the most critical fix. We command the player directly,
+    // bypassing the `playPause` function which is guarded by `_canControl`.
+    if (state.isPlaying !== undefined && state.isPlaying !== isPlaying) {
+      setTimeout(() => {
+        if (state.isPlaying) {
+          player.playVideo();
+        } else {
+          player.pauseVideo();
+        }
+      }, 150); // Small delay to allow track to load before playing
+      set({ isPlaying: state.isPlaying });
+    }
   },
+
   setLoading: (loading) => set({ isLoading: loading }),
   setError: (error) => set({ error, isLoading: false }),
+
   setCurrentTime: (time) => {
     set({ currentTime: time });
   },
+
   fetchLyrics: async (youtubeId) => {
     set(state => ({ lyrics: { ...state.lyrics, isLoading: true } }));
     try {
