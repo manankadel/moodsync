@@ -2,27 +2,34 @@
 
 ### ./.gitignore ###
 
-# Virtual Environment
+# Python
 venv/
-
-# Python cache files
+env/
+.venv/
 __pycache__/
 *.pyc
 
-# IDE-specific folders
+# Node.js / Next.js
+client/node_modules/
+client/.next/
+client/build/
+.env
+.env.local
+.env.production
+.env.development
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+
+# General
+*.log
+.DS_Store
 .vscode/
 .idea/
 
-# Secret environment variables
-.env
-
-# Log files
-logs/
-*.log
-
 ### ./app.py ###
 
-# moodsync/app.py - Fixed version with proper lrc_kit import
+# moodsync/app.py - Fixed version with proper lrc_kit import and improved caching/playlist logic
 
 import os, base64, random, string, logging, time, requests, json
 from functools import lru_cache
@@ -55,9 +62,16 @@ except ImportError:
 # --- APP INITIALIZATION ---
 load_dotenv()
 app = Flask(__name__)
-CORS(app)
+
+# Use the environment variable for CORS
+cors_origin = os.getenv("CORS_ALLOWED_ORIGIN", "*") 
+CORS(app, origins=cors_origin)
+
 app.secret_key = os.urandom(24)
-socketio = SocketIO(app, cors_allowed_origins="*")
+
+# Also use it for SocketIO
+socketio = SocketIO(app, cors_allowed_origins=cors_origin)
+
 
 # --- DATABASE CONNECTION (REDIS) ---
 try:
@@ -75,7 +89,8 @@ token_failure_count, last_token_failure = 0, 0
 GENRE_CONFIGS = {
     'deep-house': {'seeds': ['deep-house', 'minimal-techno']}, 'house': {'seeds': ['house', 'dance']},
     'progressive-house': {'seeds': ['progressive-house', 'edm']}, 'tech-house': {'seeds': ['tech-house', 'techno']},
-    'techno': {'seeds': ['techno', 'hardstyle', 'industrial']}, 'minimal-techno': {'seeds': ['minimal-techno', 'ambient']},
+    'techno': {'seeds': ['techno', 'hardstyle', 'industrial']}, 
+    'minimal-techno': {'seeds': ['minimal-techno', 'ambient', 'electronic']}, # Added 'electronic' for stability
     'detroit-techno': {'seeds': ['detroit-techno', 'techno']}, 'electronica': {'seeds': ['electronica', 'idm']},
     'edm': {'seeds': ['edm', 'electro', 'dance']}, 'electro': {'seeds': ['electro', 'chicago-house']},
     'dubstep': {'seeds': ['dubstep', 'bass-music']}, 'indie': {'seeds': ['indie', 'indie-pop', 'alternative']},
@@ -229,12 +244,16 @@ def get_room_data(room_code):
 def get_lyrics(video_id):
     app.logger.info(f"--- LYRICS ENDPOINT HIT for video_id: {video_id} ---")
     
-    cache_key = f"lyrics:{video_id}"
+    # --- CACHE BUSTING ---
+    # By changing the key name, we invalidate all old, potentially bad cache entries.
+    cache_key = f"lyrics:v2:{video_id}" 
+    
     cached_lyrics = r.get(cache_key)
     if cached_lyrics:
-        app.logger.info(f"--- Found cached lyrics for {video_id} ---")
+        app.logger.info(f"--- Found valid cached lyrics for {video_id} with new key ---")
         return jsonify(json.loads(cached_lyrics))
 
+    app.logger.info(f"--- No valid cache found for {video_id}. Fetching new lyrics. ---")
     lyrics_json = []
     
     # Method 1: Try lrc_kit first
@@ -242,56 +261,38 @@ def get_lyrics(video_id):
         try:
             app.logger.info(f"--- Attempting lrc_kit for {video_id} ---")
             youtube_url = f"https://www.youtube.com/watch?v={video_id}"
-            result = parse_lyrics(youtube_url)  # NOTE: parse_lyrics, not parse_lyrics_func
+            result = parse_lyrics(youtube_url)
             
             if isinstance(result, tuple) and len(result) >= 2:
                 lyrics_list, metadata = result
                 if lyrics_list:
                     for line in lyrics_list:
-                        if isinstance(line, dict):
-                            time_val = line.get('time', 0)
-                            text_val = line.get('text', '')
-                            if text_val.strip():
-                                lyrics_json.append({'time': time_val, 'text': text_val})
-                        elif hasattr(line, 'time') and hasattr(line, 'text'):
-                            if line.text.strip():
-                                lyrics_json.append({'time': line.time, 'text': line.text})
-                    
+                        if hasattr(line, 'time') and hasattr(line, 'text') and line.text.strip():
+                            lyrics_json.append({'time': line.time, 'text': line.text})
                     if lyrics_json:
-                        app.logger.info(f"--- lrc_kit found lyrics for {video_id} ---")
+                        app.logger.info(f"--- lrc_kit found live lyrics for {video_id} ---")
         except Exception as e:
             app.logger.error(f"--- lrc_kit error for {video_id}: {e} ---")
     
-    # Method 2: Demo lyrics (for testing the feature only)
+    # Method 2: Demo lyrics (Fallback Logic)
     if not lyrics_json:
-        app.logger.info(f"--- Adding demo lyrics for {video_id} to test the feature ---")
+        app.logger.info(f"--- Live lyrics not found. Checking for demo lyrics for {video_id}. ---")
         demo_lyrics = {
-            "4NRXx6U8ABQ": [  # Demo for testing lyrics sync
-                {"time": 0, "text": "[Demo Mode] Testing synchronized lyrics"},
-                {"time": 5, "text": "This is line number one"},
-                {"time": 10, "text": "Here comes line number two"},
-                {"time": 15, "text": "Line three appears now"},
-                {"time": 20, "text": "Fourth line synchronized"},
-                {"time": 25, "text": "Fifth line in the sequence"},
-                {"time": 30, "text": "Demo lyrics help test the feature"},
-                {"time": 35, "text": "Lines appear as song progresses"},
-                {"time": 40, "text": "This shows the timing works"},
-                {"time": 45, "text": "Replace with real lyrics API"}
-            ]
+            "4NRXx6U8ABQ": [{"time": 1, "text": "[Demo] I'm blinded by the lights"}, {"time": 6, "text": "No, I can't sleep until I feel your touch"}],
+            "H5v3kku4y6Q": [{"time": 1, "text": "[Demo] Come on, Harry, we wanna say goodnight to you!"}, {"time": 7, "text": "Holdin' me back"}],
+            "TUVcZfQe-Kw": [{"time": 1, "text": "[Demo] If you wanna run away with me, I know a galaxy"}, {"time": 6, "text": "And I could take you for a ride"}],
+            "JGwWNGJdvx8": [{"time": 1, "text": "[Demo] The club isn't the best place to find a lover"}, {"time": 6, "text": "So the bar is where I go"}],
+            "bCuhuePlP8o": [{"time": 1, "text": "[Demo] I'm going under and this time I fear there's no one to save me"}, {"time": 7, "text": "This all or nothing really got a way of driving me crazy"}]
         }
         
         if video_id in demo_lyrics:
             lyrics_json = demo_lyrics[video_id]
-            app.logger.info(f"--- Using demo lyrics for {video_id} ({len(lyrics_json)} lines) ---")
+            app.logger.info(f"--- Using demo lyrics for {video_id}. ---")
     
-    # Cache the result
+    # Cache the final result with the new key
     r.set(cache_key, json.dumps(lyrics_json), ex=86400)
     
-    if lyrics_json:
-        app.logger.info(f"--- Returning {len(lyrics_json)} lyrics lines for {video_id} ---")
-    else:
-        app.logger.info(f"--- No lyrics found for {video_id} ---")
-    
+    app.logger.info(f"--- Returning {len(lyrics_json)} lyrics lines for {video_id}. ---")
     return jsonify(lyrics_json)
 
 @socketio.on('join_room')

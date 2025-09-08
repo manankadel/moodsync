@@ -61,6 +61,7 @@ interface RoomState {
   _connectAudioGraph: () => void;
   fetchLyrics: (youtubeId: string) => void;
   setCurrentTime: (time: number) => void;
+  primePlayer: () => void;
 }
 
 export const useRoomStore = create<RoomState>((set, get) => ({
@@ -266,7 +267,6 @@ export const useRoomStore = create<RoomState>((set, get) => ({
       }
   },
 
-  // THIS IS THE CORRECTED FUNCTION
   syncPlayerState: (state) => {
     const { player, playlist, currentTrackIndex, isPlaying, volume, isCollaborative, equalizer } = get();
     if (!player || !playlist || playlist.length === 0) return;
@@ -281,7 +281,6 @@ export const useRoomStore = create<RoomState>((set, get) => ({
     
     if (state.trackIndex !== undefined && state.trackIndex !== currentTrackIndex) {
       if(state.trackIndex >= 0 && state.trackIndex < playlist.length) {
-        // Always use loadVideoById for sync, not cueVideoById.
         player.loadVideoById(playlist[state.trackIndex].youtubeId);
         set({ currentTrackIndex: state.trackIndex });
         get().fetchLyrics(playlist[state.trackIndex].youtubeId);
@@ -293,8 +292,6 @@ export const useRoomStore = create<RoomState>((set, get) => ({
         set({ volume: state.volume });
     }
 
-    // This is the most critical fix. We command the player directly,
-    // bypassing the `playPause` function which is guarded by `_canControl`.
     if (state.isPlaying !== undefined && state.isPlaying !== isPlaying) {
       setTimeout(() => {
         if (state.isPlaying) {
@@ -302,7 +299,7 @@ export const useRoomStore = create<RoomState>((set, get) => ({
         } else {
           player.pauseVideo();
         }
-      }, 150); // Small delay to allow track to load before playing
+      }, 150);
       set({ isPlaying: state.isPlaying });
     }
   },
@@ -324,6 +321,21 @@ export const useRoomStore = create<RoomState>((set, get) => ({
     } catch (error) {
       console.error("Failed to fetch lyrics:", error);
       set({ lyrics: { lines: [], isLoading: false } });
+    }
+  },
+
+  primePlayer: () => {
+    const { player, volume } = get();
+    if (player && typeof player.playVideo === 'function') {
+        console.log("Priming player for autoplay...");
+        player.mute();
+        player.playVideo();
+        setTimeout(() => {
+            player.pauseVideo();
+            player.unMute();
+            player.setVolume(volume);
+            console.log("Player primed and ready for synchronized playback.");
+        }, 250);
     }
   },
 }));
