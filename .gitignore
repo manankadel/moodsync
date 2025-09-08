@@ -1,0 +1,24 @@
+# Python
+venv/
+env/
+.venv/
+__pycache__/
+*.pyc
+
+# Node.js / Next.js
+client/node_modules/
+client/.next/
+client/build/
+.env
+.env.local
+.env.production
+.env.development
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+
+# General
+*.log
+.DS_Store
+.vscode/
+.idea/

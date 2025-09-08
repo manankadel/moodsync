@@ -1,0 +1,20 @@
+moodsync/
+    app.py
+    generate_structure.py
+    moodsync.log
+    requirements.txt
+    spotify_test.py
+    weather_test.py
+    logs/
+        moodsync.log
+        moodsync.log.10
+        moodsync.log.2
+    static/
+        mood-interactions.js
+        mood-visualizer.js
+        playlist-visualizer.js
+        style.css
+    templates/
+        error.html
+        index.html
+        result.html

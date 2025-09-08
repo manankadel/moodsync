@@ -1,0 +1,101 @@
+<!-- templates/result.html -->
+
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <title>MoodSync - {{ playlist_title }}</title>
+    <link rel="icon" href="data:image/svg+xml,<svg xmlns=%22http://www.w3.org/2000/svg%22 viewBox=%220 0 100 100%22><text y=%22.9em%22 font-size=%2290%22>🎵</text></svg>">
+    <link rel="stylesheet" href="{{ url_for('static', filename='style.css') }}">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+</head>
+<body>
+    <!-- Hidden div to pass room code to JavaScript -->
+    <div id="room-data" data-room-code="{{ room_code }}"></div>
+
+    <div class="main-container">
+        <!-- Sidebar for participants and room info -->
+        <div class="sidebar">
+            <h3>In The Room</h3>
+            <div class="room-share-info">
+                <p>Room Code:</p>
+                <strong class="room-code-display">{{ room_code }}</strong>
+            </div>
+            <ul id="participant-list">
+                <!-- User list will be populated by JS -->
+            </ul>
+            <a href="/" class="back-btn">Leave Room</a>
+        </div>
+
+        <!-- Main playlist content area -->
+        <div class="playlist-area">
+            <h1 class="playlist-title">{{ playlist_title }}</h1>
+            <div class="playlist-tracks">
+                {% for song in songs %}
+                <div class="track" 
+                     data-youtube-id="{{ song.youtubeId or 'none' }}" 
+                     data-song-name="{{ song.name }}"
+                     data-artist-name="{{ song.artist }}"
+                     data-album-art="{{ song.albumArt or url_for('static', filename='placeholder.png') }}">
+                    <div class="track-number">{{ loop.index }}</div>
+                    <div class="track-album-art">
+                        {% if song.albumArt %}
+                        <img src="{{ song.albumArt }}" alt="{{ song.name }}">
+                        {% else %}
+                        <div class="placeholder-art">🎵</div>
+                        {% endif %}
+                    </div>
+                    <div class="track-info">
+                        <h3 class="track-name">{{ song.name }}</h3>
+                        <p class="track-artist">{{ song.artist }}</p>
+                    </div>
+                </div>
+                {% endfor %}
+            </div>
+        </div>
+    </div>
+
+    <!-- Redesigned Player Bar -->
+    <div id="player-container" class="player-container">
+        <!-- Hidden YouTube Player Iframe -->
+        <div id="youtube-player-wrapper"><div id="youtube-player"></div></div>
+        
+        <!-- Left Section: Song Info -->
+        <div class="player-left">
+            <div id="player-album-art"><img src="" alt="Album Art"></div>
+            <div id="player-info">
+                <span id="now-playing-title">Select a song</span>
+                <span id="now-playing-artist"></span>
+            </div>
+        </div>
+
+        <!-- Center Section: Playback Controls -->
+        <div class="player-center">
+            <div class="controls-wrapper">
+                <button id="prev-btn" class="control-btn"><svg role="img" height="16" width="16" aria-hidden="true" viewBox="0 0 16 16"><path d="M3.3 1a.7.7 0 0 1 .7.7v5.15l9.95-5.744a.7.7 0 0 1 1.05.606v12.575a.7.7 0 0 1-1.05.607L4 8.15V13.3a.7.7 0 0 1-1.4 0V1.7a.7.7 0 0 1 .7-.7z"></path></svg></button>
+                <button id="play-pause-btn" class="control-btn play-btn"></button>
+                <button id="next-btn" class="control-btn"><svg role="img" height="16" width="16" aria-hidden="true" viewBox="0 0 16 16"><path d="M12.7 1a.7.7 0 0 0-.7.7v5.15L2.05 1.107A.7.7 0 0 0 1 1.712v12.575a.7.7 0 0 0 1.05.607L12 8.15V13.3a.7.7 0 0 0 1.4 0V1.7a.7.7 0 0 0-.7-.7z"></path></svg></button>
+            </div>
+            <div class="timeline-wrapper">
+                <span id="current-time">0:00</span>
+                <input type="range" id="timeline-slider" class="slider" value="0" min="0" max="100">
+                <span id="total-time">0:00</span>
+            </div>
+        </div>
+
+        <!-- Right Section: Visualizer and Volume -->
+        <div class="player-right">
+            <canvas id="player-visualizer-canvas" width="150" height="40"></canvas>
+            <div class="volume-wrapper">
+                <svg role="img" height="16" width="16" aria-hidden="true" class="volume-icon" viewBox="0 0 16 16"><path d="M9.741.85a.75.75 0 0 1 .375.65v13a.75.75 0 0 1-1.125.65l-6.925-4a3.642 3.642 0 0 1-1.33-4.967 3.639 3.639 0 0 1 1.33-1.033l6.925-4a.75.75 0 0 1 .75 0zm-6.924 5.3a2.142 2.142 0 0 0-1.033 3.28.75.75 0 0 1 0 .28l.001.002 1.033 1.785a2.14 2.14 0 0 0 2.75-.44l.004-.007a2.14 2.14 0 0 0 .222-.327l.002-.003.001-.002-.001-.002-.002-.003a2.14 2.14 0 0 0-.222-.327l-.004-.007a2.14 2.14 0 0 0-2.75-.44l-1.033-1.785z"></path></svg>
+                <input type="range" id="volume-slider" class="slider" value="100" min="0" max="100">
+            </div>
+        </div>
+    </div>
+
+    <!-- JavaScript Files -->
+    <script src="https://www.youtube.com/iframe_api"></script>
+    <script src="https://cdn.socket.io/4.5.4/socket.io.min.js"></script>
+    <script src="{{ url_for('static', filename='player.js') }}"></script>
+</body>
+</html>

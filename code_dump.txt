@@ -1,0 +1,4192 @@
+
+
+### ./.gitignore ###
+
+# Virtual Environment
+venv/
+
+# Python cache files
+__pycache__/
+*.pyc
+
+# IDE-specific folders
+.vscode/
+.idea/
+
+# Secret environment variables
+.env
+
+# Log files
+logs/
+*.log
+
+### ./app.py ###
+
+# moodsync/app.py - Fixed version with proper lrc_kit import
+
+import os, base64, random, string, logging, time, requests, json
+from functools import lru_cache
+from flask import Flask, jsonify, request
+from flask_socketio import SocketIO, join_room, emit
+from flask_cors import CORS
+from dotenv import load_dotenv
+from googleapiclient.discovery import build
+from googleapiclient import errors
+import redis
+
+# Try different import patterns for lrc_kit
+lrc_kit_available = False
+try:
+    from lrc_kit.lrc import parse_lyrics
+    lrc_kit_available = True
+    print("✅ Successfully imported parse_lyrics from lrc_kit.lrc")
+except ImportError:
+    try:
+        import lrc_kit.lrc as lrc_module
+        parse_lyrics = lrc_module.parse_lyrics
+        lrc_kit_available = True
+        print("✅ Successfully imported parse_lyrics via lrc_module")
+    except (ImportError, AttributeError):
+        print("❌ Could not import lrc_kit parse_lyrics. Lyrics functionality will be disabled.")
+        lrc_kit_available = False
+
+
+
+# --- APP INITIALIZATION ---
+load_dotenv()
+app = Flask(__name__)
+CORS(app)
+app.secret_key = os.urandom(24)
+socketio = SocketIO(app, cors_allowed_origins="*")
+
+# --- DATABASE CONNECTION (REDIS) ---
+try:
+    redis_url = os.getenv('REDIS_URL', 'redis://localhost:6379')
+    r = redis.from_url(redis_url, decode_responses=True)
+    r.ping()
+    app.logger.info(f"Successfully connected to Redis at {redis_url}")
+except redis.exceptions.ConnectionError as e:
+    app.logger.error(f"FATAL: Could not connect to Redis. Error: {e}")
+    exit(1)
+
+# --- GLOBAL CONFIG & FALLBACKS ---
+spotify_token_cache = {'token': None, 'expires': 0}
+token_failure_count, last_token_failure = 0, 0
+GENRE_CONFIGS = {
+    'deep-house': {'seeds': ['deep-house', 'minimal-techno']}, 'house': {'seeds': ['house', 'dance']},
+    'progressive-house': {'seeds': ['progressive-house', 'edm']}, 'tech-house': {'seeds': ['tech-house', 'techno']},
+    'techno': {'seeds': ['techno', 'hardstyle', 'industrial']}, 'minimal-techno': {'seeds': ['minimal-techno', 'ambient']},
+    'detroit-techno': {'seeds': ['detroit-techno', 'techno']}, 'electronica': {'seeds': ['electronica', 'idm']},
+    'edm': {'seeds': ['edm', 'electro', 'dance']}, 'electro': {'seeds': ['electro', 'chicago-house']},
+    'dubstep': {'seeds': ['dubstep', 'bass-music']}, 'indie': {'seeds': ['indie', 'indie-pop', 'alternative']},
+    'indie-pop': {'seeds': ['indie-pop', 'pop']}, 'alternative': {'seeds': ['alternative', 'rock']},
+    'boiler-room': {'search_query': 'Boiler Room set'}, 'live-techno-set': {'search_query': 'live techno set'},
+    'deep-house-mix': {'search_query': 'deep house mix'}, 'default': {'seeds': ['music', 'pop']}
+}
+FALLBACK_PLAYLIST = [
+    {'name': 'Blinding Lights', 'artist': 'The Weeknd', 'albumArt': 'https://i.scdn.co/image/ab67616d0000b2738863bc11d2aa12b54f5aeb36', 'youtubeId': '4NRXx6U8ABQ'},
+    {'name': 'As It Was', 'artist': 'Harry Styles', 'albumArt': 'https://i.scdn.co/image/ab67616d0000b273b46f74097652c7f3a3a08237', 'youtubeId': 'H5v3kku4y6Q'},
+    {'name': 'Levitating', 'artist': 'Dua Lipa', 'albumArt': 'https://i.scdn.co/image/ab67616d0000b273bd2a8d3e3831753690453535', 'youtubeId': 'TUVcZfQe-Kw'},
+    {'name': 'Shape of You', 'artist': 'Ed Sheeran', 'albumArt': 'https://i.scdn.co/image/ab67616d0000b273ba5db46f4b838ef6027e6f96', 'youtubeId': 'JGwWNGJdvx8'},
+    {'name': 'Someone You Loved', 'artist': 'Lewis Capaldi', 'albumArt': 'https://i.scdn.co/image/ab67616d0000b2733e55c33831f2f277d248f2f2', 'youtubeId': 'bCuhuePlP8o'}
+]
+
+# --- API FUNCTIONS ---
+@lru_cache(maxsize=1)
+def get_spotify_credentials(): return os.getenv('SPOTIFY_CLIENT_ID'), os.getenv('SPOTIFY_CLIENT_SECRET')
+
+def get_spotify_token():
+    global token_failure_count, last_token_failure
+    if token_failure_count >= 3 and time.time() - last_token_failure < 300: return None
+    if time.time() < spotify_token_cache['expires'] and spotify_token_cache['token']: return spotify_token_cache['token']
+    client_id, client_secret = get_spotify_credentials()
+    if not client_id or not client_secret: return None
+    try:
+        auth_str = base64.b64encode(f"{client_id}:{client_secret}".encode()).decode()
+        response = requests.post("https://accounts.spotify.com/api/token", headers={"Authorization": f"Basic {auth_str}", "Content-Type": "application/x-www-form-urlencoded"}, data={"grant_type": "client_credentials"}, timeout=10)
+        if response.status_code != 200: token_failure_count += 1; last_token_failure = time.time(); return None
+        data = response.json()
+        if 'access_token' not in data: token_failure_count += 1; last_token_failure = time.time(); return None
+        spotify_token_cache['token'] = data['access_token']
+        spotify_token_cache['expires'] = time.time() + data.get('expires_in', 3600) - 60
+        token_failure_count = 0
+        return data['access_token']
+    except Exception: token_failure_count += 1; last_token_failure = time.time(); return None
+
+def get_youtube_video_id_fallback(query):
+    """Fallback to a public Invidious API if the official YouTube API fails."""
+    try:
+        invidious_api_url = f"https://invidious.io.gg/api/v1/search?q={query}"
+        response = requests.get(invidious_api_url, timeout=10)
+        response.raise_for_status()
+        results = response.json()
+        if results and isinstance(results, list) and len(results) > 0:
+            return results[0].get('videoId')
+        return None
+    except Exception as e:
+        app.logger.error(f"Invidious fallback search failed for '{query}': {e}")
+        return None
+
+def get_youtube_video_id(song_name, artist_name):
+    cache_key = f"youtube:v2:{song_name}_{artist_name}".lower().replace(' ', '_')
+    cached_id = r.get(cache_key)
+    if cached_id: return None if cached_id == "none" else cached_id
+    
+    youtube_api_key = os.getenv('YOUTUBE_API_KEY')
+    video_id = None
+    query = f"{song_name} {artist_name} official audio"
+    
+    if youtube_api_key:
+        try:
+            youtube = build('youtube', 'v3', developerKey=youtube_api_key)
+            search_request = youtube.search().list(q=query, part='snippet', maxResults=1, type='video', videoCategoryId='10')
+            response = search_request.execute()
+            video_id = response['items'][0]['id']['videoId'] if response.get('items') else None
+        except errors.HttpError as e:
+            if 'quotaExceeded' in str(e): app.logger.error(f"YOUTUBE QUOTA EXCEEDED. Trying fallback.")
+            else: app.logger.error(f"YouTube search error for '{query}': {e}")
+            video_id = None
+        except Exception as e:
+            app.logger.error(f"General YouTube API error for '{query}': {e}")
+            video_id = None
+
+    if not video_id:
+        app.logger.info(f"Using Invidious fallback search for '{query}'")
+        video_id = get_youtube_video_id_fallback(query)
+
+    r.set(cache_key, video_id if video_id else "none", ex=86400 * 7)
+    return video_id
+
+def generate_playlist(genre):
+    try:
+        config = GENRE_CONFIGS.get(genre, GENRE_CONFIGS['default'])
+        tracks, token = [], get_spotify_token()
+        if not token: return FALLBACK_PLAYLIST
+        if 'search_query' in config:
+            params = {'q': config['search_query'], 'type': 'track', 'limit': 30, 'market': 'US'}
+            response = requests.get("https://api.spotify.com/v1/search", headers={"Authorization": f"Bearer {token}"}, params=params)
+        else:
+            seeds = random.sample(config['seeds'], min(2, len(config['seeds'])))
+            params = {'seed_genres': ','.join(seeds), 'limit': 30, 'market': 'US'}
+            response = requests.get("https://api.spotify.com/v1/recommendations", headers={"Authorization": f"Bearer {token}"}, params=params)
+        response.raise_for_status()
+        tracks = response.json().get('tracks', {}).get('items', []) or response.json().get('tracks', [])
+        if not tracks: raise Exception(f"No tracks found for genre: {genre}")
+        tracks.sort(key=lambda x: x.get('popularity', 0), reverse=True)
+        playlist = []
+        for track in tracks:
+            if len(playlist) >= 15: break
+            song_name, artist_name = track.get('name'), track.get('artists', [{}])[0].get('name')
+            if not song_name or not artist_name: continue
+            video_id = get_youtube_video_id(song_name, artist_name)
+            if video_id:
+                album_art = track['album']['images'][0]['url'] if track.get('album', {}).get('images') else None
+                playlist.append({'name': song_name, 'artist': artist_name, 'albumArt': album_art, 'youtubeId': video_id})
+        if not playlist: raise Exception("No valid tracks found after YouTube processing.")
+        return playlist
+    except Exception as e:
+        app.logger.warning(f"Playlist generation for '{genre}' failed: {e}. Using guaranteed fallback playlist.")
+        return FALLBACK_PLAYLIST
+
+# --- ROUTES & SOCKETS ---
+@app.route('/generate', methods=['POST'])
+def generate_route():
+    data = request.get_json(); genre = data.get('mood', 'default').lower()
+    playlist = generate_playlist(genre)
+    while True:
+        room_code = ''.join(random.choices(string.ascii_uppercase + string.digits, k=6))
+        if not r.exists(f"room:{room_code}"): break
+    title = genre.replace('-', ' ').title() if genre != 'default' else "Curated Vibes"
+    
+    room_data = {
+        'playlist': playlist, 
+        'title': title, 
+        'users': {}, 
+        'admin_sid': None, 
+        'current_state': {
+            'isPlaying': False, 
+            'trackIndex': 0, 
+            'currentTime': 0, 
+            'volume': 80, 
+            'timestamp': time.time(),
+            'equalizer': {'bass': 0, 'mids': 0, 'treble': 0}
+        }, 
+        'created_at': time.time()
+    }
+    
+    r.set(f"room:{room_code}", json.dumps(room_data), ex=86400)
+    app.logger.info(f"Room {room_code} created.")
+    return jsonify({'room_code': room_code}), 200
+
+@app.route('/api/room/<string:room_code>')
+def get_room_data(room_code):
+    room_code = room_code.upper(); room_data_json = r.get(f"room:{room_code}")
+    if not room_data_json: return jsonify({'error': 'Room not found'}), 404
+    room_data = json.loads(room_data_json)
+    return jsonify({'playlist_title': room_data['title'], 'playlist': room_data['playlist']}), 200
+
+@app.route('/api/lyrics/<string:video_id>')
+def get_lyrics(video_id):
+    app.logger.info(f"--- LYRICS ENDPOINT HIT for video_id: {video_id} ---")
+    
+    cache_key = f"lyrics:{video_id}"
+    cached_lyrics = r.get(cache_key)
+    if cached_lyrics:
+        app.logger.info(f"--- Found cached lyrics for {video_id} ---")
+        return jsonify(json.loads(cached_lyrics))
+
+    lyrics_json = []
+    
+    # Method 1: Try lrc_kit first
+    if lrc_kit_available:
+        try:
+            app.logger.info(f"--- Attempting lrc_kit for {video_id} ---")
+            youtube_url = f"https://www.youtube.com/watch?v={video_id}"
+            result = parse_lyrics(youtube_url)  # NOTE: parse_lyrics, not parse_lyrics_func
+            
+            if isinstance(result, tuple) and len(result) >= 2:
+                lyrics_list, metadata = result
+                if lyrics_list:
+                    for line in lyrics_list:
+                        if isinstance(line, dict):
+                            time_val = line.get('time', 0)
+                            text_val = line.get('text', '')
+                            if text_val.strip():
+                                lyrics_json.append({'time': time_val, 'text': text_val})
+                        elif hasattr(line, 'time') and hasattr(line, 'text'):
+                            if line.text.strip():
+                                lyrics_json.append({'time': line.time, 'text': line.text})
+                    
+                    if lyrics_json:
+                        app.logger.info(f"--- lrc_kit found lyrics for {video_id} ---")
+        except Exception as e:
+            app.logger.error(f"--- lrc_kit error for {video_id}: {e} ---")
+    
+    # Method 2: Demo lyrics (for testing the feature only)
+    if not lyrics_json:
+        app.logger.info(f"--- Adding demo lyrics for {video_id} to test the feature ---")
+        demo_lyrics = {
+            "4NRXx6U8ABQ": [  # Demo for testing lyrics sync
+                {"time": 0, "text": "[Demo Mode] Testing synchronized lyrics"},
+                {"time": 5, "text": "This is line number one"},
+                {"time": 10, "text": "Here comes line number two"},
+                {"time": 15, "text": "Line three appears now"},
+                {"time": 20, "text": "Fourth line synchronized"},
+                {"time": 25, "text": "Fifth line in the sequence"},
+                {"time": 30, "text": "Demo lyrics help test the feature"},
+                {"time": 35, "text": "Lines appear as song progresses"},
+                {"time": 40, "text": "This shows the timing works"},
+                {"time": 45, "text": "Replace with real lyrics API"}
+            ]
+        }
+        
+        if video_id in demo_lyrics:
+            lyrics_json = demo_lyrics[video_id]
+            app.logger.info(f"--- Using demo lyrics for {video_id} ({len(lyrics_json)} lines) ---")
+    
+    # Cache the result
+    r.set(cache_key, json.dumps(lyrics_json), ex=86400)
+    
+    if lyrics_json:
+        app.logger.info(f"--- Returning {len(lyrics_json)} lyrics lines for {video_id} ---")
+    else:
+        app.logger.info(f"--- No lyrics found for {video_id} ---")
+    
+    return jsonify(lyrics_json)
+
+@socketio.on('join_room')
+def handle_join_room(data):
+    room_code = data['room_code'].upper(); username = data.get('username', 'Guest'); sid = request.sid
+    room_data_json = r.get(f"room:{room_code}")
+    if not room_data_json: emit('error', {'message': 'Room not found'}); return
+    room_data = json.loads(room_data_json); join_room(room_code)
+    is_admin = not room_data.get('admin_sid') or not room_data.get('users')
+    if is_admin: room_data['admin_sid'] = sid
+    room_data['users'][sid] = {'name': username, 'isAdmin': is_admin}
+    r.set(f"room:{room_code}", json.dumps(room_data), ex=86400)
+    emit('load_current_state', room_data['current_state'], to=sid)
+    emit('update_user_list', list(room_data['users'].values()), to=room_code)
+    app.logger.info(f"User '{username}' ({sid}) joined room {room_code}. Admin: {is_admin}")
+
+@socketio.on('update_player_state')
+def handle_player_state_update(data):
+    room_code = data['room_code'].upper(); sid = request.sid
+    room_data_json = r.get(f"room:{room_code}");
+    if not room_data_json: return
+    room_data = json.loads(room_data_json)
+    if room_data.get('admin_sid') != sid: return
+    room_data['current_state'].update(data['state'])
+    room_data['current_state']['timestamp'] = time.time()
+    r.set(f"room:{room_code}", json.dumps(room_data), ex=86400)
+    emit('sync_player_state', data['state'], to=room_code, include_self=False)
+
+@socketio.on('disconnect')
+def handle_disconnect():
+    sid = request.sid
+    for key in r.scan_iter("room:*"):
+        try:
+            room_data_str = r.get(key)
+            if not room_data_str: continue
+            room_data = json.loads(room_data_str)
+            if sid in room_data.get('users', {}):
+                room_code = key.split(":")[1]; user_name = room_data['users'][sid]['name']
+                del room_data['users'][sid]
+                if room_data.get('admin_sid') == sid:
+                    if room_data['users']:
+                        new_admin_sid = next(iter(room_data['users'])); room_data['admin_sid'] = new_admin_sid
+                        room_data['users'][new_admin_sid]['isAdmin'] = True
+                    else: room_data['admin_sid'] = None
+                r.set(key, json.dumps(room_data), ex=86400)
+                emit('update_user_list', list(room_data['users'].values()), to=room_code)
+                app.logger.info(f"User '{user_name}' disconnected from room {room_code}")
+                break
+        except (json.JSONDecodeError, TypeError): continue
+
+if __name__ == '__main__':
+    logging.basicConfig(level=logging.INFO, format='%(asctime)s %(levelname)s: %(message)s')
+    app.logger.info("=== Starting MoodSync API Server (Fixed Version) ===")
+    if lrc_kit_available:
+        app.logger.info("✅ Lyrics functionality enabled")
+    else:
+        app.logger.warning("❌ Lyrics functionality disabled - lrc_kit not available")
+    socketio.run(app, debug=True, use_reloader=False, host='0.0.0.0', port=5001)
+
+### ./client/next-env.d.ts ###
+
+/// <reference types="next" />
+/// <reference types="next/image-types/global" />
+
+// NOTE: This file should not be edited
+// see https://nextjs.org/docs/basic-features/typescript for more information.
+
+
+### ./client/next.config.mjs ###
+
+/** @type {import('next').NextConfig} */
+const nextConfig = {
+  reactStrictMode: true,
+  // Add this images block
+  images: {
+    remotePatterns: [
+      {
+        protocol: 'https',
+        hostname: 'i.scdn.co',
+        port: '',
+        pathname: '/image/**',
+      },
+    ],
+  },
+};
+
+export default nextConfig;
+
+### ./client/package.json ###
+
+{
+  "name": "moodsync-client",
+  "version": "0.1.0",
+  "private": true,
+  "scripts": {
+    "dev": "next dev",
+    "build": "next build",
+    "start": "next start",
+    "lint": "next lint"
+  },
+  "dependencies": {
+    "@react-three/drei": "^9.102.6",
+    "@react-three/fiber": "^8.15.19",
+    "clsx": "^2.1.0",
+    "framer-motion": "^11.0.8",
+    "lucide-react": "^0.354.0",
+    "next": "14.1.3",
+    "react": "^18",
+    "react-dom": "^18",
+    "socket.io-client": "^4.7.4",
+    "tailwind-merge": "^2.2.1",
+    "three": "^0.162.0",
+    "zustand": "^4.5.2"
+  },
+  "devDependencies": {
+    "@types/node": "^20",
+    "@types/react": "^18",
+    "@types/react-dom": "^18",
+    "@types/three": "^0.162.0",
+    "autoprefixer": "^10.0.1",
+    "eslint": "^8",
+    "eslint-config-next": "14.1.3",
+    "postcss": "^8",
+    "tailwindcss": "^3.3.0",
+    "typescript": "^5"
+  }
+}
+
+### ./client/postcss.config.js ###
+
+module.exports = {
+  plugins: {
+    tailwindcss: {},
+    autoprefixer: {},
+  },
+}
+
+### ./client/src/app/globals.css ###
+
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+### ./client/src/app/layout.tsx ###
+
+import type { Metadata } from "next";
+import { Sora } from "next/font/google"; // Import Sora
+import "./globals.css";
+
+// Configure the font with the weights we need
+const sora = Sora({
+  subsets: ["latin"],
+  weight: ["300", "400", "600"], // Light, Regular, Semi-bold
+});
+
+export const metadata: Metadata = {
+  title: "MoodSync",
+  description: "Craft your sonic space.",
+};
+
+export default function RootLayout({
+  children,
+}: Readonly<{
+  children: React.ReactNode;
+}>) {
+  return (
+    <html lang="en">
+      {/* Apply the font's class name to the body */}
+      <body className={sora.className}>{children}</body>
+    </html>
+  );
+}
+
+### ./client/src/app/page.tsx ###
+
+import Navigation from "../components/navigation";
+import Hero from "../components/hero";
+import Features from "../components/features";
+import Cta from "../components/cta";
+
+export default function LandingPage() {
+  return (
+    <div className="bg-black text-white">
+      <Navigation />
+      <main>
+        <Hero />
+        <Features />
+        <Cta />
+      </main>
+    </div>
+  );
+}
+
+### ./client/src/app/room/[room_code]/page.tsx ###
+
+"use client";
+
+import { useParams } from 'next/navigation';
+import Link from 'next/link';
+import { useEffect, useState, useRef } from 'react';
+import { motion, AnimatePresence } from 'framer-motion';
+import Image from 'next/image';
+import Script from 'next/script';
+import Player from '@/components/player';
+import { useRoomStore } from '@/lib/room-store';
+import { Users, Crown, Copy, Link as LinkIcon, Share2 } from 'lucide-react';
+import WaveButton from '@/components/ui/WaveButton';
+
+const UsernameModal = ({ onSubmit }: { onSubmit: (name: string) => void }) => {
+  const [name, setName] = useState('');
+  return (
+    <motion.div initial={{ opacity: 0 }} animate={{ opacity: 1 }} exit={{ opacity: 0 }} className="fixed inset-0 z-50 bg-black/80 backdrop-blur-sm flex items-center justify-center p-4">
+      <motion.div initial={{ scale: 0.9, opacity: 0 }} animate={{ scale: 1, opacity: 1 }} transition={{ delay: 0.2, ease: "circOut" }} className="bg-black/50 border border-white/10 rounded-xl p-8 shadow-2xl w-full max-w-sm">
+        <h2 className="text-2xl font-semibold text-white mb-6 text-center">Enter Your Name</h2>
+        <form className="flex flex-col gap-4" onSubmit={(e) => { e.preventDefault(); if (name.trim()) onSubmit(name.trim()); }}>
+          <input type="text" value={name} onChange={(e) => setName(e.target.value)} placeholder="Your display name..." className="w-full rounded-md border border-white/10 bg-white/5 px-4 py-3 text-white text-center outline-none focus:border-cyan-400/50 focus:ring-2 focus:ring-cyan-400/30 transition-all" autoFocus />
+          <WaveButton text="Enter Sonic Space" type="submit" disabled={!name.trim()} />
+        </form>
+      </motion.div>
+    </motion.div>
+  );
+};
+
+const RoomSidebar = ({ roomCode, users, isAdmin, isCollaborative, onToggleCollaborative }: { roomCode: string, users: {name: string, isAdmin: boolean}[], isAdmin: boolean, isCollaborative: boolean, onToggleCollaborative: () => void }) => {
+    const [copied, setCopied] = useState(false);
+    const copyToClipboard = () => {
+        navigator.clipboard.writeText(window.location.href);
+        setCopied(true);
+        setTimeout(() => setCopied(false), 2000);
+    };
+
+    return (
+        <aside className="hidden lg:flex flex-col gap-8 sticky top-8">
+            <motion.div initial={{opacity: 0, x: 20}} animate={{opacity: 1, x: 0}} transition={{delay: 0.5}}>
+                <h2 className="text-sm font-light text-gray-400 mb-2">Share This Space</h2>
+                <div className="flex items-center gap-2 p-3 rounded-lg bg-white/5 border border-white/10">
+                    <LinkIcon size={16} className="text-gray-500 flex-shrink-0" />
+                    <span className="font-mono text-sm font-semibold tracking-wide text-gray-400 truncate">{`moodsync.app/${roomCode}`}</span>
+                    <button onClick={copyToClipboard} className="ml-auto p-2 rounded-md hover:bg-white/10 transition-colors" title="Copy link">
+                        <Copy size={16} className={copied ? "text-cyan-400" : "text-gray-400"} />
+                    </button>
+                </div>
+                {copied && <p className="text-xs text-cyan-400 mt-2 animate-pulse">Link copied!</p>}
+            </motion.div>
+            <motion.div initial={{opacity: 0, x: 20}} animate={{opacity: 1, x: 0}} transition={{delay: 0.6}}>
+                <h2 className="text-sm font-light text-gray-400 mb-3">In The Room ({users.length})</h2>
+                <div className="space-y-2 max-h-64 overflow-y-auto pr-2">
+                    {users.map((user) => (
+                        <div key={user.name} className="flex items-center gap-3 p-2 rounded-md bg-white/5">
+                            <span className="text-sm text-white truncate">{user.name}</span>
+                            {user.isAdmin && <Crown size={14} className="ml-auto text-amber-400 flex-shrink-0" aria-label="Room Admin" />}
+                        </div>
+                    ))}
+                </div>
+            </motion.div>
+            {isAdmin && (
+                <motion.div initial={{opacity: 0, x: 20}} animate={{opacity: 1, x: 0}} transition={{delay: 0.7}}>
+                    <h2 className="text-sm font-light text-gray-400 mb-3">Admin Controls</h2>
+                    <div className="p-4 rounded-lg bg-white/5 border border-white/10">
+                        <label htmlFor="collaborative-toggle" className="flex items-center justify-between cursor-pointer">
+                            <div className="flex items-center gap-3">
+                                <Share2 size={16} className="text-cyan-400"/>
+                                <span className="text-white font-medium">Collaborative Playback</span>
+                            </div>
+                            <div className="relative">
+                                <input id="collaborative-toggle" type="checkbox" className="sr-only" checked={isCollaborative} onChange={onToggleCollaborative} />
+                                <div className="block bg-gray-600 w-10 h-6 rounded-full"></div>
+                                <div className={`dot absolute left-1 top-1 bg-white w-4 h-4 rounded-full transition-transform ${isCollaborative ? 'translate-x-4 bg-cyan-400' : ''}`}></div>
+                            </div>
+                        </label>
+                        <p className="text-xs text-gray-500 mt-2">Allow anyone in the room to control the music.</p>
+                    </div>
+                </motion.div>
+            )}
+        </aside>
+    );
+};
+
+export default function RoomPage() {
+  const params = useParams();
+  const roomCode = params.room_code as string;
+  const [showNameModal, setShowNameModal] = useState(true);
+
+  const { playlistTitle, playlist, currentTrackIndex, isLoading, error, users, isAdmin, volume, isCollaborative } = useRoomStore();
+  const { player, isPlaying } = useRoomStore();
+  const { initializePlayer, setPlaylistData, setLoading, setError, playPause, nextTrack, prevTrack, selectTrack, setVolume, connect, disconnect, toggleCollaborative, setCurrentTime } = useRoomStore.getState();
+  
+  const currentTrack = playlist[currentTrackIndex];
+  const animationFrameId = useRef<number | null>(null);
+
+  useEffect(() => {
+    initializePlayer('youtube-player-container');
+    return () => { disconnect(); }
+  }, [initializePlayer, disconnect]);
+
+  useEffect(() => {
+    if (!roomCode || showNameModal) return;
+    const fetchRoomData = async () => {
+      setLoading(true);
+      try {
+        const response = await fetch(`http://localhost:5001/api/room/${roomCode}`);
+        if (!response.ok) throw new Error('Room not found or an error occurred.');
+        const data = await response.json();
+        setPlaylistData(data.playlist_title, data.playlist);
+      } catch (err) { setError(err instanceof Error ? err.message : 'An unknown error occurred.'); }
+    };
+    fetchRoomData();
+  }, [roomCode, showNameModal, setPlaylistData, setLoading, setError]);
+  
+  useEffect(() => {
+    const update = () => {
+      if (player && typeof player.getCurrentTime === 'function') {
+        setCurrentTime(player.getCurrentTime());
+      }
+      animationFrameId.current = requestAnimationFrame(update);
+    };
+
+    if (isPlaying) {
+      animationFrameId.current = requestAnimationFrame(update);
+    } else {
+      if (animationFrameId.current) {
+        cancelAnimationFrame(animationFrameId.current);
+      }
+    }
+
+    return () => {
+      if (animationFrameId.current) {
+        cancelAnimationFrame(animationFrameId.current);
+      }
+    };
+  }, [isPlaying, player, setCurrentTime]);
+
+  const handleNameSubmit = (name: string) => {
+    if (roomCode) { connect(roomCode, name); setShowNameModal(false); }
+  };
+
+  if (showNameModal) {
+    return <AnimatePresence>{showNameModal && <UsernameModal onSubmit={handleNameSubmit} />}</AnimatePresence>;
+  }
+  if (isLoading) return <main className="flex min-h-screen items-center justify-center bg-black"><p className="text-gray-400">Crafting Sonic Space...</p></main>;
+  if (error) return <main className="flex min-h-screen flex-col items-center justify-center bg-black p-8 text-center"><h1 className="text-3xl font-semibold text-red-500">Error</h1><p className="mt-2 text-gray-400">{error}</p><Link href="/" className="mt-8 text-cyan-400 hover:text-cyan-300">&larr; Go back home</Link></main>;
+
+  return (
+    <div className="min-h-screen bg-black text-white overflow-hidden">
+      <Script src="https://www.youtube.com/iframe_api" />
+      <div id="youtube-player-container" className="fixed -z-10 top-0 left-0"></div>
+      <div className="absolute inset-0 z-0 opacity-50"><AnimatePresence>{currentTrack?.albumArt && (<motion.div key={currentTrack.youtubeId} initial={{ opacity: 0, scale: 1.1 }} animate={{ opacity: 1, scale: 1 }} exit={{ opacity: 0, scale: 1.1 }} transition={{ duration: 1.5, ease: "easeInOut" }} className="absolute inset-0"><Image src={currentTrack.albumArt} alt="background" layout="fill" objectFit="cover" className="blur-3xl saturate-50" /></motion.div>)}</AnimatePresence><div className="absolute inset-0 bg-black/70" /></div>
+      
+      <main className="relative z-10 grid grid-cols-1 lg:grid-cols-[2fr_1fr] gap-8 xl:gap-16 max-w-7xl mx-auto p-4 sm:p-8 h-screen">
+        <div className="flex flex-col h-full pt-8 pb-32">
+          <motion.div initial={{ opacity: 0 }} animate={{ opacity: 1 }} transition={{ delay: 0.2 }}>
+            <h1 className="text-3xl sm:text-4xl font-bold tracking-tight text-white">{playlistTitle}</h1>
+          </motion.div>
+          <motion.ul initial="hidden" animate="visible" className="mt-8 space-y-2 pr-4 -mr-4 flex-1 overflow-y-auto">
+            {playlist.map((song, index) => (
+              <motion.li key={song.youtubeId || index} onClick={() => selectTrack(index)} className={`relative flex items-center gap-4 p-3 rounded-lg border transition-all duration-300 ${(isAdmin || isCollaborative) ? 'cursor-pointer' : 'cursor-default'} ${currentTrackIndex === index ? 'bg-white/10 border-white/20' : 'bg-transparent border-transparent hover:bg-white/5'}`}>
+                <AnimatePresence>{currentTrackIndex === index && (<motion.div layoutId="playing-indicator" className="absolute inset-0 rounded-lg border-2 border-cyan-400"/>)}</AnimatePresence>
+                <div className="relative h-12 w-12 rounded-md overflow-hidden bg-gray-800 flex-shrink-0">{song.albumArt ? <Image src={song.albumArt} alt={song.name} layout="fill" objectFit="cover" /> : null}</div>
+                <div className="relative flex-grow min-w-0"><p className="font-semibold text-white truncate">{song.name}</p><p className="text-sm text-gray-400 truncate">{song.artist}</p></div>
+              </motion.li>
+            ))}
+          </motion.ul>
+        </div>
+        <div className="h-full flex flex-col justify-start pt-8">
+            <RoomSidebar roomCode={roomCode} users={users} isAdmin={isAdmin} isCollaborative={isCollaborative} onToggleCollaborative={toggleCollaborative} />
+        </div>
+      </main>
+      
+      <AnimatePresence>{currentTrack && (<Player albumArt={currentTrack.albumArt} title={currentTrack.name} artist={currentTrack.artist} isPlaying={isPlaying} onPlayPause={playPause} onNext={nextTrack} onPrev={prevTrack} volume={volume} onVolumeChange={setVolume} />)}</AnimatePresence>
+    </div>
+  );
+}
+
+### ./client/src/components/Equalizer.tsx ###
+
+import { motion } from "framer-motion";
+import { useRoomStore } from "@/lib/room-store";
+
+const Equalizer = () => {
+  // Select the relevant state and actions from the Zustand store.
+  const { equalizer, setEqualizer, isAdmin, isCollaborative } = useRoomStore(
+    (state) => ({
+      equalizer: state.equalizer,
+      setEqualizer: state.setEqualizer,
+      isAdmin: state.isAdmin,
+      isCollaborative: state.isCollaborative,
+    })
+  );
+
+  // Determine if the current user has control over the equalizer.
+  const canControl = isAdmin || isCollaborative;
+
+  // Handle changes from the range sliders.
+  const handleChange = (band: "bass" | "mids" | "treble", value: string) => {
+    const numericValue = Number(value);
+    setEqualizer({ ...equalizer, [band]: numericValue });
+  };
+
+  return (
+    <motion.div
+      initial={{ opacity: 0, y: 10 }}
+      animate={{ opacity: 1, y: 0 }}
+      exit={{ opacity: 0, y: 10, transition: { duration: 0.2 } }}
+      className="absolute bottom-24 right-0 flex items-center gap-4 bg-black/50 border border-white/10 backdrop-blur-md rounded-lg p-4 shadow-2xl"
+    >
+      {/* Slider for Bass */}
+      <div className="flex flex-col items-center gap-2">
+        <label htmlFor="bass-slider" className="text-xs font-bold text-white tracking-widest">
+          BASS
+        </label>
+        <input
+          id="bass-slider"
+          type="range"
+          min="-10"
+          max="10"
+          step="0.5"
+          value={equalizer.bass}
+          onChange={(e) => handleChange("bass", e.target.value)}
+          disabled={!canControl}
+          className="w-20 h-1 bg-gray-700 rounded-full appearance-none cursor-pointer accent-cyan-400 disabled:opacity-50"
+          title={`Bass: ${equalizer.bass} dB`}
+        />
+      </div>
+      {/* Slider for Mids */}
+      <div className="flex flex-col items-center gap-2">
+        <label htmlFor="mids-slider" className="text-xs font-bold text-white tracking-widest">
+          MIDS
+        </label>
+        <input
+          id="mids-slider"
+          type="range"
+          min="-10"
+          max="10"
+          step="0.5"
+          value={equalizer.mids}
+          onChange={(e) => handleChange("mids", e.target.value)}
+          disabled={!canControl}
+          className="w-20 h-1 bg-gray-700 rounded-full appearance-none cursor-pointer accent-pink-400 disabled:opacity-50"
+          title={`Mids: ${equalizer.mids} dB`}
+        />
+      </div>
+      {/* Slider for Treble */}
+      <div className="flex flex-col items-center gap-2">
+        <label htmlFor="treble-slider" className="text-xs font-bold text-white tracking-widest">
+          TREBLE
+        </label>
+        <input
+          id="treble-slider"
+          type="range"
+          min="-10"
+          max="10"
+          step="0.5"
+          value={equalizer.treble}
+          onChange={(e) => handleChange("treble", e.target.value)}
+          disabled={!canControl}
+          className="w-20 h-1 bg-gray-700 rounded-full appearance-none cursor-pointer accent-amber-400 disabled:opacity-50"
+          title={`Treble: ${equalizer.treble} dB`}
+        />
+      </div>
+    </motion.div>
+  );
+};
+
+export default Equalizer;
+
+### ./client/src/components/Lyrics.tsx ###
+
+"use client";
+
+import { useRoomStore } from "@/lib/room-store";
+import { AnimatePresence, motion } from "framer-motion";
+import { useEffect, useRef } from "react";
+
+const Lyrics = () => {
+  const { lines, isLoading } = useRoomStore((state) => state.lyrics);
+  const currentTime = useRoomStore((state) => state.currentTime);
+  const scrollContainerRef = useRef<HTMLDivElement>(null);
+
+  // Find the index of the currently active lyric line
+  const activeLineIndex = lines.findIndex((line, index) => {
+    const nextLine = lines[index + 1];
+    return currentTime >= line.time && (!nextLine || currentTime < nextLine.time);
+  });
+
+  // Automatically scroll the active line into view
+  useEffect(() => {
+    const container = scrollContainerRef.current;
+    if (container && activeLineIndex >= 0) {
+      const activeElement = container.children[activeLineIndex] as HTMLElement;
+      if (activeElement) {
+        const containerHeight = container.offsetHeight;
+        const elementTop = activeElement.offsetTop;
+        const elementHeight = activeElement.offsetHeight;
+        
+        container.scrollTo({
+          top: elementTop - containerHeight / 2 + elementHeight / 2,
+          behavior: "smooth",
+        });
+      }
+    }
+  }, [activeLineIndex]);
+
+  const renderContent = () => {
+    if (isLoading) {
+      return <div className="text-gray-400">Loading Lyrics...</div>;
+    }
+    if (lines.length === 0) {
+      return <div className="text-gray-400">Synchronized lyrics not available for this track.</div>;
+    }
+    return lines.map((line, index) => (
+      <motion.p
+        key={`${line.time}-${index}`}
+        animate={{
+          opacity: index === activeLineIndex ? 1 : 0.4,
+          scale: index === activeLineIndex ? 1.05 : 1,
+          x: index === activeLineIndex ? 5 : 0,
+        }}
+        transition={{ duration: 0.5, ease: "circOut" }}
+        className="font-semibold text-2xl text-white transition-colors duration-300"
+      >
+        {line.text}
+      </motion.p>
+    ));
+  };
+  
+  return (
+    <motion.div
+      initial={{ opacity: 0, y: 50 }}
+      animate={{ opacity: 1, y: 0 }}
+      exit={{ opacity: 0, y: 50 }}
+      transition={{ duration: 0.5, ease: "circOut" }}
+      className="absolute inset-x-0 bottom-full mb-4 h-[50vh] bg-black/60 backdrop-blur-xl border-t border-b border-white/10 rounded-t-2xl shadow-2xl"
+    >
+      <div
+        ref={scrollContainerRef}
+        className="h-full flex flex-col gap-8 justify-center items-start p-12 overflow-y-auto text-left"
+      >
+        {renderContent()}
+      </div>
+    </motion.div>
+  );
+};
+
+export default Lyrics;
+
+### ./client/src/components/cta.tsx ###
+
+"use client";
+import UIPanel from "./ui-panel";
+import { motion } from "framer-motion";
+
+export default function Cta() {
+  return (
+    <section className="relative py-24 px-4 overflow-hidden bg-black">
+      {/* We reuse the Ethereal Grid background for consistency */}
+      <div className="absolute inset-0 z-0">
+        <div className="absolute inset-0 bg-gradient-to-t from-gray-900 via-black to-black" />
+        <div className="absolute -bottom-72 -right-72 h-[40rem] w-[40rem] rounded-full bg-purple-500/10 blur-3xl" />
+        <div
+          className="absolute inset-0"
+          style={{
+            backgroundImage: `
+              repeating-linear-gradient(0deg, transparent, transparent 1px, rgba(255, 255, 255, 0.03) 1px, rgba(255, 255, 255, 0.03) 2px),
+              repeating-linear-gradient(90deg, transparent, transparent 1px, rgba(255, 255, 255, 0.03) 1px, rgba(255, 255, 255, 0.03) 2px)
+            `,
+            backgroundSize: "60px 60px",
+            maskImage: "radial-gradient(ellipse 80% 50% at 50% 50%, black, transparent)",
+          }}
+        />
+      </div>
+
+      {/* Foreground content */}
+      <div className="relative z-10 flex flex-col items-center">
+        <motion.div 
+          initial={{ opacity: 0, y: 20 }}
+          whileInView={{ opacity: 1, y: 0 }}
+          viewport={{ once: true, amount: 0.5 }}
+          transition={{ duration: 0.8 }}
+          className="text-center mb-12"
+        >
+          <h2 className="text-4xl md:text-5xl font-semibold tracking-tight text-white">
+            Enter Your Space
+          </h2>
+          <p className="mt-4 max-w-xl mx-auto text-lg text-gray-400">
+            Your journey into sound begins now. Create a new room or join an existing one.
+          </p>
+        </motion.div>
+        
+        <UIPanel />
+      </div>
+    </section>
+  );
+}
+
+### ./client/src/components/features.tsx ###
+
+"use client";
+import { motion } from "framer-motion";
+import { BrainCircuit, Users, Globe } from "lucide-react";
+
+const features = [
+  {
+    icon: <BrainCircuit className="h-8 w-8 text-purple-400" />,
+    title: "Intelligent Curation",
+    description: "Our algorithm analyzes mood and context to generate playlists that feel uniquely personal and deeply resonant.",
+  },
+  {
+    icon: <Users className="h-8 w-8 text-sky-400" />,
+    title: "Synchronized Spaces",
+    description: "Experience music together. Our technology ensures flawless, real-time audio sync across unlimited devices, anywhere.",
+  },
+  {
+    icon: <Globe className="h-8 w-8 text-amber-400" />,
+    title: "Seamless Access",
+    description: "No installations. No barriers. MoodSync is a pure web experience, accessible on any device with a modern browser.",
+  },
+];
+
+export default function Features() {
+  const containerVariants = {
+    hidden: { opacity: 0 },
+    visible: {
+      opacity: 1,
+      transition: { staggerChildren: 0.2, delayChildren: 0.2 }
+    }
+  };
+
+  const itemVariants = {
+    hidden: { opacity: 0, y: 50 },
+    visible: { opacity: 1, y: 0, transition: { duration: 0.7, ease: "circOut" } }
+  };
+
+  return (
+    <section className="py-24 px-4 bg-black">
+      <div className="max-w-7xl mx-auto">
+        <motion.div 
+          initial={{ opacity: 0, y: 20 }}
+          whileInView={{ opacity: 1, y: 0 }}
+          viewport={{ once: true, amount: 0.5 }}
+          transition={{ duration: 0.8 }}
+          className="text-center mb-16"
+        >
+          <h2 className="text-4xl md:text-5xl font-semibold tracking-tight text-white">
+            A New Era of Listening
+          </h2>
+          <p className="mt-4 max-w-2xl mx-auto text-lg text-gray-400">
+            MoodSync isn't just about playlists. It's about creating shared sonic environments.
+          </p>
+        </motion.div>
+
+        <motion.div 
+          variants={containerVariants}
+          initial="hidden"
+          whileInView="visible"
+          viewport={{ once: true, amount: 0.2 }}
+          className="grid grid-cols-1 md:grid-cols-3 gap-8"
+        >
+          {features.map((feature, index) => (
+            <motion.div 
+              key={index}
+              variants={itemVariants}
+              className="group relative p-8 rounded-2xl bg-white/5 border border-white/10 overflow-hidden"
+            >
+              <div className="absolute top-0 left-0 h-full w-full bg-gradient-to-br from-purple-500/10 via-transparent to-transparent opacity-0 group-hover:opacity-100 transition-opacity duration-500"/>
+              <div className="relative z-10">
+                <div className="mb-4">{feature.icon}</div>
+                <h3 className="text-xl font-semibold text-white mb-2">{feature.title}</h3>
+                <p className="text-gray-400 font-light">{feature.description}</p>
+              </div>
+            </motion.div>
+          ))}
+        </motion.div>
+      </div>
+    </section>
+  );
+}
+
+### ./client/src/components/hero-scene.tsx ###
+
+"use client";
+import { motion } from "framer-motion";
+
+// This is our new "Ethereal Grid" background
+export default function HeroScene() {
+  return (
+    <div className="absolute inset-0 z-0 overflow-hidden bg-black">
+      {/* Layer 1: Base Gradient */}
+      <div className="absolute inset-0 bg-gradient-to-br from-gray-900 via-black to-gray-900" />
+
+      {/* Layer 2: Glowing Auras (Subtle colored light sources) */}
+      <div className="absolute -left-64 -top-64 h-[40rem] w-[40rem] rounded-full bg-purple-500/20 blur-3xl" />
+      <div className="absolute -bottom-72 -right-72 h-[40rem] w-[40rem] rounded-full bg-sky-500/20 blur-3xl" />
+      
+      {/* Layer 3: The Animated Grid */}
+      <motion.div
+        initial={{ opacity: 0 }}
+        animate={{ opacity: 1 }}
+        transition={{ duration: 2, delay: 0.5 }}
+        className="absolute inset-0"
+        style={{
+          backgroundImage: `
+            repeating-linear-gradient(0deg, transparent, transparent 1px, rgba(255, 255, 255, 0.05) 1px, rgba(255, 255, 255, 0.05) 2px),
+            repeating-linear-gradient(90deg, transparent, transparent 1px, rgba(255, 255, 255, 0.05) 1px, rgba(255, 255, 255, 0.05) 2px)
+          `,
+          backgroundSize: "40px 40px",
+        }}
+      />
+    </div>
+  );
+}
+
+### ./client/src/components/hero.tsx ###
+
+"use client";
+import { motion } from "framer-motion";
+import { ArrowDown } from "lucide-react";
+
+export default function Hero() {
+  const containerVariants = {
+    hidden: { opacity: 0 },
+    visible: {
+      opacity: 1,
+      transition: { staggerChildren: 0.2, delayChildren: 1 }
+    }
+  };
+
+  const itemVariants = {
+    hidden: { opacity: 0, y: 20 },
+    visible: { opacity: 1, y: 0, transition: { duration: 0.8, ease: "circOut" } }
+  };
+
+  return (
+    <section className="relative flex items-center justify-center h-screen">
+      {/* We keep our Ethereal Grid background from HeroScene */}
+      <div className="absolute inset-0 z-0 overflow-hidden bg-black">
+        <div className="absolute inset-0 bg-gradient-to-br from-gray-900 via-black to-gray-900" />
+        <div className="absolute -left-64 -top-64 h-[40rem] w-[40rem] rounded-full bg-purple-500/20 blur-3xl" />
+        <div className="absolute -bottom-72 -right-72 h-[40rem] w-[40rem] rounded-full bg-sky-500/20 blur-3xl" />
+        <div
+          className="absolute inset-0"
+          style={{
+            backgroundImage: `
+              repeating-linear-gradient(0deg, transparent, transparent 1px, rgba(255, 255, 255, 0.05) 1px, rgba(255, 255, 255, 0.05) 2px),
+              repeating-linear-gradient(90deg, transparent, transparent 1px, rgba(255, 255, 255, 0.05) 1px, rgba(255, 255, 255, 0.05) 2px)
+            `,
+            backgroundSize: "40px 40px",
+          }}
+        />
+      </div>
+      
+      {/* Foreground content */}
+      <motion.div 
+        variants={containerVariants}
+        initial="hidden"
+        animate="visible"
+        className="relative z-10 text-center px-4"
+      >
+        <motion.h1 variants={itemVariants} className="text-5xl md:text-7xl font-semibold tracking-tight text-white">
+          Where Music Becomes <br /> Atmosphere
+        </motion.h1>
+        <motion.p variants={itemVariants} className="mt-6 max-w-2xl mx-auto text-lg text-gray-400">
+          Create and experience perfectly synchronized listening rooms, generated from the essence of a mood.
+        </motion.p>
+        <motion.div variants={itemVariants} className="mt-12">
+          <button className="group inline-flex items-center gap-3 px-8 py-4 rounded-full bg-white/10 border border-white/20 text-white transition-all duration-300 hover:bg-white/20 hover:border-white/30">
+            <span>Begin the Experience</span>
+            <ArrowDown className="h-5 w-5 transition-transform duration-300 group-hover:translate-y-1" />
+          </button>
+        </motion.div>
+      </motion.div>
+    </section>
+  );
+}
+
+### ./client/src/components/navigation.tsx ###
+
+"use client";
+import { motion } from "framer-motion";
+
+export default function Navigation() {
+  return (
+    <motion.nav 
+      initial={{ y: -100, opacity: 0 }}
+      animate={{ y: 0, opacity: 1 }}
+      transition={{ duration: 0.8, ease: "circOut", delay: 0.5 }}
+      className="fixed top-0 left-0 right-0 z-50"
+    >
+      <div className="flex items-center justify-between max-w-7xl mx-auto px-8 py-6">
+        {/* Logo */}
+        <div className="flex items-center gap-3">
+          <svg width="28" height="28" viewBox="0 0 100 100" fill="none" xmlns="http://www.w3.org/2000/svg">
+            <motion.path 
+              initial={{ pathLength: 0, opacity: 0 }}
+              animate={{ pathLength: 1, opacity: 1 }}
+              transition={{ duration: 1, delay: 1 }}
+              d="M25 75V25L75 25V75L25 25L75 75" 
+              stroke="white" 
+              strokeWidth="8"
+            />
+          </svg>
+          <span className="text-xl font-semibold text-white tracking-wide">MoodSync</span>
+        </div>
+        
+        {/* Nav Links (future use) */}
+        <div className="hidden md:flex items-center gap-8 text-sm text-gray-400">
+          <a href="#" className="hover:text-white transition-colors">Features</a>
+          <a href="#" className="hover:text-white transition-colors">How It Works</a>
+        </div>
+      </div>
+    </motion.nav>
+  );
+}
+
+### ./client/src/components/player.tsx ###
+
+"use client";
+import { useState } from "react";
+import { motion, AnimatePresence } from "framer-motion";
+import Image from "next/image";
+import { Play, Pause, SkipBack, SkipForward, Volume1, Volume2, VolumeX, SlidersHorizontal, Mic } from "lucide-react";
+import BeatVisualizer from "./visualizer";
+import Equalizer from "./Equalizer";
+import Lyrics from "./Lyrics";
+
+interface PlayerProps {
+  albumArt: string | null;
+  title: string;
+  artist: string;
+  isPlaying: boolean;
+  volume: number;
+  onPlayPause: () => void;
+  onNext: () => void;
+  onPrev: () => void;
+  onVolumeChange: (volume: number) => void;
+}
+
+export default function Player({ albumArt, title, artist, isPlaying, volume, onPlayPause, onNext, onPrev, onVolumeChange }: PlayerProps) {
+  const VolumeIcon = volume === 0 ? VolumeX : volume < 50 ? Volume1 : Volume2;
+  const [showEqualizer, setShowEqualizer] = useState(false);
+  const [showLyrics, setShowLyrics] = useState(false);
+
+  return (
+    <motion.footer initial={{ opacity: 0 }} animate={{ opacity: 1 }} transition={{ duration: 1, ease: "easeOut", delay: 0.5 }} className="fixed bottom-0 left-0 right-0 z-50 h-28 bg-gradient-to-t from-black via-black/80 to-transparent">
+      <div className="mx-auto max-w-screen-lg h-full px-4 sm:px-8 flex items-center justify-center relative">
+        <AnimatePresence>
+            {showLyrics && <Lyrics />}
+        </AnimatePresence>
+        
+        <BeatVisualizer />
+        <div className="relative z-10 grid grid-cols-[1fr_auto_1fr] items-center gap-4 sm:gap-8 w-full">
+          <div className="flex items-center gap-4 min-w-0">
+            <div className="relative h-14 w-14 sm:h-16 sm:w-16 flex-shrink-0 rounded-lg bg-gray-800 shadow-lg">{albumArt && <Image src={albumArt} alt={title} layout="fill" objectFit="cover" className="rounded-lg"/>}</div>
+            <div className="min-w-0 hidden sm:block"><p className="font-semibold text-lg text-white truncate">{title}</p><p className="text-sm font-light text-gray-400 truncate">{artist}</p></div>
+          </div>
+          <div className="flex items-center gap-4 sm:gap-6">
+            <button onClick={onPrev} className="text-gray-400 hover:text-white transition-colors"><SkipBack className="w-6 h-6 sm:w-7 sm:h-7" /></button>
+            <button onClick={onPlayPause} className="flex h-14 w-14 sm:h-16 sm:w-16 items-center justify-center rounded-full bg-white text-black transition-transform hover:scale-105 shadow-2xl">{isPlaying ? <Pause className="w-7 h-7 sm:w-8 sm:h-8" /> : <Play className="w-7 h-7 sm:w-8 sm:h-8 translate-x-0.5"/>}</button>
+            <button onClick={onNext} className="text-gray-400 hover:text-white transition-colors"><SkipForward className="w-6 h-6 sm:w-7 sm:h-7" /></button>
+          </div>
+          <div className="relative flex items-center justify-end gap-2 sm:gap-3">
+            <AnimatePresence>
+                {showEqualizer && <Equalizer />}
+            </AnimatePresence>
+            
+            <button onClick={() => setShowLyrics(!showLyrics)} className={`p-2 rounded-full transition-colors ${showLyrics ? 'bg-purple-400/20 text-purple-300' : 'text-gray-400 hover:text-white'}`}>
+                <Mic size={20} />
+            </button>
+            
+            <button onClick={() => setShowEqualizer(!showEqualizer)} className={`p-2 rounded-full transition-colors ${showEqualizer ? 'bg-cyan-400/20 text-cyan-300' : 'text-gray-400 hover:text-white'}`}>
+                <SlidersHorizontal size={20} />
+            </button>
+            <VolumeIcon size={20} className="text-gray-400" />
+            <input type="range" min="0" max="100" value={volume} onChange={(e) => onVolumeChange(Number(e.target.value))} className="w-20 sm:w-24 h-1 bg-gray-700 rounded-full appearance-none cursor-pointer accent-cyan-400" />
+          </div>
+        </div>
+      </div>
+    </motion.footer>
+  );
+}
+
+### ./client/src/components/ui/WaveButton.tsx ###
+
+"use client";
+import React, { useRef, useEffect } from 'react';
+
+type WaveButtonProps = {
+  text?: string;
+  onClick?: () => void;
+  type?: 'button' | 'submit';
+  disabled?: boolean;
+};
+
+// This component is now correctly typed and structured for Next.js/React
+const WaveButton: React.FC<WaveButtonProps> = ({ text = "Get In Touch", onClick, type = "button", disabled = false }) => {
+  const wave1Ref = useRef<HTMLDivElement>(null);
+  const wave2Ref = useRef<HTMLDivElement>(null);
+  const wave3Ref = useRef<HTMLDivElement>(null);
+  const animationRefs = useRef<Animation[]>([]);
+  const durations = [12000, 10000, 8000];
+  const waveRefs = [wave1Ref, wave2Ref, wave3Ref];
+
+  useEffect(() => {
+    animationRefs.current = waveRefs.map((ref, i) => {
+      if (!ref.current) return null;
+      return ref.current.animate(
+        [{ transform: 'translateX(0px)' }, { transform: 'translateX(-400px)' }],
+        { duration: durations[i], iterations: Infinity, easing: 'linear' }
+      );
+    }).filter((anim): anim is Animation => anim !== null); // Type guard to filter out nulls
+    return () => animationRefs.current.forEach(anim => anim?.cancel());
+  }, []);
+
+  const setSpeed = (rate: number) => animationRefs.current.forEach(anim => { if(anim) anim.playbackRate = rate });
+  const handleMouseEnter = () => setSpeed(6);
+  const handleMouseLeave = () => setSpeed(1);
+
+  const getWave = (color: string, width = 6) => {
+    const svg = `<svg viewBox="0 0 400 100" xmlns="http://www.w3.org/2000/svg" preserveAspectRatio="none"><path d="M0 50 Q100 10 200 50 Q300 90 400 50" stroke="${color}" stroke-width="${width}" fill="none" vector-effect="non-scaling-stroke"/></svg>`;
+    return `url("data:image/svg+xml;charset=utf-8,${encodeURIComponent(svg)}")`;
+  };
+
+  return (
+    <button
+      type={type}
+      onClick={onClick}
+      disabled={disabled}
+      className="relative group inline-block w-full px-8 py-4 text-lg font-bold text-white rounded-full bg-black/20 border border-white/20 backdrop-blur-md overflow-hidden transition-all duration-300 hover:border-white/30 hover:shadow-cyan-400/20 disabled:opacity-50 disabled:cursor-not-allowed"
+      onMouseEnter={handleMouseEnter}
+      onMouseLeave={handleMouseLeave}
+    >
+      <span className="relative z-10">{text}</span>
+      <div className="absolute inset-0 z-0 blur-sm opacity-70 group-hover:opacity-100 transition-opacity duration-500">
+        <div ref={wave1Ref} className="absolute inset-0 h-full" style={{ width: '800px', backgroundImage: getWave('#f472b6', 12), backgroundSize: '400px 100%', backgroundRepeat: 'repeat-x' }} />
+        <div ref={wave2Ref} className="absolute inset-0 h-full" style={{ width: '800px', backgroundImage: getWave('#22d3ee', 10), backgroundSize: '400px 100%', backgroundRepeat: 'repeat-x' }} />
+        <div ref={wave3Ref} className="absolute inset-0 h-full" style={{ width: '800px', backgroundImage: getWave('#ffffff', 8), backgroundSize: '400px 100%', backgroundRepeat: 'repeat-x' }} />
+      </div>
+    </button>
+  );
+}
+
+export default WaveButton;
+
+### ./client/src/components/ui-panel.tsx ###
+
+"use client";
+import { motion, AnimatePresence } from "framer-motion";
+import { useRouter } from 'next/navigation';
+import { useState } from 'react';
+import WaveButton from "./ui/WaveButton"; // CORRECT IMPORT
+import { ArrowLeft, Check } from "lucide-react";
+
+const genres = {
+  'House': ['deep-house', 'house', 'progressive-house', 'tech-house'],
+  'Techno': ['techno', 'minimal-techno', 'detroit-techno'],
+  'Electronic': ['electronica', 'edm', 'electro', 'dubstep'],
+  'Sets': ['boiler-room', 'live-techno-set', 'deep-house-mix'],
+  'Indie': ['indie', 'indie-pop', 'alternative'],
+};
+type GenreCategory = keyof typeof genres;
+
+// Helper components are defined correctly
+const CategoryButton = ({ text, onClick, isSelected }: { text: string; onClick: () => void; isSelected: boolean; }) => (
+  <button onClick={onClick} className={`p-4 rounded-lg transition-all duration-300 text-center text-white w-full ${isSelected ? 'bg-cyan-400/20 border border-cyan-400' : 'bg-white/5 border border-transparent hover:bg-white/10'}`}>
+    {text}
+  </button>
+);
+
+const GenreTag = ({ text, onClick, isSelected }: { text: string; onClick: () => void; isSelected: boolean; }) => (
+  <button onClick={onClick} className={`px-4 py-2 text-sm rounded-full flex items-center gap-2 transition-all duration-300 ${isSelected ? 'bg-cyan-400 text-black font-semibold' : 'bg-white/10 text-gray-300 hover:bg-white/20'}`}>
+    {isSelected && <Check size={16} />}
+    {text.replace(/-/g, ' ')}
+  </button>
+);
+
+export default function UIPanel() {
+  const router = useRouter();
+  const [isLoading, setIsLoading] = useState(false);
+  const [step, setStep] = useState<number>(0);
+  const [selectedCategory, setSelectedCategory] = useState<GenreCategory | null>(null);
+  const [selectedGenre, setSelectedGenre] = useState<string | null>(null);
+  const [joinCode, setJoinCode] = useState('');
+
+  const handleCreateRoom = async () => {
+    if (!selectedGenre) return;
+    setIsLoading(true);
+    try {
+      const response = await fetch('http://localhost:5001/generate', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ mood: selectedGenre }),
+      });
+      if (!response.ok) throw new Error('Failed to create room');
+      const data = await response.json();
+      router.push(`/room/${data.room_code}`);
+    } catch (error) {
+      console.error("Error creating room:", error);
+      alert("Could not create a room.");
+      setIsLoading(false);
+    }
+  };
+
+  const handleJoinRoom = (e: React.FormEvent) => {
+    e.preventDefault();
+    if (joinCode.trim()) router.push(`/room/${joinCode.trim().toUpperCase()}`);
+  };
+  
+  const resetState = () => {
+      setStep(0);
+      setSelectedCategory(null);
+      setSelectedGenre(null);
+  };
+
+  return (
+    <motion.div layout transition={{ duration: 0.5, type: "spring", bounce: 0.2 }} className="w-full max-w-md">
+      <div className="relative rounded-2xl bg-black/40 p-8 shadow-2xl backdrop-blur-xl border border-white/10">
+        <AnimatePresence mode="wait">
+          {/* STEP 0: Main Menu */}
+          {step === 0 && (
+            <motion.div key="step0" initial={{ opacity: 0 }} animate={{ opacity: 1 }} exit={{ opacity: 0 }} className="flex flex-col gap-4">
+                <WaveButton text="Create a Sonic Space" onClick={() => setStep(1)} />
+                <button onClick={() => setStep(2)} className="w-full px-8 py-4 text-lg font-bold text-gray-400 hover:text-white transition-colors">Join a Space</button>
+            </motion.div>
+          )}
+
+          {/* STEP 1: Create Room Flow */}
+          {step === 1 && (
+            <motion.div key="step1" initial={{ opacity: 0 }} animate={{ opacity: 1 }} exit={{ opacity: 0 }}>
+              <button onClick={resetState} className="absolute top-4 left-4 flex items-center gap-2 text-gray-400 hover:text-white transition-colors text-sm"><ArrowLeft size={16}/> Back</button>
+              <h2 className="text-2xl font-semibold text-center text-white mb-6 pt-4">Select a Category</h2>
+              <div className="grid grid-cols-2 sm:grid-cols-3 gap-3 mb-6">
+                {(Object.keys(genres) as GenreCategory[]).map((cat) => (
+                  <CategoryButton key={cat} text={cat} onClick={() => setSelectedCategory(cat)} isSelected={selectedCategory === cat} />
+                ))}
+              </div>
+              <AnimatePresence>
+                {selectedCategory && (
+                  <motion.div initial={{ height: 0, opacity: 0 }} animate={{ height: 'auto', opacity: 1 }} className="overflow-hidden">
+                    <h3 className="text-lg font-medium text-center text-gray-300 my-4">Specify the Vibe</h3>
+                    <div className="flex flex-wrap justify-center gap-2 mb-6">
+                      {genres[selectedCategory].map(genre => (
+                        <GenreTag key={genre} text={genre} onClick={() => setSelectedGenre(genre)} isSelected={selectedGenre === genre} />
+                      ))}
+                    </div>
+                  </motion.div>
+                )}
+              </AnimatePresence>
+              <WaveButton text={isLoading ? "Architecting..." : "Launch Space"} onClick={handleCreateRoom} disabled={!selectedGenre || isLoading} />
+            </motion.div>
+          )}
+
+          {/* STEP 2: Join Room Flow */}
+          {step === 2 && (
+            <motion.div key="step2" initial={{ opacity: 0 }} animate={{ opacity: 1 }} exit={{ opacity: 0 }}>
+              <button onClick={resetState} className="absolute top-4 left-4 flex items-center gap-2 text-gray-400 hover:text-white transition-colors text-sm"><ArrowLeft size={16}/> Back</button>
+              <h2 className="text-2xl font-semibold text-center text-white mb-6 pt-4">Join an Existing Space</h2>
+              <form className="flex flex-col gap-3" onSubmit={handleJoinRoom}>
+                <input type="text" placeholder="ENTER ROOM CODE" value={joinCode} onChange={(e) => setJoinCode(e.target.value)} className="w-full rounded-md border border-white/10 bg-white/5 px-5 py-4 text-center tracking-widest font-mono text-white outline-none focus:border-cyan-400/50 focus:ring-2 focus:ring-cyan-400/30 transition-all"/>
+                <WaveButton text="Enter Space" type="submit" disabled={!joinCode.trim()} />
+              </form>
+            </motion.div>
+          )}
+        </AnimatePresence>
+      </div>
+    </motion.div>
+  );
+}
+
+### ./client/src/components/visualizer.tsx ###
+
+"use client";
+import { useEffect, useRef } from 'react';
+import { useRoomStore } from '@/lib/room-store';
+
+export default function BeatVisualizer() {
+  const canvasRef = useRef<HTMLCanvasElement>(null);
+  const audioContextRef = useRef<AudioContext | null>(null);
+  const analyserRef = useRef<AnalyserNode | null>(null);
+  const sourceRef = useRef<MediaElementAudioSourceNode | null>(null);
+  
+  // Add error boundary for store access
+  let player, isPlaying;
+  try {
+    player = useRoomStore(state => state.player);
+    isPlaying = useRoomStore(state => state.isPlaying);
+  } catch (error) {
+    console.error('Error accessing room store:', error);
+    return null; // Don't render if store is unavailable
+  }
+
+  // Effect for setting up the one-time AudioContext
+  useEffect(() => {
+    // This effect runs only when the player object becomes available
+    if (!player || sourceRef.current) return;
+    
+    try {
+      if (!audioContextRef.current) {
+        const audioContext = new (window.AudioContext || (window as any).webkitAudioContext)();
+        audioContextRef.current = audioContext;
+        
+        const analyser = audioContext.createAnalyser();
+        analyser.fftSize = 256;
+        analyserRef.current = analyser;
+        
+        // This is a more robust way to get the video element from the iframe
+        const iframe = player.getIframe();
+        if (iframe && iframe.contentWindow) {
+          const videoElement = iframe.contentWindow.document.querySelector('video');
+          if (videoElement) {
+            videoElement.crossOrigin = "anonymous";
+            const source = audioContext.createMediaElementSource(videoElement);
+            sourceRef.current = source;
+            source.connect(analyser);
+            analyser.connect(audioContext.destination);
+          }
+        }
+      }
+    } catch (e) {
+      console.error("Error setting up AudioContext:", e);
+    }
+  }, [player]);
+
+  // Effect for handling the animation loop
+  useEffect(() => {
+    const canvas = canvasRef.current;
+    if (!canvas) return; 
+    
+    const ctx = canvas.getContext('2d');
+    if (!ctx || !analyserRef.current) return;
+
+    const bufferLength = analyserRef.current.frequencyBinCount;
+    const dataArray = new Uint8Array(bufferLength);
+    let animationFrameId: number;
+
+    const renderFrame = () => {
+      if (!analyserRef.current || !ctx || !canvas) return;
+      
+      animationFrameId = requestAnimationFrame(renderFrame);
+      analyserRef.current.getByteFrequencyData(dataArray);
+      
+      ctx.clearRect(0, 0, canvas.width, canvas.height);
+
+      const barWidth = 4;
+      const numBars = canvas.width / (barWidth + 1);
+      let x = 0;
+
+      for (let i = 0; i < numBars; i++) {
+        const barHeight = Math.pow(dataArray[i] / 255, 2.5) * canvas.height;
+        const r = 50 + (dataArray[i] * 0.5);
+        const g = 150 + (dataArray[i] * 0.2);
+        const b = 220;
+        
+        ctx.fillStyle = `rgba(${r},${g},${b}, 0.8)`;
+        ctx.fillRect(x, canvas.height - barHeight, barWidth, barHeight);
+        x += barWidth + 2;
+      }
+    };
+
+    if (isPlaying) {
+      audioContextRef.current?.resume();
+      renderFrame();
+    } else {
+      ctx.clearRect(0, 0, canvas.width, canvas.height);
+    }
+
+    return () => {
+      if (animationFrameId) {
+        cancelAnimationFrame(animationFrameId);
+      }
+    };
+  }, [isPlaying]);
+
+  return <canvas ref={canvasRef} width="300" height="60" className="absolute bottom-0 left-1/2 -translate-x-1/2 opacity-25 blur-[1px]" />;
+}
+
+### ./client/src/lib/room-store.ts ###
+
+import { create } from 'zustand';
+import { io, Socket } from 'socket.io-client';
+
+interface Song { name: string; artist: string; albumArt: string | null; youtubeId: string; }
+interface User { name: string; isAdmin: boolean; }
+declare global { interface Window { onYouTubeIframeAPIReady: () => void; YT: any; }}
+
+interface EqualizerSettings { bass: number; mids: number; treble: number; }
+
+interface SyncState {
+  isPlaying?: boolean;
+  trackIndex?: number;
+  volume?: number;
+  isCollaborative?: boolean;
+  equalizer?: EqualizerSettings;
+}
+
+interface AudioNodes {
+  context: AudioContext | null;
+  source: MediaElementAudioSourceNode | null;
+  bass: BiquadFilterNode | null;
+  mids: BiquadFilterNode | null;
+  treble: BiquadFilterNode | null;
+}
+
+interface LyricLine {
+  time: number;
+  text: string;
+}
+
+interface RoomState {
+  roomCode: string; playlistTitle: string; playlist: Song[]; users: User[];
+  currentTrackIndex: number; isPlaying: boolean; volume: number; isCollaborative: boolean;
+  isLoading: boolean; error: string | null; player: any; socket: Socket | null; isAdmin: boolean; username: string;
+  equalizer: EqualizerSettings;
+  audioNodes: AudioNodes;
+  currentTime: number;
+  lyrics: {
+    lines: LyricLine[];
+    isLoading: boolean;
+  };
+
+  connect: (roomCode: string, username: string) => void;
+  disconnect: () => void;
+  initializePlayer: (domId: string) => void;
+  setPlaylistData: (title: string, playlist: Song[]) => void;
+  playPause: () => void;
+  nextTrack: () => void;
+  prevTrack: () => void;
+  selectTrack: (index: number) => void;
+  setVolume: (volume: number) => void;
+  setEqualizer: (settings: EqualizerSettings, emit?: boolean) => void;
+  toggleCollaborative: () => void;
+  setLoading: (loading: boolean) => void;
+  setError: (error: string | null) => void;
+  syncPlayerState: (state: SyncState) => void;
+  _changeTrack: (index: number) => void;
+  _canControl: () => boolean;
+  _connectAudioGraph: () => void;
+  fetchLyrics: (youtubeId: string) => void;
+  setCurrentTime: (time: number) => void;
+}
+
+export const useRoomStore = create<RoomState>((set, get) => ({
+  roomCode: '', playlistTitle: '', playlist: [], users: [],
+  currentTrackIndex: 0, isPlaying: false, volume: 80, isCollaborative: false, isLoading: true, error: null, player: null,
+  socket: null, isAdmin: false, username: '',
+  equalizer: { bass: 0, mids: 0, treble: 0 },
+  audioNodes: { context: null, source: null, bass: null, mids: null, treble: null },
+  currentTime: 0,
+  lyrics: { lines: [], isLoading: false },
+
+  connect: (roomCode, username) => {
+    if (get().socket) return;
+    const socket = io('http://localhost:5001');
+    set({ socket, username, roomCode });
+    socket.on('connect', () => socket.emit('join_room', { room_code: roomCode, username }));
+    socket.on('disconnect', () => set({ users: [], isAdmin: false }));
+    socket.on('error', (data) => get().setError(data.message));
+    socket.on('update_user_list', (users: User[]) => {
+      const self = users.find(u => u.name === get().username);
+      set({ users, isAdmin: self?.isAdmin || false });
+    });
+    socket.on('load_current_state', (state) => get().syncPlayerState(state));
+    socket.on('sync_player_state', (state) => get().syncPlayerState(state));
+  },
+
+  disconnect: () => { get().socket?.disconnect(); set({ socket: null }); },
+
+  _connectAudioGraph: () => {
+    const { player, audioNodes } = get();
+    if (!player || !audioNodes.context || !audioNodes.bass || !audioNodes.mids || !audioNodes.treble) {
+      return;
+    }
+    
+    try {
+      const iframe = player.getIframe();
+      if (!iframe) return;
+      const videoElement = iframe.contentWindow.document.querySelector('video');
+
+      if (videoElement && !audioNodes.source) {
+        videoElement.crossOrigin = "anonymous";
+        const source = audioNodes.context.createMediaElementSource(videoElement);
+        set(state => ({ audioNodes: { ...state.audioNodes, source }}));
+
+        source.connect(audioNodes.bass);
+        get().setEqualizer(get().equalizer, false);
+        console.log("MoodSync: Audio Equalizer successfully connected.");
+      }
+    } catch (e) {
+      console.error("MoodSync: Failed to connect audio graph. Equalizer will not work.", e);
+    }
+  },
+
+  initializePlayer: (domId) => {
+    const onPlayerStateChange = (event: any) => {
+      const state = get();
+      
+      if (event.data === window.YT.PlayerState.PLAYING) {
+        state.audioNodes.source?.disconnect();
+        set(s => ({ audioNodes: { ...s.audioNodes, source: null } }));
+        state._connectAudioGraph();
+      }
+
+      if (!state._canControl()) return;
+      let newIsPlaying = state.isPlaying;
+      if (event.data === window.YT.PlayerState.PLAYING) newIsPlaying = true;
+      else if (event.data === window.YT.PlayerState.PAUSED) newIsPlaying = false;
+      else if (event.data === window.YT.PlayerState.ENDED) { state.nextTrack(); return; }
+
+      if (newIsPlaying !== state.isPlaying) {
+        set({ isPlaying: newIsPlaying });
+        state.socket?.emit('update_player_state', { room_code: state.roomCode, state: { isPlaying: newIsPlaying }});
+      }
+    };
+
+    const onPlayerReady = (event: any) => {
+      const player = event.target;
+      player.setVolume(get().volume);
+      set({ player });
+      
+      if (!get().audioNodes.context) {
+          try {
+            const audioContext = new (window.AudioContext || (window as any).webkitAudioContext)();
+            
+            const bass = audioContext.createBiquadFilter();
+            bass.type = "lowshelf";
+            bass.frequency.value = 250;
+
+            const mids = audioContext.createBiquadFilter();
+            mids.type = "peaking";
+            mids.frequency.value = 1000;
+            mids.Q.value = 1;
+
+            const treble = audioContext.createBiquadFilter();
+            treble.type = "highshelf";
+            treble.frequency.value = 4000;
+
+            bass.connect(mids);
+            mids.connect(treble);
+            treble.connect(audioContext.destination);
+
+            set({ audioNodes: { context: audioContext, source: null, bass, mids, treble } });
+
+          } catch (e) {
+             console.error("MoodSync: Could not create Web Audio Context. Equalizer will not work.", e);
+          }
+      }
+      
+      const { playlist, currentTrackIndex } = get();
+      if (playlist.length > 0) {
+        player.cueVideoById(playlist[currentTrackIndex].youtubeId);
+      }
+    };
+
+    window.onYouTubeIframeAPIReady = () => { new window.YT.Player(domId, { height: '0', width: '0', events: { 'onReady': onPlayerReady, 'onStateChange': onPlayerStateChange } }); };
+    if (window.YT && window.YT.Player) window.onYouTubeIframeAPIReady();
+  },
+
+  setPlaylistData: (title, playlist) => {
+    set({ playlistTitle: title, playlist, isLoading: false, error: null, currentTrackIndex: 0, isPlaying: false });
+    const { player } = get();
+    if (playlist.length > 0) {
+      get().fetchLyrics(playlist[0].youtubeId);
+      if (player) player.cueVideoById(playlist[0].youtubeId);
+    }
+  },
+  
+  _canControl: () => get().isAdmin || get().isCollaborative,
+
+  _changeTrack: (index: number) => {
+    const { player, socket, roomCode, playlist } = get();
+    if (player && get()._canControl() && playlist.length > 0) {
+      const newTrack = playlist[index];
+      get().fetchLyrics(newTrack.youtubeId);
+      player.loadVideoById(newTrack.youtubeId);
+      set({ currentTrackIndex: index, isPlaying: true });
+      socket?.emit('update_player_state', { room_code: roomCode, state: { isPlaying: true, trackIndex: index }});
+    }
+  },
+
+  playPause: () => {
+    if (!get()._canControl()) return;
+    const { player, isPlaying, audioNodes } = get();
+    if (isPlaying) {
+      player?.pauseVideo();
+    } else {
+      if (audioNodes.context?.state === 'suspended') {
+        audioNodes.context.resume();
+      }
+      player?.playVideo();
+    }
+  },
+  
+  nextTrack: () => get()._changeTrack((get().currentTrackIndex + 1) % get().playlist.length),
+  prevTrack: () => get()._changeTrack((get().currentTrackIndex - 1 + get().playlist.length) % get().playlist.length),
+  selectTrack: (index) => {
+    if (index !== get().currentTrackIndex) get()._changeTrack(index);
+    else get().playPause();
+  },
+  
+  setVolume: (volume: number) => {
+    get().player?.setVolume(volume);
+    set({ volume });
+  },
+
+  setEqualizer: (settings, emit = true) => {
+    const { audioNodes, socket, roomCode, _canControl } = get();
+    
+    if(audioNodes.bass) audioNodes.bass.gain.value = settings.bass;
+    if(audioNodes.mids) audioNodes.mids.gain.value = settings.mids;
+    if(audioNodes.treble) audioNodes.treble.gain.value = settings.treble;
+
+    set({ equalizer: settings });
+    
+    if (emit && _canControl()) {
+        socket?.emit('update_player_state', { 
+            room_code: roomCode, 
+            state: { equalizer: settings } 
+        });
+    }
+  },
+
+  toggleCollaborative: () => {
+      const { isAdmin, socket, roomCode, isCollaborative } = get();
+      if(isAdmin) {
+          const newState = !isCollaborative;
+          set({ isCollaborative: newState });
+          socket?.emit('update_player_state', { room_code: roomCode, state: { isCollaborative: newState }});
+      }
+  },
+
+  syncPlayerState: (state) => {
+    const { player, playlist, currentTrackIndex, isPlaying, volume, isCollaborative, equalizer } = get();
+    if (!player || !playlist || playlist.length === 0) return;
+
+    if (state.equalizer && JSON.stringify(state.equalizer) !== JSON.stringify(equalizer)) {
+        get().setEqualizer(state.equalizer, false);
+    }
+    
+    if (state.isCollaborative !== undefined && state.isCollaborative !== isCollaborative) set({ isCollaborative: state.isCollaborative });
+    
+    if (state.trackIndex !== undefined && state.trackIndex !== currentTrackIndex) {
+      if(state.trackIndex >= 0 && state.trackIndex < playlist.length) {
+        get()._canControl() ? player.loadVideoById(playlist[state.trackIndex].youtubeId) : player.cueVideoById(playlist[state.trackIndex].youtubeId);
+        set({ currentTrackIndex: state.trackIndex });
+      }
+    }
+    if (state.isPlaying !== undefined && state.isPlaying !== isPlaying) {
+      const playerState = player.getPlayerState();
+      setTimeout(() => {
+          if (state.isPlaying && playerState !== window.YT.PlayerState.PLAYING) get().playPause();
+          else if (!state.isPlaying && playerState !== window.YT.PlayerState.PAUSED) get().playPause();
+      }, 100);
+      set({ isPlaying: state.isPlaying });
+    }
+    if (state.volume !== undefined && state.volume !== volume) {
+        player.setVolume(state.volume);
+        set({ volume: state.volume });
+    }
+  },
+
+  setLoading: (loading) => set({ isLoading: loading }),
+  setError: (error) => set({ error, isLoading: false }),
+
+  setCurrentTime: (time) => {
+    set({ currentTime: time });
+  },
+
+  fetchLyrics: async (youtubeId) => {
+    set(state => ({ lyrics: { ...state.lyrics, isLoading: true } }));
+    try {
+      const response = await fetch(`http://localhost:5001/api/lyrics/${youtubeId}`);
+      if (!response.ok) throw new Error('Lyrics not found.');
+      const lines: LyricLine[] = await response.json();
+      set({ lyrics: { lines, isLoading: false } });
+    } catch (error) {
+      console.error("Failed to fetch lyrics:", error);
+      set({ lyrics: { lines: [], isLoading: false } });
+    }
+  },
+}));
+
+### ./client/tailwind.config.ts ###
+
+import type { Config } from "tailwindcss";
+
+const config: Config = {
+  content: [
+    "./src/app/**/*.{js,ts,jsx,tsx,mdx}",
+    "./src/components/**/*.{js,ts,jsx,tsx,mdx}",
+  ],
+  theme: {
+    extend: {},
+  },
+  plugins: [],
+};
+export default config;
+
+### ./client/tsconfig.json ###
+
+{
+  "compilerOptions": {
+    "lib": ["dom", "dom.iterable", "esnext"],
+    "allowJs": true,
+    "skipLibCheck": true,
+    "strict": true,
+    "noEmit": true,
+    "esModuleInterop": true,
+    "module": "esnext",
+    "moduleResolution": "bundler",
+    "resolveJsonModule": true,
+    "isolatedModules": true,
+    "jsx": "preserve",
+    "incremental": true,
+    "plugins": [
+      {
+        "name": "next"
+      }
+    ],
+    "paths": {
+      "@/*": ["./src/*"]
+    }
+  },
+  "include": ["next-env.d.ts", "**/*.ts", "**/*.tsx", ".next/types/**/*.ts"],
+  "exclude": ["node_modules"]
+}
+
+### ./debug_lrc.py ###
+
+# debug_lrc.py - Debug script for lrc_kit API
+import inspect
+
+print("=== Debugging lrc_kit API ===")
+
+try:
+    from lrc_kit.lrc import LRC as Lrc
+    print("✅ Successfully imported LRC as Lrc")
+    
+    # Check class methods and attributes
+    print(f"\n--- Lrc class methods ---")
+    for name, method in inspect.getmembers(Lrc, predicate=inspect.ismethod):
+        print(f"  - {name}")
+    
+    print(f"\n--- Lrc class functions ---")
+    for name, func in inspect.getmembers(Lrc, predicate=inspect.isfunction):
+        print(f"  - {name}")
+    
+    print(f"\n--- All Lrc attributes ---")
+    for attr in dir(Lrc):
+        if not attr.startswith('_'):
+            print(f"  - {attr}")
+    
+    # Try to create an instance and check its methods
+    try:
+        instance = Lrc()
+        print(f"\n--- Instance methods ---")
+        for name, method in inspect.getmembers(instance, predicate=inspect.ismethod):
+            if not name.startswith('_'):
+                print(f"  - {name}")
+    except Exception as e:
+        print(f"\n--- Could not create instance: {e} ---")
+        
+    # Check constructor signature
+    if callable(Lrc):
+        try:
+            sig = inspect.signature(Lrc.__init__)
+            print(f"\n--- Constructor signature: {sig} ---")
+        except:
+            print("\n--- Couldn't get constructor signature ---")
+            
+except Exception as e:
+    print(f"❌ Error importing LRC: {e}")
+    
+# Also try importing the whole module
+try:
+    import lrc_kit.lrc as lrc_module
+    print(f"\n--- lrc_module contents ---")
+    for attr in dir(lrc_module):
+        if not attr.startswith('_'):
+            print(f"  - {attr}")
+except Exception as e:
+    print(f"❌ Error importing lrc module: {e}")
+
+print("\n=== Debug complete ===")
+
+### ./dump_project.py ###
+
+import os
+
+# Simple and explicit exclusions - only exclude what we know for sure
+EXCLUDE_DIRS = {
+    # Node.js
+    "node_modules", ".next", ".turbo", ".vercel", ".expo", "dist", "build",
+    
+    # Python Virtual Environments - ONLY these specific names
+    "venv", "env", ".venv", "virtualenv", "__pycache__", ".pytest_cache",
+    
+    # Version Control
+    ".git", ".svn", ".hg",
+    
+    # IDEs & Editors  
+    ".vscode", ".idea", ".vs",
+    
+    # Cache & Temp
+    ".cache", ".tmp", "temp", ".nyc_output"
+}
+
+EXCLUDE_FILES = {
+    # Lock files
+    ".DS_Store", "package-lock.json", "yarn.lock", "pnpm-lock.yaml", "bun.lockb",
+    "poetry.lock", "Pipfile.lock",
+    
+    # Environment files
+    ".env", ".env.local", ".env.development", ".env.production",
+    
+    # Logs & generated files
+    "*.log", "moodsync.log", "code_dump.txt", "project_structure.txt", "structure.txt",
+    
+    # Backup files
+    "*.bak", "package.json.bak"
+}
+
+EXCLUDE_EXTENSIONS = {
+    # Images & Media
+    ".png", ".jpg", ".jpeg", ".gif", ".svg", ".ico", ".webp", ".bmp",
+    ".mp4", ".mp3", ".wav", ".avi", ".mov", ".webm",
+    
+    # Fonts
+    ".ttf", ".woff", ".woff2", ".eot", ".otf",
+    
+    # Archives & Binaries
+    ".zip", ".tar", ".gz", ".rar", ".exe", ".dll", ".so", ".dylib",
+    ".bin", ".deb", ".rpm",
+    
+    # Misc
+    ".lock", ".log", ".cache", ".tmp", ".swp", ".backup"
+}
+
+structure_file = open("project_structure.txt", "w", encoding="utf-8")
+code_dump_file = open("code_dump.txt", "w", encoding="utf-8")
+
+def is_binary_or_excluded(filename):
+    return (
+        filename in EXCLUDE_FILES or
+        any(filename.lower().endswith(ext) for ext in EXCLUDE_EXTENSIONS)
+    )
+
+def dump_structure_and_code(path, indent=""):
+    try:
+        items = sorted(os.listdir(path))
+    except (PermissionError, OSError) as e:
+        structure_file.write(f"{indent}[Permission denied: {e}]\n")
+        return
+    
+    for item in items:
+        full_path = os.path.join(path, item)
+
+        if item in EXCLUDE_FILES:
+            continue
+            
+        if os.path.isdir(full_path):
+            # Only exclude directories that are explicitly in our exclude list
+            if item in EXCLUDE_DIRS:
+                structure_file.write(f"{indent}{item}/ [EXCLUDED]\n")
+                continue
+                
+            # Keep ALL other directories (including lib, src, etc.)
+            structure_file.write(f"{indent}{item}/\n")
+            dump_structure_and_code(full_path, indent + "  ")
+        else:
+            if is_binary_or_excluded(item):
+                structure_file.write(f"{indent}{item} [EXCLUDED]\n")
+                continue
+                
+            structure_file.write(f"{indent}{item}\n")
+            
+            # Try to read and dump file content
+            try:
+                with open(full_path, "r", encoding="utf-8") as f:
+                    content = f.read()
+                    # Skip very large files (> 1MB of text)
+                    if len(content) > 1024 * 1024:
+                        code_dump_file.write(f"\n\n### {full_path} ###\n\n")
+                        code_dump_file.write(f"[File too large: {len(content)} characters - SKIPPED]\n")
+                    else:
+                        code_dump_file.write(f"\n\n### {full_path} ###\n\n")
+                        code_dump_file.write(content)
+            except (UnicodeDecodeError, PermissionError) as e:
+                code_dump_file.write(f"\n\n### {full_path} ###\n\n")
+                code_dump_file.write(f"[Error reading file: {e}]\n")
+
+if __name__ == "__main__":
+    root_dir = "."  # Set to your project path if not in root
+    
+    print("🚀 Starting code dump...")
+    print("📁 Analyzing project structure...")
+    
+    dump_structure_and_code(root_dir)
+    
+    structure_file.close()
+    code_dump_file.close()
+    
+    # Get file sizes for summary
+    try:
+        struct_size = os.path.getsize("project_structure.txt") / 1024  # KB
+        code_size = os.path.getsize("code_dump.txt") / 1024 / 1024     # MB
+        
+        print("✅ Done! Files created:")
+        print(f"   📋 project_structure.txt ({struct_size:.1f} KB)")
+        print(f"   💻 code_dump.txt ({code_size:.1f} MB)")
+        
+        if code_size > 50:
+            print("⚠️  Warning: Code dump is quite large. Consider adding more exclusions.")
+            
+    except OSError:
+        print("✅ Done. Files saved: 'project_structure.txt' and 'code_dump.txt'")
+
+### ./generate_structure.py ###
+
+import os
+
+IGNORE_DIRS = {
+    ".git", "__pycache__", "venv", "env", "node_modules", ".next", ".vercel",
+    ".idea", ".vscode", "dist", "build", ".pytest_cache", ".mypy_cache", "__pypackages__"
+}
+
+IGNORE_FILES = {
+    ".DS_Store", "Thumbs.db", ".env", ".env.local", ".gitignore", "structure.txt", "code_dump.txt"
+}
+
+VALID_EXTENSIONS = {".py", ".html", ".js", ".css"}
+
+def generate_structure_and_code(root_dir):
+    structure_path = os.path.join(root_dir, "structure.txt")
+    code_path = os.path.join(root_dir, "code_dump.txt")
+
+    with open(structure_path, "w", encoding="utf-8") as sf, open(code_path, "w", encoding="utf-8") as cf:
+        for root, dirs, files in os.walk(root_dir):
+            dirs[:] = [d for d in dirs if d not in IGNORE_DIRS]
+            files = [file for file in files if file not in IGNORE_FILES]
+
+            level = root.replace(root_dir, "").count(os.sep)
+            indent = "    " * level
+            sf.write(f"{indent}{os.path.basename(root)}/\n")
+
+            subindent = "    " * (level + 1)
+            for file in files:
+                sf.write(f"{subindent}{file}\n")
+
+                ext = os.path.splitext(file)[1]
+                if ext in VALID_EXTENSIONS:
+                    file_path = os.path.join(root, file)
+                    try:
+                        with open(file_path, "r", encoding="utf-8") as source:
+                            cf.write(f"\n\n========== {file_path} ==========\n")
+                            cf.write(source.read())
+                            cf.write("\n" + "="*60 + "\n")
+                    except Exception as e:
+                        print(f"⚠️ Skipped {file_path}: {e}")
+
+    print("✅ structure.txt and code_dump.txt generated.")
+
+if __name__ == "__main__":
+    root_directory = os.path.dirname(os.path.abspath(__file__))
+    generate_structure_and_code(root_directory)
+
+
+### ./requirements.txt ###
+
+async-timeout==5.0.1
+bidict==0.23.1
+blinker==1.9.0
+cachetools==5.5.2
+certifi==2025.8.3
+charset-normalizer==3.4.3
+click==8.1.8
+Flask==3.1.2
+flask-cors==6.0.1
+Flask-SocketIO==5.5.1
+gevent==25.8.2
+gevent-websocket==0.10.1
+google-api-core==2.25.1
+google-api-python-client==2.181.0
+google-auth==2.40.3
+google-auth-httplib2==0.2.0
+googleapis-common-protos==1.70.0
+greenlet==3.2.4
+gunicorn==23.0.0
+h11==0.16.0
+httplib2==0.30.0
+idna==3.10
+importlib_metadata==8.7.0
+itsdangerous==2.2.0
+Jinja2==3.1.6
+lrc-kit==0.1.8.3
+MarkupSafe==3.0.2
+packaging==25.0
+proto-plus==1.26.1
+protobuf==6.32.0
+pyasn1==0.6.1
+pyasn1_modules==0.4.2
+pyparsing==3.2.3
+python-dotenv==1.1.1
+python-engineio==4.12.2
+python-socketio==5.13.0
+redis==6.4.0
+requests==2.32.5
+rsa==4.9.1
+simple-websocket==1.1.0
+uritemplate==4.2.0
+urllib3==2.5.0
+Werkzeug==3.1.3
+wsproto==1.2.0
+zipp==3.23.0
+zope.event==5.1.1
+zope.interface==7.2
+
+### ./spotify_test.py ###
+
+# spotify_debug_test.py
+import os
+import base64
+import requests
+from dotenv import load_dotenv
+
+load_dotenv()
+
+def test_spotify_connection():
+    """Test Spotify API connection and search functionality"""
+    client_id = os.getenv('SPOTIFY_CLIENT_ID')
+    client_secret = os.getenv('SPOTIFY_CLIENT_SECRET')
+    
+    print("=== SPOTIFY API DEBUG TEST ===")
+    print(f"Client ID: {client_id[:10]}..." if client_id else "Client ID: NOT FOUND")
+    print(f"Client Secret: {client_secret[:10]}..." if client_secret else "Client Secret: NOT FOUND")
+    
+    if not client_id or not client_secret:
+        print("❌ ERROR: Spotify credentials not found in .env file")
+        return False
+    
+    # Test 1: Get access token
+    print("\n1. Testing token generation...")
+    try:
+        url = "https://accounts.spotify.com/api/token"
+        headers = {
+            "Authorization": "Basic " + base64.b64encode(f"{client_id}:{client_secret}".encode()).decode(),
+            "Content-Type": "application/x-www-form-urlencoded"
+        }
+        data = {"grant_type": "client_credentials"}
+        
+        response = requests.post(url, headers=headers, data=data, timeout=10)
+        print(f"Token response status: {response.status_code}")
+        
+        if response.status_code == 200:
+            token_data = response.json()
+            access_token = token_data.get('access_token')
+            print("✅ Token generation successful")
+            print(f"Token: {access_token[:20]}...")
+        else:
+            print(f"❌ Token generation failed: {response.text}")
+            return False
+            
+    except Exception as e:
+        print(f"❌ Token generation error: {e}")
+        return False
+    
+    # Test 2: Simple search test
+    print("\n2. Testing basic search...")
+    try:
+        search_url = "https://api.spotify.com/v1/search"
+        headers = {"Authorization": f"Bearer {access_token}"}
+        
+        # Test with simple query
+        params = {
+            "q": "rock",
+            "type": "track",
+            "limit": 5
+        }
+        
+        response = requests.get(search_url, headers=headers, params=params, timeout=10)
+        print(f"Search response status: {response.status_code}")
+        
+        if response.status_code == 200:
+            search_data = response.json()
+            tracks = search_data.get('tracks', {}).get('items', [])
+            print(f"✅ Search successful - found {len(tracks)} tracks")
+            
+            for i, track in enumerate(tracks[:3]):
+                print(f"  {i+1}. {track.get('name')} by {track.get('artists', [{}])[0].get('name')}")
+                
+        else:
+            print(f"❌ Search failed: {response.text}")
+            return False
+            
+    except Exception as e:
+        print(f"❌ Search error: {e}")
+        return False
+    
+    # Test 3: Genre-based search (like in your app)
+    print("\n3. Testing genre-based search...")
+    try:
+        test_genres = ['rock', 'pop', 'electronic']
+        
+        for genre in test_genres:
+            params = {
+                "q": f"genre:{genre}",
+                "type": "track",
+                "limit": 5,
+                "market": "US"
+            }
+            
+            response = requests.get(search_url, headers=headers, params=params, timeout=10)
+            
+            if response.status_code == 200:
+                search_data = response.json()
+                tracks = search_data.get('tracks', {}).get('items', [])
+                print(f"✅ Genre '{genre}' search: {len(tracks)} tracks found")
+                
+                if tracks:
+                    track = tracks[0]
+                    print(f"  Sample: {track.get('name')} by {track.get('artists', [{}])[0].get('name')}")
+                else:
+                    print(f"  ⚠️ No tracks found for genre: {genre}")
+            else:
+                print(f"❌ Genre '{genre}' search failed: {response.status_code}")
+                
+    except Exception as e:
+        print(f"❌ Genre search error: {e}")
+        return False
+    
+    print("\n=== TEST COMPLETED ===")
+    return True
+
+if __name__ == "__main__":
+    test_spotify_connection()
+
+### ./static/mood-interactions.js ###
+
+document.addEventListener('DOMContentLoaded', () => {
+    // --- Mood selection for visualizer (unchanged) ---
+    document.querySelectorAll('.mood-option input').forEach(option => {
+        option.addEventListener('change', (e) => {
+            moodVisualizer.setMood(e.target.value);
+        });
+    });
+
+    // --- Form for CREATING a room ---
+    const generateForm = document.getElementById('generate-form');
+    generateForm.addEventListener('submit', (e) => {
+        // Check if a mood is selected
+        const selectedMood = document.querySelector('input[name="mood"]:checked');
+        if (!selectedMood) {
+            e.preventDefault(); // Stop form submission
+            alert('Please select a mood to create a room!');
+            return;
+        }
+        // Set the current hour before submitting
+        document.getElementById('hour-input').value = new Date().getHours();
+    });
+
+    // --- Form for JOINING a room ---
+    const joinForm = document.getElementById('join-form');
+    joinForm.addEventListener('submit', (e) => {
+        e.preventDefault(); // We'll handle the redirect ourselves
+        const roomCodeInput = document.getElementById('room-code-input');
+        const roomCode = roomCodeInput.value.trim().toUpperCase();
+
+        if (roomCode) {
+            // Redirect the user to the room URL
+            window.location.href = `/room/${roomCode}`;
+        } else {
+            alert('Please enter a room code.');
+        }
+    });
+
+    // Initial animation
+    moodVisualizer.animate();
+});
+
+### ./static/mood-visualizer.js ###
+
+class MoodVisualizer {
+    constructor(canvasId) {
+        this.canvas = document.getElementById(canvasId);
+        this.ctx = this.canvas.getContext('2d');
+        this.particles = [];
+        this.setupCanvas();
+        this.currentMood = null;
+    }
+
+    setupCanvas() {
+        this.canvas.width = window.innerWidth;
+        this.canvas.height = window.innerHeight;
+        window.addEventListener('resize', () => this.resizeCanvas());
+    }
+
+    resizeCanvas() {
+        this.canvas.width = window.innerWidth;
+        this.canvas.height = window.innerHeight;
+    }
+
+    createParticles(mood) {
+        this.particles = [];
+        const particleCount = 100;
+        const colors = {
+            'happy': ['#FFD700', '#FF6B6B', '#4ECDC4'],
+            'sad': ['#4A90E2', '#5BCAFF', '#1A2980'],
+            'energetic': ['#FF4500', '#FF6B6B', '#FF9A3C']
+        };
+
+        for (let i = 0; i < particleCount; i++) {
+            this.particles.push({
+                x: Math.random() * this.canvas.width,
+                y: Math.random() * this.canvas.height,
+                radius: Math.random() * 3 + 1,
+                color: colors[mood][Math.floor(Math.random() * colors[mood].length)],
+                speedX: (Math.random() - 0.5) * 2,
+                speedY: (Math.random() - 0.5) * 2,
+                alpha: 0.7
+            });
+        }
+    }
+
+    animate(mood) {
+        this.ctx.clearRect(0, 0, this.canvas.width, this.canvas.height);
+        
+        this.particles.forEach((particle, index) => {
+            // Update particle position
+            particle.x += particle.speedX;
+            particle.y += particle.speedY;
+
+            // Bounce off walls
+            if (particle.x < 0 || particle.x > this.canvas.width) particle.speedX *= -1;
+            if (particle.y < 0 || particle.y > this.canvas.height) particle.speedY *= -1;
+
+            // Draw particle
+            this.ctx.beginPath();
+            this.ctx.arc(particle.x, particle.y, particle.radius, 0, Math.PI * 2);
+            this.ctx.fillStyle = particle.color;
+            this.ctx.globalAlpha = particle.alpha;
+            this.ctx.fill();
+        });
+
+        requestAnimationFrame(() => this.animate(mood));
+    }
+
+    setMood(mood) {
+        this.currentMood = mood;
+        this.createParticles(mood);
+    }
+}
+
+// Initialize mood visualizer
+const moodVisualizer = new MoodVisualizer('moodCanvas');
+
+### ./static/player.js ###
+
+// static/player.js
+
+document.addEventListener('DOMContentLoaded', () => {
+    const roomDataDiv = document.getElementById('room-data');
+    if (!roomDataDiv) return;
+
+    // ======== STATE & CONFIG ========
+    const ROOM_CODE = roomDataDiv.dataset.roomCode;
+    let player;
+    let updateInterval;
+    let visualizerAnimationId;
+    let username = '';
+    let isUserAdmin = false;
+    let isSeeking = false;
+    let currentTrackIndex = -1;
+    const tracks = Array.from(document.querySelectorAll('.track'));
+
+    // ======== DOM ELEMENTS ========
+    const participantList = document.getElementById('participant-list');
+    const allControls = document.querySelectorAll('.control-btn, .slider');
+    const playerContainer = document.getElementById('player-container');
+    const nowPlayingTitle = document.getElementById('now-playing-title');
+    const nowPlayingArtist = document.getElementById('now-playing-artist');
+    const playerAlbumArtImg = document.querySelector('#player-album-art img');
+    const playPauseBtn = document.getElementById('play-pause-btn');
+    const nextBtn = document.getElementById('next-btn');
+    const prevBtn = document.getElementById('prev-btn');
+    const timelineSlider = document.getElementById('timeline-slider');
+    const currentTimeEl = document.getElementById('current-time');
+    const totalTimeEl = document.getElementById('total-time');
+    const volumeSlider = document.getElementById('volume-slider');
+    const visualizerCanvas = document.getElementById('player-visualizer-canvas');
+    const playIconSVG = `<svg role="img" height="24" width="24" aria-hidden="true" viewBox="0 0 24 24"><path d="M7.05 3.606a.75.75 0 0 1 .591.905l-1.282 5.599a.75.75 0 0 1-1.442-.315L6.2 4.094a.75.75 0 0 1 .85-.488zM9.533 3.692a.75.75 0 0 1 .728.843l-1.282 5.599a.75.75 0 0 1-1.442-.315L8.81 4.22a.75.75 0 0 1 .723-.528zM12.016 3.69a.75.75 0 0 1 .727.845l-1.282 5.599a.75.75 0 0 1-1.442-.315L11.29 4.22a.75.75 0 0 1 .726-.53zM14.5 3.694a.75.75 0 0 1 .726.845l-1.282 5.599a.75.75 0 1 1-1.442-.315L13.77 4.22a.75.75 0 0 1 .73-.527zM16.983 3.69a.75.75 0 0 1 .727.845l-1.282 5.599a.75.75 0 1 1-1.442-.315L16.26 4.22a.75.75 0 0 1 .723-.53z"></path></svg>`;
+    const pauseIconSVG = `<svg role="img" height="24" width="24" aria-hidden="true" viewBox="0 0 24 24"><path d="M5.7 3a.7.7 0 0 0-.7.7v16.6a.7.7 0 0 0 .7.7h2.6a.7.7 0 0 0 .7-.7V3.7a.7.7 0 0 0-.7-.7H5.7zm10 0a.7.7 0 0 0-.7.7v16.6a.7.7 0 0 0 .7.7h2.6a.7.7 0 0 0 .7-.7V3.7a.7.7 0 0 0-.7-.7h-2.6z"></path></svg>`;
+
+    // ======== INITIALIZATION ========
+    function init() {
+        username = prompt("Please enter your name:", "Guest") || "Guest";
+        allControls.forEach(el => el.disabled = true);
+        playPauseBtn.innerHTML = playIconSVG;
+    }
+    init();
+
+    // ======== SOCKET.IO ========
+    const socket = io();
+    
+    socket.on('connect', () => {
+        console.log('Connected to server');
+        socket.emit('join_room', { room_code: ROOM_CODE, username: username });
+    });
+    
+    socket.on('disconnect', () => {
+        console.log('Disconnected from server');
+    });
+    
+    socket.on('error', (data) => {
+        console.error('Socket error:', data);
+        alert('Error: ' + data.message);
+    });
+    
+    socket.on('update_user_list', renderUserList);
+    socket.on('load_current_state', (state) => syncPlayer(state, true));
+    socket.on('sync_player_state', (state) => syncPlayer(state, false));
+
+    // ======== YOUTUBE PLAYER ========
+    window.onYouTubeIframeAPIReady = () => {
+        player = new YT.Player('youtube-player', {
+            height: '100', 
+            width: '100',
+            playerVars: { 
+                'playsinline': 1, 
+                'controls': 0,
+                'disablekb': 1,
+                'fs': 0,
+                'modestbranding': 1,
+                'rel': 0
+            },
+            events: { 
+                'onReady': onPlayerReady, 
+                'onStateChange': onPlayerStateChange,
+                'onError': onPlayerError
+            }
+        });
+    };
+
+    function onPlayerReady() {
+        console.log('YouTube player ready');
+        if(player && typeof player.setVolume === 'function') {
+            player.setVolume(volumeSlider.value);
+        }
+    }
+
+    function onPlayerStateChange(event) {
+        if (!isUserAdmin || isSeeking) return;
+        
+        console.log('Player state changed:', event.data);
+        updatePlayPauseButton(event.data);
+        
+        if (event.data === YT.PlayerState.PLAYING) {
+            startTimelineUpdater();
+            startVisualizer();
+        } else if (event.data === YT.PlayerState.PAUSED) {
+            clearInterval(updateInterval);
+        } else if (event.data === YT.PlayerState.ENDED) {
+            // Auto-play next track
+            const nextIndex = (currentTrackIndex + 1) % tracks.length;
+            playSong(nextIndex);
+            return; // Don't emit state for auto-advance
+        }
+        
+        // Emit state with slight delay to ensure player is ready
+        setTimeout(() => {
+            emitPlayerState();
+        }, 100);
+    }
+
+    function onPlayerError(event) {
+        console.error('YouTube player error:', event.data);
+        alert('Error playing video. Skipping to next track.');
+        if (isUserAdmin) {
+            const nextIndex = (currentTrackIndex + 1) % tracks.length;
+            playSong(nextIndex);
+        }
+    }
+
+    // ======== CORE LOGIC ========
+    function syncPlayer(state, isFirstLoad) {
+        if (!player || typeof player.seekTo !== 'function') {
+            console.log('Player not ready for sync');
+            return;
+        }
+        
+        console.log('Syncing player:', state);
+        isSeeking = true;
+        
+        const { trackIndex, currentTime, isPlaying, timestamp } = state;
+
+        // Load new track if different
+        if (currentTrackIndex !== trackIndex) {
+            playSong(trackIndex, false);
+        }
+        
+        // Calculate time drift for sync
+        const timeDiff = (Date.now() / 1000) - timestamp;
+        let seekTime = currentTime;
+        
+        // Only apply drift compensation if playing and not first load
+        if (isPlaying && !isFirstLoad) {
+            seekTime = Math.max(0, currentTime + timeDiff);
+        }
+        
+        // Seek to position
+        player.seekTo(seekTime, true);
+        
+        // Set play state
+        if (isPlaying) {
+            player.playVideo();
+        } else {
+            player.pauseVideo();
+        }
+        
+        updatePlayPauseButton(isPlaying ? YT.PlayerState.PLAYING : YT.PlayerState.PAUSED);
+        
+        if (isPlaying) {
+            startTimelineUpdater();
+            startVisualizer();
+        } else {
+            clearInterval(updateInterval);
+        }
+
+        // Allow seeking again after sync
+        setTimeout(() => { 
+            isSeeking = false; 
+        }, 500);
+    }
+    
+    function playSong(trackIndex, shouldEmit = true) {
+        const trackElement = tracks[trackIndex];
+        if (!trackElement) {
+            console.error('Track not found:', trackIndex);
+            return;
+        }
+
+        const videoId = trackElement.dataset.youtubeId;
+        if (!videoId || videoId === 'none') {
+            alert("This song is not available for playback.");
+            return;
+        }
+
+        console.log('Playing song:', trackIndex, trackElement.dataset.songName);
+        
+        currentTrackIndex = trackIndex;
+        updateAllTrackPlayingStates();
+        
+        // Update now playing display
+        nowPlayingTitle.textContent = trackElement.dataset.songName;
+        nowPlayingArtist.textContent = trackElement.dataset.artistName;
+        
+        // Update album art with error handling
+        const albumArt = trackElement.dataset.albumArt;
+        if (albumArt && albumArt !== 'None') {
+            playerAlbumArtImg.src = albumArt;
+            playerAlbumArtImg.onerror = () => {
+                playerAlbumArtImg.src = '/static/default-album-art.png'; // Fallback
+            };
+        }
+        
+        // Load the video
+        player.loadVideoById(videoId);
+
+        // Emit state if admin and should emit
+        if (isUserAdmin && shouldEmit) {
+            setTimeout(() => {
+                emitPlayerState();
+            }, 1000); // Give player time to load
+        }
+    }
+
+    function emitPlayerState() {
+        if (!isUserAdmin || !player || typeof player.getPlayerState !== 'function') {
+            return;
+        }
+        
+        try {
+            const state = {
+                isPlaying: player.getPlayerState() === YT.PlayerState.PLAYING,
+                trackIndex: currentTrackIndex,
+                currentTime: player.getCurrentTime() || 0,
+                timestamp: Date.now() / 1000
+            };
+            
+            console.log('Emitting player state:', state);
+            socket.emit('update_player_state', { room_code: ROOM_CODE, state: state });
+        } catch (error) {
+            console.error('Error emitting player state:', error);
+        }
+    }
+
+    // ======== UI & VISUALS ========
+    function renderUserList(users) {
+        console.log('Updating user list:', users);
+        participantList.innerHTML = '';
+        
+        // Find current user and update admin status
+        const currentUser = users.find(u => u.name === username);
+        if (currentUser) {
+            isUserAdmin = currentUser.isAdmin;
+            toggleAdminControls(isUserAdmin);
+            console.log('User is admin:', isUserAdmin);
+        }
+        
+        // Render user list
+        users.forEach(user => {
+            const li = document.createElement('li');
+            li.className = 'participant-item';
+            li.innerHTML = `
+                ${user.isAdmin ? '<span class="admin-icon">👑</span>' : ''} 
+                <span class="participant-name">${user.name}</span>
+            `;
+            participantList.appendChild(li);
+        });
+    }
+
+    function toggleAdminControls(isAdmin) {
+        allControls.forEach(el => {
+            el.disabled = !isAdmin;
+            el.style.opacity = isAdmin ? '1' : '0.5';
+        });
+        
+        // Update UI feedback
+        if (isAdmin) {
+            playerContainer.classList.add('admin-mode');
+        } else {
+            playerContainer.classList.remove('admin-mode');
+        }
+    }
+
+    function updatePlayPauseButton(playerState) {
+        const isPlaying = (playerState === YT.PlayerState.PLAYING);
+        playPauseBtn.innerHTML = isPlaying ? pauseIconSVG : playIconSVG;
+        playPauseBtn.setAttribute('aria-label', isPlaying ? 'Pause' : 'Play');
+    }
+
+    function startTimelineUpdater() {
+        clearInterval(updateInterval);
+        updateInterval = setInterval(() => {
+            if (player && typeof player.getDuration === 'function' && !isSeeking) {
+                try {
+                    const currentTime = player.getCurrentTime() || 0;
+                    const duration = player.getDuration() || 0;
+                    
+                    if (duration > 0) {
+                        timelineSlider.value = (currentTime / duration) * 100;
+                        currentTimeEl.textContent = formatTime(currentTime);
+                        totalTimeEl.textContent = formatTime(duration);
+                    }
+                } catch (error) {
+                    console.error('Error updating timeline:', error);
+                }
+            }
+        }, 1000);
+    }
+
+    function formatTime(seconds) {
+        if (isNaN(seconds) || seconds < 0) return '0:00';
+        const min = Math.floor(seconds / 60);
+        const sec = Math.floor(seconds % 60).toString().padStart(2, '0');
+        return `${min}:${sec}`;
+    }
+
+    function startVisualizer() {
+        if (!visualizerCanvas) return;
+        
+        cancelAnimationFrame(visualizerAnimationId);
+        const ctx = visualizerCanvas.getContext('2d');
+        const barCount = 16;
+        
+        function animate() {
+            if (!player || player.getPlayerState() !== YT.PlayerState.PLAYING) {
+                ctx.clearRect(0, 0, visualizerCanvas.width, visualizerCanvas.height);
+                visualizerAnimationId = requestAnimationFrame(animate);
+                return;
+            }
+            
+            ctx.clearRect(0, 0, visualizerCanvas.width, visualizerCanvas.height);
+            
+            for (let i = 0; i < barCount; i++) {
+                const barHeight = Math.random() * visualizerCanvas.height * 0.8;
+                const x = (visualizerCanvas.width / barCount) * i;
+                const barWidth = (visualizerCanvas.width / barCount) - 2;
+                
+                // Create gradient for bars
+                const gradient = ctx.createLinearGradient(0, visualizerCanvas.height, 0, visualizerCanvas.height - barHeight);
+                gradient.addColorStop(0, `rgba(29, 185, 84, ${Math.random() * 0.5 + 0.5})`);
+                gradient.addColorStop(1, `rgba(30, 215, 96, ${Math.random() * 0.3 + 0.7})`);
+                
+                ctx.fillStyle = gradient;
+                ctx.fillRect(x, visualizerCanvas.height - barHeight, barWidth, barHeight);
+            }
+            
+            visualizerAnimationId = requestAnimationFrame(animate);
+        }
+        animate();
+    }
+    
+    function updateAllTrackPlayingStates() {
+        tracks.forEach((track, index) => {
+            track.classList.toggle('playing', index === currentTrackIndex);
+        });
+    }
+
+    // ======== EVENT LISTENERS ========
+    tracks.forEach((track, index) => {
+        track.addEventListener('click', () => { 
+            if (isUserAdmin) {
+                playSong(index); 
+            }
+        });
+    });
+
+    playPauseBtn.addEventListener('click', () => {
+        if (!isUserAdmin || !player) return;
+        
+        try {
+            if (player.getPlayerState() === YT.PlayerState.PLAYING) {
+                player.pauseVideo();
+            } else {
+                player.playVideo();
+            }
+        } catch (error) {
+            console.error('Error toggling play/pause:', error);
+        }
+    });
+
+    nextBtn.addEventListener('click', () => { 
+        if (isUserAdmin) {
+            const nextIndex = (currentTrackIndex + 1) % tracks.length;
+            playSong(nextIndex); 
+        }
+    });
+    
+    prevBtn.addEventListener('click', () => { 
+        if (isUserAdmin) {
+            const prevIndex = (currentTrackIndex - 1 + tracks.length) % tracks.length;
+            playSong(prevIndex); 
+        }
+    });
+
+    // Timeline slider events
+    timelineSlider.addEventListener('mousedown', () => { 
+        if (isUserAdmin) {
+            isSeeking = true; 
+        }
+    });
+    
+    timelineSlider.addEventListener('mouseup', () => {
+        if (isUserAdmin && player) {
+            try {
+                const duration = player.getDuration() || 0;
+                const seekTime = (timelineSlider.value / 100) * duration;
+                player.seekTo(seekTime, true);
+                
+                setTimeout(() => {
+                    isSeeking = false;
+                    emitPlayerState();
+                }, 200);
+            } catch (error) {
+                console.error('Error seeking:', error);
+                isSeeking = false;
+            }
+        }
+    });
+
+    volumeSlider.addEventListener('input', () => {
+        if (player && typeof player.setVolume === 'function') {
+            try {
+                player.setVolume(volumeSlider.value);
+            } catch (error) {
+                console.error('Error setting volume:', error);
+            }
+        }
+    });
+
+    // Keyboard shortcuts for admin
+    document.addEventListener('keydown', (e) => {
+        if (!isUserAdmin) return;
+        
+        switch(e.code) {
+            case 'Space':
+                e.preventDefault();
+                playPauseBtn.click();
+                break;
+            case 'ArrowLeft':
+                e.preventDefault();
+                prevBtn.click();
+                break;
+            case 'ArrowRight':
+                e.preventDefault();
+                nextBtn.click();
+                break;
+        }
+    });
+
+    // Cleanup on page unload
+    window.addEventListener('beforeunload', () => {
+        clearInterval(updateInterval);
+        cancelAnimationFrame(visualizerAnimationId);
+        if (socket) {
+            socket.disconnect();
+        }
+    });
+});
+
+### ./static/playlist-visualizer.js ###
+
+class PlaylistVisualizer {
+    constructor(canvasId) {
+        this.canvas = document.getElementById(canvasId);
+        this.ctx = this.canvas.getContext('2d');
+        this.particles = [];
+        this.setupCanvas();
+    }
+
+    setupCanvas() {
+        this.canvas.width = window.innerWidth;
+        this.canvas.height = window.innerHeight;
+        window.addEventListener('resize', () => this.resizeCanvas());
+    }
+
+    resizeCanvas() {
+        this.canvas.width = window.innerWidth;
+        this.canvas.height = window.innerHeight;
+    }
+
+    createMusicWaveParticles() {
+        this.particles = [];
+        const particleCount = 200;
+        const colors = ['#00f260', '#0575e6', '#4ECDC4'];
+
+        for (let i = 0; i < particleCount; i++) {
+            this.particles.push({
+                x: Math.random() * this.canvas.width,
+                y: this.canvas.height / 2 + Math.sin(i * 0.1) * 100,
+                radius: Math.random() * 3 + 1,
+                color: colors[Math.floor(Math.random() * colors.length)],
+                speed: Math.random() * 2 + 1,
+                amplitude: Math.random() * 50 + 20
+            });
+        }
+    }
+
+    animate() {
+        this.ctx.clearRect(0, 0, this.canvas.width, this.canvas.height);
+        
+        this.particles.forEach((particle, index) => {
+            // Update particle position with wave-like motion
+            particle.x -= particle.speed;
+            particle.y = this.canvas.height / 2 + 
+                         Math.sin(particle.x * 0.01) * particle.amplitude;
+
+            // Reset particle position when it goes off-screen
+            if (particle.x < 0) {
+                particle.x = this.canvas.width;
+            }
+
+            // Draw particle
+            this.ctx.beginPath();
+            this.ctx.arc(particle.x, particle.y, particle.radius, 0, Math.PI * 2);
+            this.ctx.fillStyle = particle.color;
+            this.ctx.globalAlpha = 0.7;
+            this.ctx.fill();
+        });
+
+        requestAnimationFrame(() => this.animate());
+    }
+
+    init() {
+        this.createMusicWaveParticles();
+        this.animate();
+    }
+}
+
+// Initialize playlist visualizer
+document.addEventListener('DOMContentLoaded', () => {
+    const playlistVisualizer = new PlaylistVisualizer('playlistCanvas');
+    playlistVisualizer.init();
+});
+
+### ./static/style.css ###
+
+/* static/style.css - Improved MoodSync Styles */
+
+/* --- IMPORTS & CSS CUSTOM PROPERTIES --- */
+@import url('https://fonts.googleapis.com/css2?family=Poppins:wght@300;400;500;600;700&display=swap');
+
+:root {
+    /* Color Palette */
+    --primary-gradient: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+    --secondary-gradient: linear-gradient(45deg, #1db954, #1ed760);
+    --accent-gradient: linear-gradient(45deg, #00f260, #0575e6);
+    --background-dark: linear-gradient(45deg, #1a1a2e, #16213e);
+    
+    /* Semantic Colors */
+    --surface-primary: rgba(255, 255, 255, 0.1);
+    --surface-secondary: rgba(255, 255, 255, 0.05);
+    --surface-hover: rgba(255, 255, 255, 0.2);
+    --surface-active: rgba(29, 185, 84, 0.2);
+    --surface-glass: rgba(255, 255, 255, 0.08);
+    
+    /* Text Colors */
+    --text-primary: #ffffff;
+    --text-secondary: rgba(255, 255, 255, 0.8);
+    --text-tertiary: rgba(255, 255, 255, 0.6);
+    --text-accent: #1db954;
+    
+    /* Borders */
+    --border-primary: rgba(255, 255, 255, 0.1);
+    --border-secondary: rgba(255, 255, 255, 0.05);
+    --border-accent: rgba(29, 185, 84, 0.3);
+    
+    /* Spacing */
+    --spacing-xs: 0.25rem;
+    --spacing-sm: 0.5rem;
+    --spacing-md: 1rem;
+    --spacing-lg: 1.5rem;
+    --spacing-xl: 2rem;
+    --spacing-xxl: 3rem;
+    
+    /* Border Radius */
+    --radius-sm: 0.375rem;
+    --radius-md: 0.5rem;
+    --radius-lg: 0.75rem;
+    --radius-xl: 1rem;
+    --radius-pill: 50px;
+    
+    /* Shadows */
+    --shadow-sm: 0 2px 10px rgba(0, 0, 0, 0.1);
+    --shadow-md: 0 4px 20px rgba(0, 0, 0, 0.15);
+    --shadow-lg: 0 8px 30px rgba(0, 0, 0, 0.2);
+    --shadow-glow: 0 0 20px rgba(29, 185, 84, 0.3);
+    
+    /* Transitions */
+    --transition-fast: 0.15s ease;
+    --transition-normal: 0.3s ease;
+    --transition-slow: 0.5s ease;
+    
+    /* Layout */
+    --player-height: 90px;
+    --sidebar-width: 280px;
+    --content-max-width: 1200px;
+}
+
+/* --- RESET & BASE STYLES --- */
+* {
+    margin: 0;
+    padding: 0;
+    box-sizing: border-box;
+}
+
+html, body {
+    font-family: 'Poppins', -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+    background: var(--primary-gradient);
+    min-height: 100vh;
+    color: var(--text-primary);
+    font-size: 16px;
+    line-height: 1.5;
+    -webkit-font-smoothing: antialiased;
+    -moz-osx-font-smoothing: grayscale;
+}
+
+body {
+    overflow-x: hidden;
+}
+
+/* --- SCROLLBAR STYLES --- */
+*::-webkit-scrollbar {
+    width: 8px;
+    height: 8px;
+}
+
+*::-webkit-scrollbar-track {
+    background: var(--surface-secondary);
+    border-radius: var(--radius-sm);
+}
+
+*::-webkit-scrollbar-thumb {
+    background: var(--secondary-gradient);
+    border-radius: var(--radius-sm);
+    transition: background var(--transition-fast);
+}
+
+*::-webkit-scrollbar-thumb:hover {
+    background: var(--accent-gradient);
+}
+
+/* --- UTILITY CLASSES --- */
+.glass-effect {
+    background: var(--surface-glass);
+    backdrop-filter: blur(20px);
+    -webkit-backdrop-filter: blur(20px);
+    border: 1px solid var(--border-primary);
+}
+
+.gradient-text {
+    background: var(--secondary-gradient);
+    -webkit-background-clip: text;
+    background-clip: text;
+    -webkit-text-fill-color: transparent;
+    background-clip: text;
+}
+
+.hover-lift {
+    transition: transform var(--transition-fast), box-shadow var(--transition-fast);
+}
+
+.hover-lift:hover {
+    transform: translateY(-2px);
+    box-shadow: var(--shadow-lg);
+}
+
+.pulse-animation {
+    animation: pulse 2s infinite;
+}
+
+@keyframes pulse {
+    0%, 100% { opacity: 1; }
+    50% { opacity: 0.7; }
+}
+
+/* --- HOME PAGE STYLES --- */
+.mood-visualizer-container {
+    display: flex;
+    justify-content: center;
+    align-items: center;
+    min-height: 100vh;
+    position: relative;
+    padding: var(--spacing-lg);
+}
+
+.mood-canvas {
+    position: absolute;
+    top: 0;
+    left: 0;
+    width: 100%;
+    height: 100%;
+    z-index: 1;
+}
+
+.mood-selector {
+    position: relative;
+    z-index: 10;
+    text-align: center;
+    width: 100%;
+    max-width: 600px;
+    padding: var(--spacing-xxl);
+    background: var(--surface-glass);
+    border-radius: var(--radius-xl);
+    backdrop-filter: blur(20px);
+    border: 1px solid var(--border-primary);
+    box-shadow: var(--shadow-lg);
+}
+
+.app-title {
+    font-size: clamp(2.5rem, 5vw, 3.5rem);
+    font-weight: 700;
+    margin-bottom: var(--spacing-sm);
+    background: var(--secondary-gradient);
+    -webkit-background-clip: text;
+    background-clip: text;
+    -webkit-text-fill-color: transparent;
+    letter-spacing: -0.02em;
+}
+
+.subtitle {
+    color: var(--text-secondary);
+    font-size: 1.1rem;
+    margin-bottom: var(--spacing-xl);
+    font-weight: 400;
+}
+
+.mood-options {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(100px, 1fr));
+    gap: var(--spacing-md);
+    margin-bottom: var(--spacing-xl);
+}
+
+.mood-option input {
+    display: none;
+}
+
+.mood-label {
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    justify-content: center;
+    cursor: pointer;
+    padding: var(--spacing-lg);
+    border-radius: var(--radius-lg);
+    transition: all var(--transition-normal);
+    background: var(--surface-primary);
+    border: 2px solid transparent;
+    min-height: 120px;
+}
+
+.mood-label:hover {
+    background: var(--surface-hover);
+    transform: translateY(-2px);
+    box-shadow: var(--shadow-md);
+}
+
+.mood-emoji {
+    font-size: 2.5rem;
+    margin-bottom: var(--spacing-sm);
+    transition: transform var(--transition-fast);
+}
+
+.mood-label:hover .mood-emoji {
+    transform: scale(1.1);
+}
+
+.mood-option input:checked + .mood-label {
+    background: var(--surface-active);
+    border-color: var(--text-accent);
+    transform: scale(1.05);
+    box-shadow: var(--shadow-glow);
+}
+
+.mood-option input:checked + .mood-label .mood-emoji {
+    transform: scale(1.2);
+}
+
+.generate-btn {
+    background: var(--secondary-gradient);
+    color: var(--text-primary);
+    border: none;
+    padding: var(--spacing-lg) var(--spacing-xl);
+    border-radius: var(--radius-pill);
+    font-size: 1.1rem;
+    font-weight: 600;
+    cursor: pointer;
+    width: 100%;
+    transition: all var(--transition-normal);
+    box-shadow: var(--shadow-sm);
+    position: relative;
+    overflow: hidden;
+}
+
+.generate-btn::before {
+    content: '';
+    position: absolute;
+    top: 0;
+    left: -100%;
+    width: 100%;
+    height: 100%;
+    background: linear-gradient(90deg, transparent, rgba(255, 255, 255, 0.2), transparent);
+    transition: left var(--transition-slow);
+}
+
+.generate-btn:hover::before {
+    left: 100%;
+}
+
+.generate-btn:hover {
+    transform: translateY(-2px);
+    box-shadow: 0 8px 25px rgba(29, 185, 84, 0.4);
+}
+
+.generate-btn:active {
+    transform: translateY(0);
+}
+
+.divider {
+    text-align: center;
+    color: var(--text-tertiary);
+    margin: var(--spacing-xl) 0;
+    font-weight: 500;
+    position: relative;
+}
+
+.divider::before,
+.divider::after {
+    content: '';
+    position: absolute;
+    top: 50%;
+    width: 40%;
+    height: 1px;
+    background: var(--border-primary);
+}
+
+.divider::before {
+    left: 0;
+}
+
+.divider::after {
+    right: 0;
+}
+
+.join-room-form {
+    display: flex;
+    gap: var(--spacing-md);
+    align-items: center;
+}
+
+.join-room-form input {
+    flex: 1;
+    padding: var(--spacing-lg);
+    border-radius: var(--radius-pill);
+    border: 2px solid var(--border-primary);
+    background: var(--surface-secondary);
+    color: var(--text-primary);
+    font-family: inherit;
+    font-size: 1rem;
+    text-align: center;
+    transition: all var(--transition-fast);
+    letter-spacing: 1px;
+}
+
+.join-room-form input:focus {
+    outline: none;
+    border-color: var(--text-accent);
+    box-shadow: 0 0 0 3px rgba(29, 185, 84, 0.2);
+}
+
+.join-room-form input::placeholder {
+    color: var(--text-tertiary);
+}
+
+.join-btn {
+    background: linear-gradient(45deg, #5BCAFF, #4A90E2);
+    color: var(--text-primary);
+    border: none;
+    padding: var(--spacing-lg) var(--spacing-xl);
+    border-radius: var(--radius-pill);
+    font-size: 1rem;
+    font-weight: 600;
+    cursor: pointer;
+    transition: all var(--transition-normal);
+    white-space: nowrap;
+}
+
+.join-btn:hover {
+    transform: translateY(-2px);
+    box-shadow: 0 8px 25px rgba(91, 202, 255, 0.4);
+}
+
+/* --- MAIN LAYOUT --- */
+.main-container {
+    display: flex;
+    height: calc(100vh - var(--player-height));
+    max-width: var(--content-max-width);
+    margin: 0 auto;
+}
+
+/* --- SIDEBAR --- */
+.sidebar {
+    width: var(--sidebar-width);
+    flex-shrink: 0;
+    background: var(--surface-glass);
+    backdrop-filter: blur(20px);
+    padding: var(--spacing-xl);
+    display: flex;
+    flex-direction: column;
+    border-right: 1px solid var(--border-primary);
+}
+
+.sidebar h3 {
+    font-size: 1.3rem;
+    font-weight: 600;
+    margin-bottom: var(--spacing-lg);
+    color: var(--text-primary);
+    text-align: center;
+}
+
+.room-share-info {
+    background: var(--surface-primary);
+    padding: var(--spacing-lg);
+    border-radius: var(--radius-lg);
+    margin-bottom: var(--spacing-xl);
+    text-align: center;
+    border: 1px solid var(--border-primary);
+}
+
+.room-share-info p {
+    font-size: 0.9rem;
+    margin-bottom: var(--spacing-sm);
+    color: var(--text-secondary);
+}
+
+.room-code-display {
+    font-size: 1.5rem;
+    font-weight: 700;
+    letter-spacing: 3px;
+    color: var(--text-accent);
+    background: var(--surface-active);
+    padding: var(--spacing-md) var(--spacing-lg);
+    border-radius: var(--radius-md);
+    display: inline-block;
+    border: 1px solid var(--border-accent);
+    font-family: 'Courier New', monospace;
+}
+
+#participant-list {
+    list-style: none;
+    flex-grow: 1;
+    overflow-y: auto;
+    padding-right: var(--spacing-sm);
+}
+
+#participant-list li {
+    padding: var(--spacing-md);
+    margin-bottom: var(--spacing-sm);
+    background: var(--surface-primary);
+    border-radius: var(--radius-md);
+    font-size: 0.9rem;
+    transition: all var(--transition-fast);
+    border: 1px solid var(--border-secondary);
+    display: flex;
+    align-items: center;
+    gap: var(--spacing-sm);
+}
+
+#participant-list li:hover {
+    background: var(--surface-hover);
+    transform: translateX(4px);
+}
+
+#participant-list li.admin {
+    background: var(--surface-active);
+    border-color: var(--border-accent);
+    font-weight: 500;
+}
+
+#participant-list li.admin::before {
+    content: '👑';
+    font-size: 0.8rem;
+}
+
+.back-btn {
+    display: inline-block;
+    padding: var(--spacing-lg);
+    background: var(--surface-primary);
+    color: var(--text-primary);
+    text-decoration: none;
+    border-radius: var(--radius-lg);
+    text-align: center;
+    margin-top: var(--spacing-lg);
+    transition: all var(--transition-normal);
+    border: 1px solid var(--border-primary);
+    font-weight: 500;
+}
+
+.back-btn:hover {
+    background: var(--surface-hover);
+    transform: translateY(-2px);
+    box-shadow: var(--shadow-md);
+}
+
+/* --- PLAYLIST AREA --- */
+.playlist-area {
+    flex: 1;
+    padding: var(--spacing-xl);
+    overflow-y: auto;
+    background: var(--surface-secondary);
+}
+
+.playlist-title {
+    font-size: clamp(2rem, 4vw, 3rem);
+    font-weight: 700;
+    margin-bottom: var(--spacing-xl);
+    text-align: center;
+    background: var(--secondary-gradient);
+    -webkit-background-clip: text;
+    background-clip: text;
+    -webkit-text-fill-color: transparent;
+    letter-spacing: -0.02em;
+}
+
+.playlist-tracks {
+    display: grid;
+    gap: var(--spacing-md);
+    max-width: 800px;
+    margin: 0 auto;
+}
+
+.track {
+    display: flex;
+    align-items: center;
+    padding: var(--spacing-lg);
+    background: var(--surface-glass);
+    backdrop-filter: blur(10px);
+    border-radius: var(--radius-lg);
+    transition: all var(--transition-normal);
+    cursor: pointer;
+    border: 1px solid var(--border-primary);
+    position: relative;
+    overflow: hidden;
+}
+
+.track::before {
+    content: '';
+    position: absolute;
+    top: 0;
+    left: -100%;
+    width: 100%;
+    height: 100%;
+    background: linear-gradient(90deg, transparent, rgba(255, 255, 255, 0.1), transparent);
+    transition: left var(--transition-slow);
+}
+
+.track:hover::before {
+    left: 100%;
+}
+
+.track:hover {
+    background: var(--surface-hover);
+    transform: translateY(-2px);
+    box-shadow: var(--shadow-lg);
+}
+
+.track.playing {
+    background: var(--surface-active);
+    border-color: var(--text-accent);
+    box-shadow: var(--shadow-glow);
+}
+
+.track.playing::after {
+    content: '';
+    position: absolute;
+    left: 0;
+    top: 0;
+    width: 3px;
+    height: 100%;
+    background: var(--secondary-gradient);
+}
+
+.track-number {
+    font-size: 1.1rem;
+    font-weight: 600;
+    margin-right: var(--spacing-lg);
+    min-width: 35px;
+    text-align: center;
+    color: var(--text-accent);
+}
+
+.track-album-art {
+    width: 55px;
+    height: 55px;
+    border-radius: var(--radius-md);
+    margin-right: var(--spacing-lg);
+    overflow: hidden;
+    background: var(--surface-primary);
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    flex-shrink: 0;
+    box-shadow: var(--shadow-sm);
+}
+
+.track-album-art img {
+    width: 100%;
+    height: 100%;
+    object-fit: cover;
+    transition: transform var(--transition-fast);
+}
+
+.track:hover .track-album-art img {
+    transform: scale(1.05);
+}
+
+.placeholder-art {
+    font-size: 1.5rem;
+    color: var(--text-tertiary);
+}
+
+.track-info {
+    flex: 1;
+    min-width: 0;
+}
+
+.track-name {
+    font-size: 1.1rem;
+    font-weight: 600;
+    margin-bottom: var(--spacing-xs);
+    color: var(--text-primary);
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+}
+
+.track-artist {
+    font-size: 0.9rem;
+    color: var(--text-secondary);
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+}
+
+/* --- PLAYER BAR --- */
+.player-container {
+    position: fixed;
+    bottom: 0;
+    left: 0;
+    right: 0;
+    height: var(--player-height);
+    background: rgba(0, 0, 0, 0.95);
+    backdrop-filter: blur(30px);
+    border-top: 1px solid var(--border-primary);
+    display: grid;
+    grid-template-columns: 1fr 2fr 1fr;
+    align-items: center;
+    padding: 0 var(--spacing-xl);
+    gap: var(--spacing-xl);
+    z-index: 1000;
+    box-shadow: 0 -4px 20px rgba(0, 0, 0, 0.3);
+}
+
+#youtube-player-wrapper {
+    position: absolute;
+    left: -9999px;
+    top: -9999px;
+    width: 1px;
+    height: 1px;
+    overflow: hidden;
+    visibility: hidden;
+}
+
+.player-left {
+    display: flex;
+    align-items: center;
+    gap: var(--spacing-md);
+    min-width: 0;
+}
+
+#player-album-art {
+    width: 60px;
+    height: 60px;
+    border-radius: var(--radius-md);
+    overflow: hidden;
+    background: var(--surface-primary);
+    flex-shrink: 0;
+    box-shadow: var(--shadow-sm);
+}
+
+#player-album-art img {
+    width: 100%;
+    height: 100%;
+    object-fit: cover;
+    transition: transform var(--transition-fast);
+}
+
+#player-info {
+    min-width: 0;
+    flex: 1;
+}
+
+#now-playing-title {
+    font-size: 1rem;
+    font-weight: 600;
+    color: var(--text-primary);
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    margin-bottom: var(--spacing-xs);
+}
+
+#now-playing-artist {
+    font-size: 0.85rem;
+    color: var(--text-secondary);
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+}
+
+.player-center {
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    gap: var(--spacing-md);
+    min-width: 0;
+}
+
+.controls-wrapper {
+    display: flex;
+    align-items: center;
+    gap: var(--spacing-lg);
+}
+
+.control-btn {
+    background: none;
+    border: none;
+    color: var(--text-secondary);
+    padding: var(--spacing-sm);
+    border-radius: 50%;
+    cursor: pointer;
+    transition: all var(--transition-fast);
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    width: 36px;
+    height: 36px;
+}
+
+.control-btn:hover {
+    background: var(--surface-primary);
+    color: var(--text-primary);
+    transform: scale(1.1);
+}
+
+.control-btn:disabled {
+    opacity: 0.4;
+    cursor: not-allowed;
+    pointer-events: none;
+}
+
+.control-btn#play-pause-btn {
+    background: var(--text-primary);
+    color: #000;
+    width: 44px;
+    height: 44px;
+    box-shadow: var(--shadow-sm);
+}
+
+.control-btn#play-pause-btn:hover {
+    background: var(--text-primary);
+    transform: scale(1.05);
+    box-shadow: var(--shadow-md);
+}
+
+.timeline-wrapper {
+    display: flex;
+    align-items: center;
+    gap: var(--spacing-md);
+    width: 100%;
+    font-size: 0.8rem;
+    color: var(--text-tertiary);
+}
+
+.slider {
+    -webkit-appearance: none;
+    appearance: none;
+    width: 100%;
+    height: 4px;
+    background: var(--surface-primary);
+    border-radius: var(--radius-sm);
+    outline: none;
+    cursor: pointer;
+    transition: all var(--transition-fast);
+    position: relative;
+}
+
+.slider:hover {
+    height: 6px;
+}
+
+.slider::-webkit-slider-thumb {
+    -webkit-appearance: none;
+    appearance: none;
+    width: 16px;
+    height: 16px;
+    background: var(--text-primary);
+    border-radius: 50%;
+    cursor: pointer;
+    box-shadow: var(--shadow-sm);
+    transition: all var(--transition-fast);
+}
+
+.slider::-webkit-slider-thumb:hover {
+    transform: scale(1.2);
+    box-shadow: var(--shadow-md);
+}
+
+.slider::-moz-range-thumb {
+    width: 16px;
+    height: 16px;
+    background: var(--text-primary);
+    border-radius: 50%;
+    cursor: pointer;
+    border: none;
+    box-shadow: var(--shadow-sm);
+}
+
+.player-right {
+    display: flex;
+    align-items: center;
+    justify-content: flex-end;
+    gap: var(--spacing-md);
+}
+
+.volume-wrapper {
+    display: flex;
+    align-items: center;
+    gap: var(--spacing-sm);
+    width: 120px;
+}
+
+.volume-icon {
+    color: var(--text-secondary);
+    flex-shrink: 0;
+}
+
+#player-visualizer-canvas {
+    height: 40px;
+    width: 150px;
+    border-radius: var(--radius-sm);
+    background: var(--surface-primary);
+}
+
+/* --- RESPONSIVE DESIGN --- */
+@media (max-width: 768px) {
+    :root {
+        --sidebar-width: 250px;
+        --player-height: 80px;
+    }
+    
+    .mood-selector {
+        margin: var(--spacing-md);
+        padding: var(--spacing-xl);
+    }
+    
+    .app-title {
+        font-size: 2.5rem;
+    }
+    
+    .mood-options {
+        grid-template-columns: repeat(2, 1fr);
+        gap: var(--spacing-sm);
+    }
+    
+    .mood-label {
+        padding: var(--spacing-md);
+        min-height: 100px;
+    }
+    
+    .mood-emoji {
+        font-size: 2rem;
+    }
+    
+    .main-container {
+        flex-direction: column;
+        height: auto;
+    }
+    
+    .sidebar {
+        width: 100%;
+        height: auto;
+        border-right: none;
+        border-bottom: 1px solid var(--border-primary);
+    }
+    
+    .player-container {
+        grid-template-columns: 1fr;
+        grid-template-rows: 1fr auto;
+        height: auto;
+        padding: var(--spacing-md);
+    }
+    
+    .player-left {
+        justify-content: center;
+    }
+    
+    .player-center {
+        order: 2;
+    }
+    
+    .player-right {
+        display: none;
+    }
+    
+    .join-room-form {
+        flex-direction: column;
+    }
+    
+    .join-room-form input {
+        width: 100%;
+        margin-bottom: var(--spacing-md);
+    }
+}
+
+@media (max-width: 480px) {
+    :root {
+        --spacing-md: 0.75rem;
+        --spacing-lg: 1rem;
+        --spacing-xl: 1.5rem;
+    }
+    
+    .playlist-area {
+        padding: var(--spacing-md);
+    }
+    
+    .track {
+        padding: var(--spacing-md);
+    }
+    
+    .track-album-art {
+        width: 45px;
+        height: 45px;
+    }
+    
+    .sidebar {
+        padding: var(--spacing-md);
+    }
+}
+
+/* --- ANIMATIONS --- */
+@keyframes fadeIn {
+    from {
+        opacity: 0;
+        transform: translateY(20px);
+    }
+    to {
+        opacity: 1;
+        transform: translateY(0);
+    }
+}
+
+@keyframes slideIn {
+    from {
+        transform: translateX(-100%);
+    }
+    to {
+        transform: translateX(0);
+    }
+}
+
+@keyframes glow {
+    0%, 100% {
+        box-shadow: 0 0 5px rgba(29, 185, 84, 0.5);
+    }
+    50% {
+        box-shadow: 0 0 20px rgba(29, 185, 84, 0.8);
+    }
+}
+
+.fade-in {
+    animation: fadeIn 0.5s ease-out;
+}
+
+.slide-in {
+    animation: slideIn 0.3s ease-out;
+}
+
+.glow-effect {
+    animation: glow 2s ease-in-out infinite;
+}
+
+/* --- FOCUS STYLES --- */
+.control-btn:focus,
+.generate-btn:focus,
+.join-btn:focus,
+.back-btn:focus {
+    outline: 2px solid var(--text-accent);
+    outline-offset: 2px;
+}
+
+.slider:focus {
+    outline: none;
+    box-shadow: 0 0 0 3px rgba(29, 185, 84, 0.3);
+}
+
+/* --- PRINT STYLES --- */
+@media print {
+    .player-container,
+    .sidebar,
+    .mood-canvas {
+        display: none !important;
+    }
+    
+    .playlist-area {
+        width: 100%;
+        padding: 0;
+    }
+}
+
+### ./templates/error.html ###
+
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <title>MoodSync - Error</title>
+    <link rel="stylesheet" href="{{ url_for('static', filename='style.css') }}">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <style>
+        .error-container {
+            display: flex;
+            flex-direction: column;
+            justify-content: center;
+            align-items: center;
+            height: 100vh;
+            text-align: center;
+            background: linear-gradient(45deg, #ff416c, #ff4b2b);
+            color: white;
+            padding: 20px;
+        }
+        .error-icon {
+            font-size: 5rem;
+            margin-bottom: 20px;
+        }
+        .error-message {
+            max-width: 600px;
+            font-size: 1.2rem;
+            margin-bottom: 30px;
+        }
+        .error-action {
+            display: inline-block;
+            padding: 10px 20px;
+            background: white;
+            color: #ff416c;
+            text-decoration: none;
+            border-radius: 50px;
+            transition: all 0.3s ease;
+        }
+        .error-action:hover {
+            transform: scale(1.05);
+            box-shadow: 0 10px 20px rgba(0,0,0,0.1);
+        }
+    </style>
+</head>
+<body>
+    <div class="error-container">
+        <div class="error-icon">🚫</div>
+        <h1>Oops! Something Went Wrong</h1>
+        <p class="error-message">
+            {{ error or "An unexpected error occurred. Please try again later." }}
+        </p>
+        <a href="/" class="error-action">Back to Home</a>
+    </div>
+</body>
+</html>
+
+### ./templates/index.html ###
+
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <title>MoodSync - Musical Mood Generator</title>
+    <link rel="stylesheet" href="{{ url_for('static', filename='style.css') }}">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+</head>
+<body>
+    <div class="mood-visualizer-container">
+        <canvas id="moodCanvas" class="mood-canvas"></canvas>
+        
+        <div class="mood-selector">
+            <h1 class="app-title">MoodSync</h1>
+            <p class="subtitle">What's your musical vibe today?</p>
+            
+            <!-- This form now submits to /generate -->
+            <form id="generate-form" method="POST" action="/generate">
+                <div class="mood-options">
+                    <!-- ... mood options (happy, sad, energetic) are the same ... -->
+                    <div class="mood-option" data-mood="happy">
+                        <input type="radio" name="mood" value="happy" id="happy-mood" required>
+                        <label for="happy-mood" class="mood-label"><span class="mood-emoji">😊</span><span class="mood-text">Happy</span></label>
+                    </div>
+                    <div class="mood-option" data-mood="sad">
+                        <input type="radio" name="mood" value="sad" id="sad-mood">
+                        <label for="sad-mood" class="mood-label"><span class="mood-emoji">😢</span><span class="mood-text">Sad</span></label>
+                    </div>
+                    <div class="mood-option" data-mood="energetic">
+                        <input type="radio" name="mood" value="energetic" id="energetic-mood">
+                        <label for="energetic-mood" class="mood-label"><span class="mood-emoji">⚡</span><span class="mood-text">Energetic</span></label>
+                    </div>
+                </div>
+                <!-- Hidden input for the hour, will be set by JS -->
+                <input type="hidden" name="hour" id="hour-input">
+                <button type="submit" id="generatePlaylist" class="generate-btn">
+                    Create a Listening Room
+                    <div class="btn-particle-flow"></div>
+                </button>
+            </form>
+
+            <div class="divider">OR</div>
+
+            <!-- NEW: Join Room Form -->
+            <form id="join-form" class="join-room-form">
+                <input type="text" id="room-code-input" placeholder="Enter Room Code" required>
+                <button type="submit" class="join-btn">Join Room</button>
+            </form>
+
+        </div>
+    </div>
+
+    <script src="{{ url_for('static', filename='mood-visualizer.js') }}"></script>
+    <script src="{{ url_for('static', filename='mood-interactions.js') }}"></script>
+</body>
+</html>
+
+### ./templates/result.html ###
+
+<!-- templates/result.html -->
+
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <title>MoodSync - {{ playlist_title }}</title>
+    <link rel="icon" href="data:image/svg+xml,<svg xmlns=%22http://www.w3.org/2000/svg%22 viewBox=%220 0 100 100%22><text y=%22.9em%22 font-size=%2290%22>🎵</text></svg>">
+    <link rel="stylesheet" href="{{ url_for('static', filename='style.css') }}">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+</head>
+<body>
+    <!-- Hidden div to pass room code to JavaScript -->
+    <div id="room-data" data-room-code="{{ room_code }}"></div>
+
+    <div class="main-container">
+        <!-- Sidebar for participants and room info -->
+        <div class="sidebar">
+            <h3>In The Room</h3>
+            <div class="room-share-info">
+                <p>Room Code:</p>
+                <strong class="room-code-display">{{ room_code }}</strong>
+            </div>
+            <ul id="participant-list">
+                <!-- User list will be populated by JS -->
+            </ul>
+            <a href="/" class="back-btn">Leave Room</a>
+        </div>
+
+        <!-- Main playlist content area -->
+        <div class="playlist-area">
+            <h1 class="playlist-title">{{ playlist_title }}</h1>
+            <div class="playlist-tracks">
+                {% for song in songs %}
+                <div class="track" 
+                     data-youtube-id="{{ song.youtubeId or 'none' }}" 
+                     data-song-name="{{ song.name }}"
+                     data-artist-name="{{ song.artist }}"
+                     data-album-art="{{ song.albumArt or url_for('static', filename='placeholder.png') }}">
+                    <div class="track-number">{{ loop.index }}</div>
+                    <div class="track-album-art">
+                        {% if song.albumArt %}
+                        <img src="{{ song.albumArt }}" alt="{{ song.name }}">
+                        {% else %}
+                        <div class="placeholder-art">🎵</div>
+                        {% endif %}
+                    </div>
+                    <div class="track-info">
+                        <h3 class="track-name">{{ song.name }}</h3>
+                        <p class="track-artist">{{ song.artist }}</p>
+                    </div>
+                </div>
+                {% endfor %}
+            </div>
+        </div>
+    </div>
+
+    <!-- Redesigned Player Bar -->
+    <div id="player-container" class="player-container">
+        <!-- Hidden YouTube Player Iframe -->
+        <div id="youtube-player-wrapper"><div id="youtube-player"></div></div>
+        
+        <!-- Left Section: Song Info -->
+        <div class="player-left">
+            <div id="player-album-art"><img src="" alt="Album Art"></div>
+            <div id="player-info">
+                <span id="now-playing-title">Select a song</span>
+                <span id="now-playing-artist"></span>
+            </div>
+        </div>
+
+        <!-- Center Section: Playback Controls -->
+        <div class="player-center">
+            <div class="controls-wrapper">
+                <button id="prev-btn" class="control-btn"><svg role="img" height="16" width="16" aria-hidden="true" viewBox="0 0 16 16"><path d="M3.3 1a.7.7 0 0 1 .7.7v5.15l9.95-5.744a.7.7 0 0 1 1.05.606v12.575a.7.7 0 0 1-1.05.607L4 8.15V13.3a.7.7 0 0 1-1.4 0V1.7a.7.7 0 0 1 .7-.7z"></path></svg></button>
+                <button id="play-pause-btn" class="control-btn play-btn"></button>
+                <button id="next-btn" class="control-btn"><svg role="img" height="16" width="16" aria-hidden="true" viewBox="0 0 16 16"><path d="M12.7 1a.7.7 0 0 0-.7.7v5.15L2.05 1.107A.7.7 0 0 0 1 1.712v12.575a.7.7 0 0 0 1.05.607L12 8.15V13.3a.7.7 0 0 0 1.4 0V1.7a.7.7 0 0 0-.7-.7z"></path></svg></button>
+            </div>
+            <div class="timeline-wrapper">
+                <span id="current-time">0:00</span>
+                <input type="range" id="timeline-slider" class="slider" value="0" min="0" max="100">
+                <span id="total-time">0:00</span>
+            </div>
+        </div>
+
+        <!-- Right Section: Visualizer and Volume -->
+        <div class="player-right">
+            <canvas id="player-visualizer-canvas" width="150" height="40"></canvas>
+            <div class="volume-wrapper">
+                <svg role="img" height="16" width="16" aria-hidden="true" class="volume-icon" viewBox="0 0 16 16"><path d="M9.741.85a.75.75 0 0 1 .375.65v13a.75.75 0 0 1-1.125.65l-6.925-4a3.642 3.642 0 0 1-1.33-4.967 3.639 3.639 0 0 1 1.33-1.033l6.925-4a.75.75 0 0 1 .75 0zm-6.924 5.3a2.142 2.142 0 0 0-1.033 3.28.75.75 0 0 1 0 .28l.001.002 1.033 1.785a2.14 2.14 0 0 0 2.75-.44l.004-.007a2.14 2.14 0 0 0 .222-.327l.002-.003.001-.002-.001-.002-.002-.003a2.14 2.14 0 0 0-.222-.327l-.004-.007a2.14 2.14 0 0 0-2.75-.44l-1.033-1.785z"></path></svg>
+                <input type="range" id="volume-slider" class="slider" value="100" min="0" max="100">
+            </div>
+        </div>
+    </div>
+
+    <!-- JavaScript Files -->
+    <script src="https://www.youtube.com/iframe_api"></script>
+    <script src="https://cdn.socket.io/4.5.4/socket.io.min.js"></script>
+    <script src="{{ url_for('static', filename='player.js') }}"></script>
+</body>
+</html>
+
+### ./test_different_songs.py ###
+
+# test_different_songs.py - Test lyrics with different popular songs
+from lrc_kit.lrc import parse_lyrics
+
+# Test with multiple popular songs
+test_songs = [
+    {"id": "4NRXx6U8ABQ", "name": "Blinding Lights - The Weeknd"},
+    {"id": "H5v3kku4y6Q", "name": "As It Was - Harry Styles"},
+    {"id": "JGwWNGJdvx8", "name": "Shape of You - Ed Sheeran"},
+    {"id": "hT_nvWreIhg", "name": "Counting Stars - OneRepublic"},
+    {"id": "kJQP7kiw5Fk", "name": "Despacito - Luis Fonsi"},
+]
+
+for song in test_songs:
+    video_id = song["id"]
+    name = song["name"]
+    youtube_url = f"https://www.youtube.com/watch?v={video_id}"
+    
+    print(f"\n=== Testing: {name} ===")
+    print(f"URL: {youtube_url}")
+    
+    try:
+        result = parse_lyrics(youtube_url)
+        print(f"Type: {type(result)}")
+        
+        if isinstance(result, tuple) and len(result) >= 2:
+            lyrics_list, metadata = result
+            print(f"Lyrics count: {len(lyrics_list)}")
+            print(f"Metadata: {metadata}")
+            
+            if lyrics_list:
+                print("✅ Found lyrics!")
+                print(f"First few lines:")
+                for i, line in enumerate(lyrics_list[:3]):
+                    print(f"  {i+1}. {line}")
+                break  # Stop at first successful result
+            else:
+                print("❌ Empty lyrics list")
+        else:
+            print(f"❌ Unexpected result format: {result}")
+            
+    except Exception as e:
+        print(f"❌ Error: {e}")
+
+print("\n=== Test complete ===")
+
+### ./test_parse_lyrics.py ###
+
+# test_parse_lyrics.py - Test the parse_lyrics function
+from lrc_kit.lrc import parse_lyrics
+
+# Test with a popular song
+test_video_id = "4NRXx6U8ABQ"  # Blinding Lights by The Weeknd
+youtube_url = f"https://www.youtube.com/watch?v={test_video_id}"
+
+print(f"=== Testing parse_lyrics with {youtube_url} ===")
+
+try:
+    result = parse_lyrics(youtube_url)
+    print(f"Type of result: {type(result)}")
+    print(f"Result: {result}")
+    
+    if result:
+        if isinstance(result, list):
+            print(f"Result is a list with {len(result)} items")
+            if len(result) > 0:
+                print(f"First item: {result[0]}")
+                print(f"First item type: {type(result[0])}")
+        elif isinstance(result, dict):
+            print(f"Result is a dict with keys: {result.keys()}")
+        elif isinstance(result, str):
+            print(f"Result is a string of length {len(result)}")
+            print(f"First 200 chars: {result[:200]}")
+        else:
+            print(f"Result has attributes: {dir(result)}")
+    else:
+        print("Result is None or empty")
+        
+except Exception as e:
+    print(f"Error: {e}")
+    import traceback
+    traceback.print_exc()
+
+print("=== Test complete ===")
+
+### ./weather_test.py ###
+
+import requests
+
+api_key = '12bbc3118dc24fdd071e4fa87cc1aef7'
+city = 'London'
+url = f"http://api.openweathermap.org/data/2.5/weather?q={city}&appid={api_key}&units=metric"
+
+try:
+    response = requests.get(url)
+    weather_data = response.json()
+    
+    # Extract key weather information
+    main_weather = weather_data['weather'][0]['main']
+    description = weather_data['weather'][0]['description']
+    temperature = weather_data['main']['temp']
+    
+    print(f"Weather in {city}:")
+    print(f"Condition: {main_weather}")
+    print(f"Description: {description}")
+    print(f"Temperature: {temperature}°C")
+
+except Exception as e:
+    print(f"An error occurred: {e}")

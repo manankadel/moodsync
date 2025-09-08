@@ -1,0 +1,54 @@
+.git/ [EXCLUDED]
+.gitignore
+app.py
+client/
+  .next/ [EXCLUDED]
+  next-env.d.ts
+  next.config.mjs
+  node_modules/ [EXCLUDED]
+  package.json
+  postcss.config.js
+  src/
+    app/
+      globals.css
+      layout.tsx
+      page.tsx
+      room/
+        [room_code]/
+          page.tsx
+    components/
+      Equalizer.tsx
+      Lyrics.tsx
+      cta.tsx
+      features.tsx
+      hero-scene.tsx
+      hero.tsx
+      navigation.tsx
+      player.tsx
+      ui/
+        WaveButton.tsx
+      ui-panel.tsx
+      visualizer.tsx
+    lib/
+      room-store.ts
+  tailwind.config.ts
+  tsconfig.json
+debug_lrc.py
+dump_project.py
+generate_structure.py
+requirements.txt
+spotify_test.py
+static/
+  mood-interactions.js
+  mood-visualizer.js
+  player.js
+  playlist-visualizer.js
+  style.css
+templates/
+  error.html
+  index.html
+  result.html
+test_different_songs.py
+test_parse_lyrics.py
+venv/ [EXCLUDED]
+weather_test.py
