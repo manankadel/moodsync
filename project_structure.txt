@@ -22,6 +22,7 @@ client/
     components/
       Equalizer.tsx
       FileUploadModal.tsx
+      LatencyControl.tsx
       Lyrics.tsx
       cta.tsx
       features.tsx

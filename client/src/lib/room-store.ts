@@ -86,7 +86,7 @@ export const useRoomStore = create<RoomState>((set, get) => ({
     if (isSeeking) return;
 
     if (state.trackIndex !== undefined && state.trackIndex !== currentTrackIndex) {
-        set({ currentTrackIndex: state.trackIndex, isPlaying: state.isPlaying }); // Sync isPlaying state on track change
+        set({ currentTrackIndex: state.trackIndex, isPlaying: state.isPlaying });
         const track = playlist[state.trackIndex];
         if (track?.isUpload && track.audioUrl && audioElement) { audioElement.src = track.audioUrl; audioElement.load(); }
         else if (track?.youtubeId && player) { player.cueVideoById(track.youtubeId); get().fetchLyrics(track.youtubeId); }
@@ -172,7 +172,7 @@ export const useRoomStore = create<RoomState>((set, get) => ({
     const onPlayerStateChange = (e: any) => {
         const { isAdmin, isPlaying, nextTrack, _emitStateUpdate } = get();
         const newIsPlaying = e.data === window.YT.PlayerState.PLAYING;
-        set({ isPlaying: newIsPlaying }); // Update local state immediately for UI responsiveness
+        set({ isPlaying: newIsPlaying });
         if (isAdmin) {
             if (e.data === window.YT.PlayerState.ENDED) { nextTrack(); return; }
             if (newIsPlaying !== isPlaying) { _emitStateUpdate({ isPlaying: newIsPlaying }); }

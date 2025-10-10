@@ -1,3 +1,4 @@
+"use client";
 import { useState, useRef } from 'react';
 import { motion, AnimatePresence } from 'framer-motion';
 import { Upload, X, Music, Check, AlertCircle } from 'lucide-react';
@@ -17,14 +18,12 @@ export default function FileUploadModal({ isOpen, onClose }: { isOpen: boolean; 
   const handleFileSelect = (e: React.ChangeEvent<HTMLInputElement>) => {
     const selectedFile = e.target.files?.[0];
     if (selectedFile) {
-      // Check file type
       const allowedTypes = ['audio/mpeg', 'audio/wav', 'audio/ogg', 'audio/m4a', 'audio/flac'];
       if (!allowedTypes.includes(selectedFile.type) && !selectedFile.name.match(/\.(mp3|wav|ogg|m4a|flac)$/i)) {
         setError('Please select a valid audio file (MP3, WAV, OGG, M4A, or FLAC)');
         return;
       }
       
-      // Check file size (50MB max)
       if (selectedFile.size > 50 * 1024 * 1024) {
         setError('File size must be less than 50MB');
         return;
@@ -32,7 +31,6 @@ export default function FileUploadModal({ isOpen, onClose }: { isOpen: boolean; 
       
       setFile(selectedFile);
       setError('');
-      // Auto-fill title from filename
       if (!title) {
         setTitle(selectedFile.name.replace(/\.[^/.]+$/, ''));
       }
@@ -47,7 +45,6 @@ export default function FileUploadModal({ isOpen, onClose }: { isOpen: boolean; 
     setUploadProgress(0);
     
     try {
-      // Simulate progress for better UX
       const progressInterval = setInterval(() => {
         setUploadProgress(prev => Math.min(prev + 10, 90));
       }, 200);
@@ -58,7 +55,6 @@ export default function FileUploadModal({ isOpen, onClose }: { isOpen: boolean; 
       setUploadProgress(100);
       setSuccess(true);
       
-      // Reset and close after success
       setTimeout(() => {
         resetForm();
         onClose();
@@ -122,7 +118,6 @@ export default function FileUploadModal({ isOpen, onClose }: { isOpen: boolean; 
               </button>
             </div>
 
-            {/* File Drop Zone */}
             <div
               onClick={() => fileInputRef.current?.click()}
               className={`border-2 border-dashed rounded-xl p-8 mb-6 cursor-pointer transition-all ${
@@ -163,7 +158,6 @@ export default function FileUploadModal({ isOpen, onClose }: { isOpen: boolean; 
               </div>
             </div>
 
-            {/* Metadata Inputs */}
             {file && (
               <motion.div
                 initial={{ opacity: 0, y: 10 }}
@@ -200,7 +194,6 @@ export default function FileUploadModal({ isOpen, onClose }: { isOpen: boolean; 
               </motion.div>
             )}
 
-            {/* Progress Bar */}
             {isUploading && (
               <motion.div
                 initial={{ opacity: 0, y: 10 }}
@@ -222,7 +215,6 @@ export default function FileUploadModal({ isOpen, onClose }: { isOpen: boolean; 
               </motion.div>
             )}
 
-            {/* Error Message */}
             {error && (
               <motion.div
                 initial={{ opacity: 0, y: 10 }}
@@ -234,7 +226,6 @@ export default function FileUploadModal({ isOpen, onClose }: { isOpen: boolean; 
               </motion.div>
             )}
 
-            {/* Success Message */}
             {success && (
               <motion.div
                 initial={{ opacity: 0, scale: 0.9 }}
@@ -246,7 +237,6 @@ export default function FileUploadModal({ isOpen, onClose }: { isOpen: boolean; 
               </motion.div>
             )}
 
-            {/* Action Buttons */}
             <div className="flex gap-3">
               <button
                 onClick={handleClose}

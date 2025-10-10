@@ -40,7 +40,7 @@ try:
 except (redis.exceptions.ConnectionError, ValueError) as e:
     app.logger.error(f"FATAL: Could not connect to Redis. Error: {e}")
     exit(1)
-    
+
 lrc_kit_available = False
 try:
     from lrc_kit.lrc import parse_lyrics
@@ -73,32 +73,48 @@ FALLBACK_PLAYLIST = [
 ]
 
 @lru_cache(maxsize=1)
-def get_spotify_credentials(): return os.getenv('SPOTIFY_CLIENT_ID'), os.getenv('SPOTIFY_CLIENT_SECRET')
+def get_spotify_credentials(): 
+    return os.getenv('SPOTIFY_CLIENT_ID'), os.getenv('SPOTIFY_CLIENT_SECRET')
 
 def get_spotify_token():
     global token_failure_count, last_token_failure
-    if token_failure_count >= 3 and time.time() - last_token_failure < 300: return None
-    if time.time() < spotify_token_cache['expires'] and spotify_token_cache['token']: return spotify_token_cache['token']
+    if token_failure_count >= 3 and time.time() - last_token_failure < 300: 
+        return None
+    if time.time() < spotify_token_cache['expires'] and spotify_token_cache['token']: 
+        return spotify_token_cache['token']
     client_id, client_secret = get_spotify_credentials()
-    if not client_id or not client_secret: return None
+    if not client_id or not client_secret: 
+        return None
     try:
         auth_str = base64.b64encode(f"{client_id}:{client_secret}".encode()).decode()
         response = requests.post("https://accounts.spotify.com/api/token", headers={"Authorization": f"Basic {auth_str}", "Content-Type": "application/x-www-form-urlencoded"}, data={"grant_type": "client_credentials"}, timeout=10)
-        if response.status_code != 200: token_failure_count += 1; last_token_failure = time.time(); return None
+        if response.status_code != 200: 
+            token_failure_count += 1
+            last_token_failure = time.time()
+            return None
         data = response.json()
-        if 'access_token' not in data: token_failure_count += 1; last_token_failure = time.time(); return None
+        if 'access_token' not in data: 
+            token_failure_count += 1
+            last_token_failure = time.time()
+            return None
         spotify_token_cache['token'] = data['access_token']
         spotify_token_cache['expires'] = time.time() + data.get('expires_in', 3600) - 60
         token_failure_count = 0
         return data['access_token']
-    except Exception: token_failure_count += 1; last_token_failure = time.time(); return None
+    except Exception as e:
+        app.logger.error(f"Spotify token error: {e}")
+        token_failure_count += 1
+        last_token_failure = time.time()
+        return None
 
 def get_youtube_video_id(song_name, artist_name):
     cache_key = f"youtube:v2:{song_name}_{artist_name}".lower().replace(' ', '_')
     try:
         cached_id = r.get(cache_key)
-        if cached_id: return None if cached_id == "none" else cached_id
-    except redis.exceptions.ConnectionError: pass
+        if cached_id: 
+            return None if cached_id == "none" else cached_id
+    except redis.exceptions.ConnectionError: 
+        pass
     youtube_api_key = os.getenv('YOUTUBE_API_KEY')
     query = f"{song_name} {artist_name} official audio"
     video_id = None
@@ -108,21 +124,26 @@ def get_youtube_video_id(song_name, artist_name):
             req = youtube.search().list(q=query, part='snippet', maxResults=1, type='video', videoCategoryId='10')
             res = req.execute()
             video_id = res['items'][0]['id']['videoId'] if res.get('items') else None
-        except Exception as e: app.logger.error(f"YouTube API Error: {e}")
+        except Exception as e: 
+            app.logger.error(f"YouTube API Error: {e}")
     if not video_id:
         try:
             res = requests.get(f"https://invidious.io.gg/api/v1/search?q={query}", timeout=10).json()
             video_id = res[0].get('videoId') if res and isinstance(res, list) else None
-        except Exception as e: app.logger.error(f"Invidious fallback failed: {e}")
-    try: r.set(cache_key, video_id if video_id else "none", ex=86400 * 7)
-    except redis.exceptions.ConnectionError: pass
+        except Exception as e: 
+            app.logger.error(f"Invidious fallback failed: {e}")
+    try: 
+        r.set(cache_key, video_id if video_id else "none", ex=86400 * 7)
+    except redis.exceptions.ConnectionError: 
+        pass
     return video_id
 
 def generate_playlist(genre):
     try:
         config = GENRE_CONFIGS.get(genre, GENRE_CONFIGS['default'])
         token = get_spotify_token()
-        if not token: return FALLBACK_PLAYLIST
+        if not token: 
+            return FALLBACK_PLAYLIST
         if 'search_query' in config:
             params = {'q': config['search_query'], 'type': 'track', 'limit': 30, 'market': 'US'}
             response = requests.get("https://api.spotify.com/v1/search", headers={"Authorization": f"Bearer {token}"}, params=params)
@@ -132,10 +153,12 @@ def generate_playlist(genre):
             response = requests.get("https://api.spotify.com/v1/recommendations", headers={"Authorization": f"Bearer {token}"}, params=params)
         response.raise_for_status()
         tracks = response.json().get('tracks', {}).get('items', []) or response.json().get('tracks', [])
-        if not tracks: raise Exception(f"No tracks for genre: {genre}")
+        if not tracks: 
+            raise Exception(f"No tracks for genre: {genre}")
         playlist = []
         for track in sorted(tracks, key=lambda x: x.get('popularity', 0), reverse=True):
-            if len(playlist) >= 15: break
+            if len(playlist) >= 15: 
+                break
             song_name = track.get('name')
             artist_name = track.get('artists', [{}])[0].get('name')
             if song_name and artist_name:
@@ -143,7 +166,8 @@ def generate_playlist(genre):
                 if video_id:
                     album_art = track['album']['images'][0]['url'] if track.get('album', {}).get('images') else None
                     playlist.append({'name': song_name, 'artist': artist_name, 'albumArt': album_art, 'youtubeId': video_id})
-        if not playlist: raise Exception("No valid tracks after YouTube processing.")
+        if not playlist: 
+            raise Exception("No valid tracks after YouTube processing.")
         return playlist
     except Exception as e:
         app.logger.warning(f"Playlist generation for '{genre}' failed: {e}. Using fallback.")
@@ -151,13 +175,15 @@ def generate_playlist(genre):
 
 @app.route('/generate', methods=['POST', 'OPTIONS'])
 def generate_route():
-    if request.method == 'OPTIONS': return '', 204
+    if request.method == 'OPTIONS': 
+        return '', 204
     data = request.get_json()
     genre = data.get('mood', 'default').lower()
     playlist = generate_playlist(genre)
     while True:
         room_code = ''.join(random.choices(string.ascii_uppercase + string.digits, k=6))
-        if not r.exists(f"room:{room_code}"): break
+        if not r.exists(f"room:{room_code}"): 
+            break
     title = genre.replace('-', ' ').title() if genre != 'default' else "Curated Vibes"
     room_data = {
         'playlist': playlist, 'title': title, 'users': {}, 'admin_sid': None,
@@ -172,7 +198,8 @@ def generate_route():
 def get_room_data(room_code):
     room_code = room_code.upper()
     room_data_json = r.get(f"room:{room_code}")
-    if not room_data_json: return jsonify({'error': 'Room not found'}), 404
+    if not room_data_json: 
+        return jsonify({'error': 'Room not found'}), 404
     room_data = json.loads(room_data_json)
     return jsonify({'playlist_title': room_data['title'], 'playlist': room_data['playlist']}), 200
 
@@ -182,9 +209,11 @@ def uploaded_file(filename):
 
 @app.route('/api/upload', methods=['POST'])
 def upload_file_route():
-    if 'file' not in request.files: return jsonify({'error': 'No file part'}), 400
+    if 'file' not in request.files: 
+        return jsonify({'error': 'No file part'}), 400
     file = request.files['file']
-    if file.filename == '': return jsonify({'error': 'No selected file'}), 400
+    if file.filename == '': 
+        return jsonify({'error': 'No selected file'}), 400
     if file and allowed_file(file.filename):
         filename = f"{os.urandom(8).hex()}_{secure_filename(file.filename)}"
         file_path = os.path.join(app.config['UPLOAD_FOLDER'], filename)
@@ -202,7 +231,8 @@ def add_upload_to_playlist(room_code):
     room_code = room_code.upper()
     data = request.get_json()
     room_data_json = r.get(f"room:{room_code}")
-    if not room_data_json: return jsonify({'error': 'Room not found'}), 404
+    if not room_data_json: 
+        return jsonify({'error': 'Room not found'}), 404
     room_data = json.loads(room_data_json)
     new_track = {'name': data.get('title'), 'artist': data.get('artist'), 'albumArt': None, 'youtubeId': None, 'isUpload': True, 'audioUrl': data.get('audioUrl')}
     room_data['playlist'].append(new_track)
@@ -215,8 +245,10 @@ def get_lyrics(video_id):
     cache_key = f"lyrics:v2:{video_id}"
     try:
         cached_lyrics = r.get(cache_key)
-        if cached_lyrics: return jsonify(json.loads(cached_lyrics))
-    except redis.exceptions.ConnectionError: pass
+        if cached_lyrics: 
+            return jsonify(json.loads(cached_lyrics))
+    except redis.exceptions.ConnectionError: 
+        pass
     lyrics_json = []
     if lrc_kit_available:
         try:
@@ -225,19 +257,28 @@ def get_lyrics(video_id):
                 for line in result[0]:
                     if hasattr(line, 'time') and hasattr(line, 'text') and line.text.strip():
                         lyrics_json.append({'time': line.time, 'text': line.text})
-        except Exception as e: app.logger.error(f"lrc_kit error: {e}")
-    try: r.set(cache_key, json.dumps(lyrics_json), ex=86400)
-    except redis.exceptions.ConnectionError: pass
+        except Exception as e: 
+            app.logger.error(f"lrc_kit error: {e}")
+    try: 
+        r.set(cache_key, json.dumps(lyrics_json), ex=86400)
+    except redis.exceptions.ConnectionError: 
+        pass
     return jsonify(lyrics_json)
 
 @socketio.on('join_room')
 def handle_join_room(data):
-    room_code = data['room_code'].upper(); username = data.get('username', 'Guest'); sid = request.sid
+    room_code = data['room_code'].upper()
+    username = data.get('username', 'Guest')
+    sid = request.sid
     room_data_json = r.get(f"room:{room_code}")
-    if not room_data_json: emit('error', {'message': 'Room not found'}); return
-    room_data = json.loads(room_data_json); join_room(room_code)
+    if not room_data_json: 
+        emit('error', {'message': 'Room not found'})
+        return
+    room_data = json.loads(room_data_json)
+    join_room(room_code)
     is_admin = not room_data.get('users') or not room_data.get('admin_sid')
-    if is_admin: room_data['admin_sid'] = sid
+    if is_admin: 
+        room_data['admin_sid'] = sid
     room_data['users'][sid] = {'name': username, 'isAdmin': is_admin}
     r.set(f"room:{room_code}", json.dumps(room_data), ex=86400)
     emit('load_current_state', room_data['current_state'], to=sid)
@@ -245,17 +286,22 @@ def handle_join_room(data):
 
 @socketio.on('update_player_state')
 def handle_player_state_update(data):
-    room_code = data['room_code'].upper(); sid = request.sid; room_data_json = r.get(f"room:{room_code}")
-    if not room_data_json: return
+    room_code = data['room_code'].upper()
+    sid = request.sid
+    room_data_json = r.get(f"room:{room_code}")
+    if not room_data_json: 
+        return
     room_data = json.loads(room_data_json)
-    if room_data.get('admin_sid') != sid and not room_data['current_state'].get('isCollaborative', False): return
+    if room_data.get('admin_sid') != sid and not room_data['current_state'].get('isCollaborative', False): 
+        return
     client_state = data['state']
     room_data['current_state'].update(client_state)
     client_timestamp = client_state.get('timestamp', 0)
     server_receive_time = time.time()
     if client_timestamp > 0 and client_state.get('isPlaying', False):
         latency = server_receive_time - client_timestamp
-        if 0 < latency < 2.0: room_data['current_state']['currentTime'] += latency
+        if 0 < latency < 2.0: 
+            room_data['current_state']['currentTime'] += latency
     room_data['current_state']['serverTimestamp'] = server_receive_time
     r.set(f"room:{room_code}", json.dumps(room_data), ex=86400)
     emit('sync_player_state', room_data['current_state'], to=room_code, include_self=False)
@@ -266,7 +312,8 @@ def handle_disconnect():
     for key in r.scan_iter("room:*"):
         try:
             room_data_str = r.get(key)
-            if not room_data_str: continue
+            if not room_data_str: 
+                continue
             room_data = json.loads(room_data_str)
             if sid in room_data.get('users', {}):
                 room_code = key.split(":")[1]
@@ -276,14 +323,16 @@ def handle_disconnect():
                         new_admin_sid = next(iter(room_data['users']))
                         room_data['admin_sid'] = new_admin_sid
                         room_data['users'][new_admin_sid]['isAdmin'] = True
-                    else: room_data['admin_sid'] = None
+                    else: 
+                        room_data['admin_sid'] = None
                 if room_data['users']:
                     r.set(key, json.dumps(room_data), ex=86400)
                     emit('update_user_list', list(room_data['users'].values()), to=room_code)
                 else:
                     r.delete(key)
                 break
-        except (json.JSONDecodeError, TypeError): continue
+        except (json.JSONDecodeError, TypeError): 
+            continue
 
 if __name__ == '__main__':
     logging.basicConfig(level=logging.INFO, format='%(asctime)s %(levelname)s: %(message)s')
