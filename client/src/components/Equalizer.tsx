@@ -2,7 +2,6 @@ import { motion } from "framer-motion";
 import { useRoomStore } from "@/lib/room-store";
 
 const Equalizer = () => {
-  // Select the relevant state and actions from the Zustand store.
   const { equalizer, setEqualizer, isAdmin, isCollaborative } = useRoomStore(
     (state) => ({
       equalizer: state.equalizer,
@@ -12,10 +11,8 @@ const Equalizer = () => {
     })
   );
 
-  // Determine if the current user has control over the equalizer.
   const canControl = isAdmin || isCollaborative;
 
-  // Handle changes from the range sliders.
   const handleChange = (band: "bass" | "mids" | "treble", value: string) => {
     const numericValue = Number(value);
     setEqualizer({ ...equalizer, [band]: numericValue });
@@ -28,7 +25,6 @@ const Equalizer = () => {
       exit={{ opacity: 0, y: 10, transition: { duration: 0.2 } }}
       className="absolute bottom-24 right-0 flex items-center gap-4 bg-black/50 border border-white/10 backdrop-blur-md rounded-lg p-4 shadow-2xl"
     >
-      {/* Slider for Bass */}
       <div className="flex flex-col items-center gap-2">
         <label htmlFor="bass-slider" className="text-xs font-bold text-white tracking-widest">
           BASS
@@ -46,7 +42,6 @@ const Equalizer = () => {
           title={`Bass: ${equalizer.bass} dB`}
         />
       </div>
-      {/* Slider for Mids */}
       <div className="flex flex-col items-center gap-2">
         <label htmlFor="mids-slider" className="text-xs font-bold text-white tracking-widest">
           MIDS
@@ -64,7 +59,6 @@ const Equalizer = () => {
           title={`Mids: ${equalizer.mids} dB`}
         />
       </div>
-      {/* Slider for Treble */}
       <div className="flex flex-col items-center gap-2">
         <label htmlFor="treble-slider" className="text-xs font-bold text-white tracking-widest">
           TREBLE

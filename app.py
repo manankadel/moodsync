@@ -1,19 +1,18 @@
-# moodsync/app.py - Final Production-Ready Version
-
 import os, base64, random, string, logging, time, requests, json
 from functools import lru_cache
-from flask import Flask, jsonify, request, send_from_directory, url_for
-from flask_socketio import SocketIO, join_room, emit
+from flask import Flask, jsonify, request, send_from_directory
+from flask_socketio import SocketIO, join_room, emit, rooms
 from flask_cors import CORS
 from dotenv import load_dotenv
 from googleapiclient.discovery import build
 from googleapiclient import errors
 import redis
 from werkzeug.utils import secure_filename
-from werkzeug.middleware.proxy_fix import ProxyFix # FIX: Import ProxyFix
+from werkzeug.middleware.proxy_fix import ProxyFix
 import mimetypes
+from datetime import datetime
 
-# ... (lrc_kit import logic is the same) ...
+# Imports for lrc_kit
 lrc_kit_available = False
 try:
     from lrc_kit.lrc import parse_lyrics
@@ -29,30 +28,26 @@ except ImportError:
         print("❌ Could not import lrc_kit parse_lyrics. Lyrics functionality will be disabled.")
         lrc_kit_available = False
 
-
 # --- APP INITIALIZATION ---
 load_dotenv()
 app = Flask(__name__)
-
-# FIX: Add ProxyFix middleware to handle HTTPS headers from Render's proxy
-# This ensures url_for generates https:// URLs in production.
 app.wsgi_app = ProxyFix(app.wsgi_app, x_for=1, x_proto=1, x_host=1, x_prefix=1)
 
-# ... (the rest of the app initialization is the same) ...
 cors_origin = os.getenv("CORS_ALLOWED_ORIGIN", "*") 
 CORS(app, origins=cors_origin)
 app.secret_key = os.urandom(24)
-socketio = SocketIO(app, cors_allowed_origins=cors_origin)
+socketio = SocketIO(app, cors_allowed_origins=cors_origin, ping_timeout=60, ping_interval=25)
+
 UPLOAD_FOLDER = 'uploads'
 ALLOWED_EXTENSIONS = {'mp3', 'wav', 'ogg', 'm4a', 'flac'}
 MAX_FILE_SIZE = 50 * 1024 * 1024
 os.makedirs(UPLOAD_FOLDER, exist_ok=True)
 app.config['UPLOAD_FOLDER'] = UPLOAD_FOLDER
 app.config['MAX_CONTENT_LENGTH'] = MAX_FILE_SIZE
+
 def allowed_file(filename):
     return '.' in filename and filename.rsplit('.', 1)[1].lower() in ALLOWED_EXTENSIONS
 
-# ... (the rest of the file is IDENTICAL to the last version you had) ...
 # --- DATABASE CONNECTION (REDIS) ---
 try:
     redis_url = os.getenv('REDIS_URL', 'redis://localhost:6379')
@@ -66,49 +61,63 @@ except redis.exceptions.ConnectionError as e:
 # --- GLOBAL CONFIG & FALLBACKS ---
 spotify_token_cache = {'token': None, 'expires': 0}
 token_failure_count, last_token_failure = 0, 0
+
 GENRE_CONFIGS = {
-    'deep-house': {'seeds': ['deep-house', 'minimal-techno']}, 'house': {'seeds': ['house', 'dance']},
-    'progressive-house': {'seeds': ['progressive-house', 'edm']}, 'tech-house': {'seeds': ['tech-house', 'techno']},
+    'deep-house': {'seeds': ['deep-house', 'minimal-techno']}, 
+    'house': {'seeds': ['house', 'dance']},
+    'progressive-house': {'seeds': ['progressive-house', 'edm']}, 
+    'tech-house': {'seeds': ['tech-house', 'techno']},
     'techno': {'seeds': ['techno', 'hardstyle', 'industrial']}, 
     'minimal-techno': {'seeds': ['minimal-techno', 'ambient', 'electronic']},
-    'detroit-techno': {'seeds': ['detroit-techno', 'techno']}, 'electronica': {'seeds': ['electronica', 'idm']},
-    'edm': {'seeds': ['edm', 'electro', 'dance']}, 'electro': {'seeds': ['electro', 'chicago-house']},
-    'dubstep': {'seeds': ['dubstep', 'bass-music']}, 'indie': {'seeds': ['indie', 'indie-pop', 'alternative']},
-    'indie-pop': {'seeds': ['indie-pop', 'pop']}, 'alternative': {'seeds': ['alternative', 'rock']},
-    'boiler-room': {'search_query': 'Boiler Room set'}, 'live-techno-set': {'search_query': 'live techno set'},
-    'deep-house-mix': {'search_query': 'deep house mix'}, 'default': {'seeds': ['music', 'pop']}
+    'detroit-techno': {'seeds': ['detroit-techno', 'techno']}, 
+    'electronica': {'seeds': ['electronica', 'idm']},
+    'edm': {'seeds': ['edm', 'electro', 'dance']}, 
+    'electro': {'seeds': ['electro', 'chicago-house']},
+    'dubstep': {'seeds': ['dubstep', 'bass-music']}, 
+    'indie': {'seeds': ['indie', 'indie-pop', 'alternative']},
+    'indie-pop': {'seeds': ['indie-pop', 'pop']}, 
+    'alternative': {'seeds': ['alternative', 'rock']},
+    'boiler-room': {'search_query': 'Boiler Room set'}, 
+    'live-techno-set': {'search_query': 'live techno set'},
+    'deep-house-mix': {'search_query': 'deep house mix'}, 
+    'default': {'seeds': ['music', 'pop']}
 }
+
 FALLBACK_PLAYLIST = [
     {'name': 'Blinding Lights', 'artist': 'The Weeknd', 'albumArt': 'https://i.scdn.co/image/ab67616d0000b2738863bc11d2aa12b54f5aeb36', 'youtubeId': '4NRXx6U8ABQ'},
     {'name': 'As It Was', 'artist': 'Harry Styles', 'albumArt': 'https://i.scdn.co/image/ab67616d0000b273b46f74097652c7f3a3a08237', 'youtubeId': 'H5v3kku4y6Q'},
-    # ... more fallback tracks
 ]
 
 # --- API FUNCTIONS ---
 @lru_cache(maxsize=1)
-def get_spotify_credentials(): return os.getenv('SPOTIFY_CLIENT_ID'), os.getenv('SPOTIFY_CLIENT_SECRET')
+def get_spotify_credentials(): 
+    return os.getenv('SPOTIFY_CLIENT_ID'), os.getenv('SPOTIFY_CLIENT_SECRET')
 
 def get_spotify_token():
-    # ... implementation is the same ...
     global token_failure_count, last_token_failure
-    if token_failure_count >= 3 and time.time() - last_token_failure < 300: return None
-    if time.time() < spotify_token_cache['expires'] and spotify_token_cache['token']: return spotify_token_cache['token']
+    if token_failure_count >= 3 and time.time() - last_token_failure < 300: 
+        return None
+    if time.time() < spotify_token_cache['expires'] and spotify_token_cache['token']: 
+        return spotify_token_cache['token']
     client_id, client_secret = get_spotify_credentials()
-    if not client_id or not client_secret: return None
+    if not client_id or not client_secret: 
+        return None
     try:
         auth_str = base64.b64encode(f"{client_id}:{client_secret}".encode()).decode()
         response = requests.post("https://accounts.spotify.com/api/token", headers={"Authorization": f"Basic {auth_str}", "Content-Type": "application/x-www-form-urlencoded"}, data={"grant_type": "client_credentials"}, timeout=10)
-        if response.status_code != 200: token_failure_count += 1; last_token_failure = time.time(); return None
+        if response.status_code != 200: 
+            token_failure_count += 1; last_token_failure = time.time(); return None
         data = response.json()
-        if 'access_token' not in data: token_failure_count += 1; last_token_failure = time.time(); return None
+        if 'access_token' not in data: 
+            token_failure_count += 1; last_token_failure = time.time(); return None
         spotify_token_cache['token'] = data['access_token']
         spotify_token_cache['expires'] = time.time() + data.get('expires_in', 3600) - 60
         token_failure_count = 0
         return data['access_token']
-    except Exception: token_failure_count += 1; last_token_failure = time.time(); return None
+    except Exception: 
+        token_failure_count += 1; last_token_failure = time.time(); return None
 
 def get_youtube_video_id_fallback(query):
-    # ... implementation is the same ...
     try:
         invidious_api_url = f"https://invidious.io.gg/api/v1/search?q={query}"
         response = requests.get(invidious_api_url, timeout=10)
@@ -122,10 +131,10 @@ def get_youtube_video_id_fallback(query):
         return None
 
 def get_youtube_video_id(song_name, artist_name):
-    # ... implementation is the same ...
     cache_key = f"youtube:v2:{song_name}_{artist_name}".lower().replace(' ', '_')
     cached_id = r.get(cache_key)
-    if cached_id: return None if cached_id == "none" else cached_id
+    if cached_id: 
+        return None if cached_id == "none" else cached_id
     youtube_api_key = os.getenv('YOUTUBE_API_KEY')
     video_id = None
     query = f"{song_name} {artist_name} official audio"
@@ -136,8 +145,10 @@ def get_youtube_video_id(song_name, artist_name):
             response = search_request.execute()
             video_id = response['items'][0]['id']['videoId'] if response.get('items') else None
         except errors.HttpError as e:
-            if 'quotaExceeded' in str(e): app.logger.error(f"YOUTUBE QUOTA EXCEEDED. Trying fallback.")
-            else: app.logger.error(f"YouTube search error for '{query}': {e}")
+            if 'quotaExceeded' in str(e): 
+                app.logger.error(f"YOUTUBE QUOTA EXCEEDED. Trying fallback.")
+            else: 
+                app.logger.error(f"YouTube search error for '{query}': {e}")
             video_id = None
         except Exception as e:
             app.logger.error(f"General YouTube API error for '{query}': {e}")
@@ -149,11 +160,11 @@ def get_youtube_video_id(song_name, artist_name):
     return video_id
 
 def generate_playlist(genre):
-    # ... implementation is the same ...
     try:
         config = GENRE_CONFIGS.get(genre, GENRE_CONFIGS['default'])
         tracks, token = [], get_spotify_token()
-        if not token: return FALLBACK_PLAYLIST
+        if not token: 
+            return FALLBACK_PLAYLIST
         if 'search_query' in config:
             params = {'q': config['search_query'], 'type': 'track', 'limit': 30, 'market': 'US'}
             response = requests.get("https://api.spotify.com/v1/search", headers={"Authorization": f"Bearer {token}"}, params=params)
@@ -163,42 +174,64 @@ def generate_playlist(genre):
             response = requests.get("https://api.spotify.com/v1/recommendations", headers={"Authorization": f"Bearer {token}"}, params=params)
         response.raise_for_status()
         tracks = response.json().get('tracks', {}).get('items', []) or response.json().get('tracks', [])
-        if not tracks: raise Exception(f"No tracks found for genre: {genre}")
+        if not tracks: 
+            raise Exception(f"No tracks found for genre: {genre}")
         tracks.sort(key=lambda x: x.get('popularity', 0), reverse=True)
         playlist = []
         for track in tracks:
-            if len(playlist) >= 15: break
+            if len(playlist) >= 15: 
+                break
             song_name, artist_name = track.get('name'), track.get('artists', [{}])[0].get('name')
-            if not song_name or not artist_name: continue
+            if not song_name or not artist_name: 
+                continue
             video_id = get_youtube_video_id(song_name, artist_name)
             if video_id:
                 album_art = track['album']['images'][0]['url'] if track.get('album', {}).get('images') else None
                 playlist.append({'name': song_name, 'artist': artist_name, 'albumArt': album_art, 'youtubeId': video_id})
-        if not playlist: raise Exception("No valid tracks found after YouTube processing.")
+        if not playlist: 
+            raise Exception("No valid tracks found after YouTube processing.")
         return playlist
     except Exception as e:
         app.logger.warning(f"Playlist generation for '{genre}' failed: {e}. Using guaranteed fallback playlist.")
         return FALLBACK_PLAYLIST
 
 # --- ROUTES & SOCKETS ---
-# ... (all routes and socket handlers are the same as the previous correct version) ...
 @app.route('/generate', methods=['POST'])
 def generate_route():
-    data = request.get_json(); genre = data.get('mood', 'default').lower()
+    data = request.get_json()
+    genre = data.get('mood', 'default').lower()
     playlist = generate_playlist(genre)
     while True:
         room_code = ''.join(random.choices(string.ascii_uppercase + string.digits, k=6))
-        if not r.exists(f"room:{room_code}"): break
+        if not r.exists(f"room:{room_code}"): 
+            break
     title = genre.replace('-', ' ').title() if genre != 'default' else "Curated Vibes"
-    room_data = { 'playlist': playlist, 'title': title, 'users': {}, 'admin_sid': None, 'current_state': { 'isPlaying': False, 'trackIndex': 0, 'currentTime': 0, 'volume': 80, 'timestamp': time.time(), 'equalizer': {'bass': 0, 'mids': 0, 'treble': 0} }, 'created_at': time.time() }
+    room_data = {
+        'playlist': playlist, 
+        'title': title, 
+        'users': {}, 
+        'admin_sid': None, 
+        'current_state': {
+            'isPlaying': False, 
+            'trackIndex': 0, 
+            'currentTime': 0, 
+            'volume': 80, 
+            'timestamp': time.time(),
+            'serverTimestamp': time.time(),
+            'equalizer': {'bass': 0, 'mids': 0, 'treble': 0}
+        }, 
+        'created_at': time.time()
+    }
     r.set(f"room:{room_code}", json.dumps(room_data), ex=86400)
     app.logger.info(f"Room {room_code} created.")
     return jsonify({'room_code': room_code}), 200
 
 @app.route('/api/room/<string:room_code>')
 def get_room_data(room_code):
-    room_code = room_code.upper(); room_data_json = r.get(f"room:{room_code}")
-    if not room_data_json: return jsonify({'error': 'Room not found'}), 404
+    room_code = room_code.upper()
+    room_data_json = r.get(f"room:{room_code}")
+    if not room_data_json: 
+        return jsonify({'error': 'Room not found'}), 404
     room_data = json.loads(room_data_json)
     return jsonify({'playlist_title': room_data['title'], 'playlist': room_data['playlist']}), 200
 
@@ -209,19 +242,23 @@ def uploaded_file(filename):
 
 @app.route('/api/upload', methods=['POST'])
 def upload_file_route():
-    if 'file' not in request.files: return jsonify({'error': 'No file part'}), 400
+    if 'file' not in request.files: 
+        return jsonify({'error': 'No file part'}), 400
     file = request.files['file']
-    if file.filename == '': return jsonify({'error': 'No selected file'}), 400
+    if file.filename == '': 
+        return jsonify({'error': 'No selected file'}), 400
     if file and allowed_file(file.filename):
-        if request.content_length > app.config['MAX_CONTENT_LENGTH']: return jsonify({'error': 'File too large (max 50MB)'}), 413
+        if request.content_length > app.config['MAX_CONTENT_LENGTH']: 
+            return jsonify({'error': 'File too large (max 50MB)'}), 413
         filename = secure_filename(file.filename)
         unique_filename = f"{os.urandom(8).hex()}_{filename}"
         file_path = os.path.join(app.config['UPLOAD_FOLDER'], unique_filename)
         try:
             file.save(file_path)
+            from flask import url_for
             audio_url = url_for('uploaded_file', filename=unique_filename, _external=True)
             app.logger.info(f"File uploaded: {unique_filename}, URL: {audio_url}")
-            return jsonify({ 'filename': unique_filename, 'audioUrl': audio_url }), 200
+            return jsonify({'filename': unique_filename, 'audioUrl': audio_url}), 200
         except Exception as e:
             app.logger.error(f"File save error: {e}")
             return jsonify({'error': 'Failed to save file'}), 500
@@ -233,10 +270,19 @@ def add_upload_to_playlist(room_code):
     data = request.get_json()
     audio_url = data.get('audioUrl')
     room_data_json = r.get(f"room:{room_code}")
-    if not room_data_json: return jsonify({'error': 'Room not found'}), 404
+    if not room_data_json: 
+        return jsonify({'error': 'Room not found'}), 404
     room_data = json.loads(room_data_json)
-    if any(track.get('audioUrl') == audio_url for track in room_data['playlist']): return jsonify({'message': 'Track already in playlist'}), 200
-    new_track = { 'name': data.get('title'), 'artist': data.get('artist'), 'albumArt': None, 'youtubeId': None, 'isUpload': True, 'audioUrl': audio_url }
+    if any(track.get('audioUrl') == audio_url for track in room_data['playlist']): 
+        return jsonify({'message': 'Track already in playlist'}), 200
+    new_track = {
+        'name': data.get('title'), 
+        'artist': data.get('artist'), 
+        'albumArt': None, 
+        'youtubeId': None, 
+        'isUpload': True, 
+        'audioUrl': audio_url
+    }
     room_data['playlist'].append(new_track)
     r.set(f"room:{room_code}", json.dumps(room_data), ex=86400)
     socketio.emit('refresh_playlist', to=room_code)
@@ -244,10 +290,10 @@ def add_upload_to_playlist(room_code):
 
 @app.route('/api/lyrics/<string:video_id>')
 def get_lyrics(video_id):
-    # ... implementation is the same ...
     cache_key = f"lyrics:v2:{video_id}" 
     cached_lyrics = r.get(cache_key)
-    if cached_lyrics: return jsonify(json.loads(cached_lyrics))
+    if cached_lyrics: 
+        return jsonify(json.loads(cached_lyrics))
     lyrics_json = []
     if lrc_kit_available:
         try:
@@ -259,22 +305,33 @@ def get_lyrics(video_id):
                     for line in lyrics_list:
                         if hasattr(line, 'time') and hasattr(line, 'text') and line.text.strip():
                             lyrics_json.append({'time': line.time, 'text': line.text})
-        except Exception as e: app.logger.error(f"--- lrc_kit error for {video_id}: {e} ---")
+        except Exception as e: 
+            app.logger.error(f"--- lrc_kit error for {video_id}: {e} ---")
     if not lyrics_json:
-        demo_lyrics = { "4NRXx6U8ABQ": [{"time": 1, "text": "[Demo] I'm blinded by the lights"}, {"time": 6, "text": "No, I can't sleep until I feel your touch"}], "H5v3kku4y6Q": [{"time": 1, "text": "[Demo] Come on, Harry, we wanna say goodnight to you!"}, {"time": 7, "text": "Holdin' me back"}] }
-        if video_id in demo_lyrics: lyrics_json = demo_lyrics[video_id]
+        demo_lyrics = {
+            "4NRXx6U8ABQ": [{"time": 1, "text": "[Demo] I'm blinded by the lights"}, {"time": 6, "text": "No, I can't sleep until I feel your touch"}], 
+            "H5v3kku4y6Q": [{"time": 1, "text": "[Demo] Come on, Harry, we wanna say goodnight to you!"}, {"time": 7, "text": "Holdin' me back"}]
+        }
+        if video_id in demo_lyrics: 
+            lyrics_json = demo_lyrics[video_id]
     r.set(cache_key, json.dumps(lyrics_json), ex=86400)
     return jsonify(lyrics_json)
 
+# --- SOCKETIO HANDLERS WITH ZERO-LATENCY SYNC ---
 @socketio.on('join_room')
 def handle_join_room(data):
-    # ... implementation is the same ...
-    room_code = data['room_code'].upper(); username = data.get('username', 'Guest'); sid = request.sid
+    room_code = data['room_code'].upper()
+    username = data.get('username', 'Guest')
+    sid = request.sid
     room_data_json = r.get(f"room:{room_code}")
-    if not room_data_json: emit('error', {'message': 'Room not found'}); return
-    room_data = json.loads(room_data_json); join_room(room_code)
+    if not room_data_json: 
+        emit('error', {'message': 'Room not found'})
+        return
+    room_data = json.loads(room_data_json)
+    join_room(room_code)
     is_admin = not room_data.get('admin_sid') or not room_data.get('users')
-    if is_admin: room_data['admin_sid'] = sid
+    if is_admin: 
+        room_data['admin_sid'] = sid
     room_data['users'][sid] = {'name': username, 'isAdmin': is_admin}
     r.set(f"room:{room_code}", json.dumps(room_data), ex=86400)
     emit('load_current_state', room_data['current_state'], to=sid)
@@ -282,40 +339,52 @@ def handle_join_room(data):
 
 @socketio.on('update_player_state')
 def handle_player_state_update(data):
-    # ... implementation is the same ...
-    room_code = data['room_code'].upper(); sid = request.sid
-    room_data_json = r.get(f"room:{room_code}");
-    if not room_data_json: return
+    room_code = data['room_code'].upper()
+    sid = request.sid
+    room_data_json = r.get(f"room:{room_code}")
+    if not room_data_json: 
+        return
     room_data = json.loads(room_data_json)
-    if room_data.get('admin_sid') != sid and not room_data['current_state'].get('isCollaborative', False): return
+    if room_data.get('admin_sid') != sid and not room_data['current_state'].get('isCollaborative', False): 
+        return
+    
+    # Critical: Update with server timestamp
+    room_data['current_state']['serverTimestamp'] = time.time()
     room_data['current_state'].update(data['state'])
     room_data['current_state']['timestamp'] = time.time()
+    
     r.set(f"room:{room_code}", json.dumps(room_data), ex=86400)
-    emit('sync_player_state', data['state'], to=room_code, include_self=False)
+    
+    # Broadcast to all clients with server timestamp
+    emit('sync_player_state', room_data['current_state'], to=room_code, include_self=False)
 
 @socketio.on('disconnect')
 def handle_disconnect():
-    # ... implementation is the same ...
     sid = request.sid
     for key in r.scan_iter("room:*"):
         try:
             room_data_str = r.get(key)
-            if not room_data_str: continue
+            if not room_data_str: 
+                continue
             room_data = json.loads(room_data_str)
             if sid in room_data.get('users', {}):
-                room_code = key.split(":")[1]; user_name = room_data['users'][sid]['name']
+                room_code = key.split(":")[1]
+                user_name = room_data['users'][sid]['name']
                 del room_data['users'][sid]
                 if room_data.get('admin_sid') == sid:
                     if room_data['users']:
-                        new_admin_sid = next(iter(room_data['users'])); room_data['admin_sid'] = new_admin_sid
+                        new_admin_sid = next(iter(room_data['users']))
+                        room_data['admin_sid'] = new_admin_sid
                         room_data['users'][new_admin_sid]['isAdmin'] = True
-                    else: room_data['admin_sid'] = None
+                    else: 
+                        room_data['admin_sid'] = None
                 r.set(key, json.dumps(room_data), ex=86400)
                 emit('update_user_list', list(room_data['users'].values()), to=room_code)
                 break
-        except (json.JSONDecodeError, TypeError): continue
+        except (json.JSONDecodeError, TypeError): 
+            continue
 
 if __name__ == '__main__':
     logging.basicConfig(level=logging.INFO, format='%(asctime)s %(levelname)s: %(message)s')
-    app.logger.info("=== Starting MoodSync API Server (Final Version) ===")
-    socketio.run(app, debug=True, use_reloader=False, host='0.0.0.0', port=5001)
+    app.logger.info("=== Starting MoodSync API Server (Zero-Latency Version) ===")
+    socketio.run(app, debug=False, use_reloader=False, host='0.0.0.0', port=5001)

@@ -8,6 +8,9 @@ client/
   node_modules/ [EXCLUDED]
   package.json
   postcss.config.js
+  public/
+    Blueblood Logo.png [EXCLUDED]
+    favicon.ico [EXCLUDED]
   src/
     app/
       globals.css
