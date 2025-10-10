@@ -81,8 +81,8 @@ interface RoomState {
   fetchLyrics: (youtubeId: string) => void;
   setCurrentTime: (time: number) => void;
   primePlayer: () => void;
-  uploadFile: (file: File, title?: string, artist?: string) => Promise<{ filename: string, audioUrl: string }>; // UPDATED RETURN TYPE
-  addUploadToPlaylist: (filename: string, title: string, artist: string, audioUrl: string) => Promise<void>; // ADDED audioUrl
+  uploadFile: (file: File, title?: string, artist?: string) => Promise<{ filename: string, audioUrl: string }>;
+  addUploadToPlaylist: (filename: string, title: string, artist: string, audioUrl: string) => Promise<void>;
   refreshPlaylist: () => void;
 }
 
@@ -101,7 +101,6 @@ export const useRoomStore = create<RoomState>((set, get) => ({
   connect: (roomCode, username) => {
     if (get().socket) return;
     
-    // Ultra-low latency socket configuration
     const socket = io(API_URL, {
       transports: ['websocket'],
       upgrade: false,
@@ -141,7 +140,6 @@ export const useRoomStore = create<RoomState>((set, get) => ({
   _connectAudioGraph: () => {
     const { audioElement, audioNodes } = get();
     
-    // CRITICAL: Ensure the AudioContext is resumed before attempting to connect the graph
     if (audioNodes.context?.state === 'suspended') {
         audioNodes.context.resume().catch(e => console.error("Failed to resume AudioContext:", e));
     }
@@ -151,8 +149,6 @@ export const useRoomStore = create<RoomState>((set, get) => ({
     }
     
     try {
-      // CRITICAL: Only connect the audio element if it is an upload track
-      // YouTube video is in an iframe and cannot be connected directly for processing
       if (audioElement && !audioNodes.source) {
         const source = audioNodes.context.createMediaElementSource(audioElement);
         source.connect(audioNodes.bass);
@@ -172,7 +168,6 @@ export const useRoomStore = create<RoomState>((set, get) => ({
   _startSyncLoop: () => {
     get()._stopSyncLoop();
     
-    // Continuous sync loop for admin (every 100ms for ultra-low latency)
     const interval = setInterval(() => {
       const { isAdmin, socket, roomCode, player, audioElement, isPlaying, currentTrackIndex, playlist } = get();
       
@@ -200,7 +195,7 @@ export const useRoomStore = create<RoomState>((set, get) => ({
       } catch (error) {
         console.error('Sync loop error:', error);
       }
-    }, 100); // Ultra-fast 100ms sync
+    }, 100);
     
     set({ syncInterval: interval });
   },
@@ -214,10 +209,9 @@ export const useRoomStore = create<RoomState>((set, get) => ({
   },
 
   initializePlayer: (domId) => {
-    // Initialize audio element for uploads
     const audioEl = new Audio();
     audioEl.preload = 'auto';
-    audioEl.crossOrigin = 'anonymous'; // CRITICAL for Web Audio API to work
+    audioEl.crossOrigin = 'anonymous';
     
     audioEl.addEventListener('timeupdate', () => {
       if (!get().isLoading) {
@@ -226,7 +220,6 @@ export const useRoomStore = create<RoomState>((set, get) => ({
     });
     
     audioEl.addEventListener('play', () => {
-      // Only set isPlaying/sync loop if the user can control or it's a sync event
       if (get()._canControl() || !get().isAdmin) { 
         set({ isPlaying: true });
         get()._startSyncLoop();
@@ -256,10 +249,9 @@ export const useRoomStore = create<RoomState>((set, get) => ({
     
     set({ audioElement: audioEl });
     
-    // Setup Web Audio API with optimized settings
     try {
       const audioContext = new (window.AudioContext || (window as any).webkitAudioContext)({
-        latencyHint: 'interactive', // Lowest latency mode
+        latencyHint: 'interactive',
         sampleRate: 48000
       });
       
@@ -281,7 +273,6 @@ export const useRoomStore = create<RoomState>((set, get) => ({
       console.error("Could not create Web Audio Context:", e);
     }
     
-    // YouTube player initialization
     const onPlayerReady = (event: any) => {
       const player = event.target;
       player.setVolume(get().volume);
@@ -321,7 +312,6 @@ export const useRoomStore = create<RoomState>((set, get) => ({
         playerVars: { 
             origin: window.location.origin, 
             controls: 0,
-            // CRITICAL: Disable HTML5 for YouTube to avoid MediaElement-related CORS issues
             html5: 0 
         },
         events: { 'onReady': onPlayerReady, 'onStateChange': onPlayerStateChange }
@@ -350,7 +340,6 @@ export const useRoomStore = create<RoomState>((set, get) => ({
     get()._stopSyncLoop();
     const newTrack = playlist[index];
     
-    // Stop current playback
     if (audioElement) {
       audioElement.pause();
       audioElement.currentTime = 0;
@@ -362,7 +351,6 @@ export const useRoomStore = create<RoomState>((set, get) => ({
     set({ currentTrackIndex: index, isPlaying: false, currentTime: 0 });
     
     if (newTrack.isUpload && newTrack.audioUrl) {
-      // Play uploaded file
       if (audioElement) {
         audioElement.src = newTrack.audioUrl;
         audioElement.load();
@@ -375,7 +363,6 @@ export const useRoomStore = create<RoomState>((set, get) => ({
         }).catch(e => console.error('Play error:', e));
       }
     } else if (newTrack.youtubeId && player) {
-      // Play YouTube video
       get().fetchLyrics(newTrack.youtubeId);
       player.loadVideoById(newTrack.youtubeId);
       set({ isPlaying: true });
@@ -456,7 +443,8 @@ export const useRoomStore = create<RoomState>((set, get) => ({
   },
 
   syncPlayerState: (state) => {
-    const { player, audioElement, playlist, currentTrackIndex, isPlaying, volume, isCollaborative, equalizer } = get();
+    // FIX: Add 'audioNodes' to the destructured state from get()
+    const { player, audioElement, playlist, currentTrackIndex, isPlaying, volume, isCollaborative, equalizer, audioNodes } = get();
     if (!playlist || playlist.length === 0) return;
 
     const now = Date.now() / 1000;
@@ -493,26 +481,20 @@ export const useRoomStore = create<RoomState>((set, get) => ({
       set({ volume: state.volume });
     }
 
-    // ULTRA-PRECISE SYNC (target: <50ms drift)
     if (state.currentTime !== undefined) {
       const targetTime = state.currentTime + latency;
       const currentTrack = playlist[currentTrackIndex];
       
       if (currentTrack?.isUpload && audioElement) {
         const drift = Math.abs(audioElement.currentTime - targetTime);
-        
-        // Only sync if drift > 30ms (ultra-precise)
         if (drift > 0.03) {
           audioElement.currentTime = targetTime;
-          // console.log(`🎯 Synced upload: ${(drift * 1000).toFixed(0)}ms drift`);
         }
       } else if (player && typeof player.seekTo === 'function') {
         const playerTime = player.getCurrentTime() || 0;
         const drift = Math.abs(playerTime - targetTime);
-        
         if (drift > 0.03) {
           player.seekTo(targetTime, true);
-          // console.log(`🎯 Synced YouTube: ${(drift * 1000).toFixed(0)}ms drift`);
         }
       }
     }
@@ -522,7 +504,6 @@ export const useRoomStore = create<RoomState>((set, get) => ({
       
       setTimeout(() => {
         if (state.isPlaying) {
-          // CRITICAL: Ensure AudioContext is not suspended before playing uploaded audio
           if (audioNodes.context?.state === 'suspended') {
             audioNodes.context.resume();
           }
@@ -541,7 +522,7 @@ export const useRoomStore = create<RoomState>((set, get) => ({
           }
           get()._stopSyncLoop();
         }
-      }, 20); // Minimal delay for sync
+      }, 20);
       
       set({ isPlaying: state.isPlaying });
     }
@@ -568,7 +549,6 @@ export const useRoomStore = create<RoomState>((set, get) => ({
   primePlayer: () => {
     const { player, audioElement, volume, audioNodes } = get();
     
-    // Resume audio context for both players when user interacts
     if (audioNodes.context?.state === 'suspended') {
       audioNodes.context.resume();
     }
@@ -589,13 +569,11 @@ export const useRoomStore = create<RoomState>((set, get) => ({
     }
   },
 
-  // UPDATED to return the full response data
   uploadFile: async (file: File, title?: string, artist?: string) => {
     const formData = new FormData();
     formData.append('file', file);
     
     try {
-      // CRITICAL: The API endpoint needs to support CORS for this to work (fixed in app.py)
       const response = await fetch(`${API_URL}/api/upload`, {
         method: 'POST',
         body: formData
@@ -605,7 +583,6 @@ export const useRoomStore = create<RoomState>((set, get) => ({
       
       const data = await response.json();
       
-      // CRITICAL: Pass the audioUrl received from the backend
       await get().addUploadToPlaylist(
         data.filename,
         title || file.name.replace(/\.[^/.]+$/, ""),
@@ -613,14 +590,13 @@ export const useRoomStore = create<RoomState>((set, get) => ({
         data.audioUrl
       );
       
-      return data; // Return the full data as promised in the original modal logic
+      return data;
     } catch (error) {
       console.error('Upload error:', error);
       throw error;
     }
   },
 
-  // UPDATED to accept audioUrl
   addUploadToPlaylist: async (filename: string, title: string, artist: string, audioUrl: string) => {
     const { roomCode } = get();
     
@@ -628,15 +604,10 @@ export const useRoomStore = create<RoomState>((set, get) => ({
       const response = await fetch(`${API_URL}/api/room/${roomCode}/add-upload`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ filename, title, artist, audioUrl }) // Pass audioUrl to backend
+        body: JSON.stringify({ filename, title, artist, audioUrl })
       });
       
       if (!response.ok) throw new Error('Failed to add to playlist');
-      
-      // The backend should now emit 'refresh_playlist', so local update is not strictly necessary 
-      // but we keep a simplified local update for responsiveness.
-      // NOTE: The server now emits 'refresh_playlist' which will trigger refreshPlaylist()
-      
     } catch (error) {
       console.error('Add to playlist error:', error);
       throw error;
@@ -650,8 +621,6 @@ export const useRoomStore = create<RoomState>((set, get) => ({
       if (response.ok) {
         const data = await response.json();
         
-        // CRITICAL: Only update the playlist if the content has actually changed
-        // This prevents unnecessary re-renders when a non-playlist update occurs.
         if (data.playlist.length !== playlist.length) {
              set({ playlist: data.playlist });
         }
