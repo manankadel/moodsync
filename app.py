@@ -1,7 +1,7 @@
 import os, base64, random, string, logging, time, requests, json
 from functools import lru_cache
 from flask import Flask, jsonify, request, send_from_directory, url_for
-from flask_socketio import SocketIO, join_room, emit, rooms
+from flask_socketio import SocketIO, join_room, emit
 from flask_cors import CORS
 from dotenv import load_dotenv
 from googleapiclient.discovery import build
@@ -10,29 +10,11 @@ import redis
 from werkzeug.utils import secure_filename
 from werkzeug.middleware.proxy_fix import ProxyFix
 
-# Imports for lrc_kit
-lrc_kit_available = False
-try:
-    from lrc_kit.lrc import parse_lyrics
-    lrc_kit_available = True
-    print("✅ Successfully imported parse_lyrics from lrc_kit.lrc")
-except ImportError:
-    try:
-        import lrc_kit.lrc as lrc_module
-        parse_lyrics = lrc_module.parse_lyrics
-        lrc_kit_available = True
-        print("✅ Successfully imported parse_lyrics via lrc_module")
-    except (ImportError, AttributeError):
-        print("❌ Could not import lrc_kit parse_lyrics. Lyrics functionality will be disabled.")
-        lrc_kit_available = False
-
 # --- APP INITIALIZATION ---
 load_dotenv()
 app = Flask(__name__)
 app.wsgi_app = ProxyFix(app.wsgi_app, x_for=1, x_proto=1, x_host=1, x_prefix=1)
 
-
-# --- ROBUST CORS SETUP FOR LIVE DEPLOYMENT ---
 frontend_url = os.getenv("FRONTEND_URL") or os.getenv("CORS_ALLOWED_ORIGIN")
 allowed_origins = ["http://localhost:3000"]
 if frontend_url:
@@ -41,32 +23,36 @@ if frontend_url:
 CORS(app, origins=allowed_origins, supports_credentials=True)
 socketio = SocketIO(app, cors_allowed_origins=allowed_origins, ping_timeout=60, ping_interval=25)
 
-
 app.secret_key = os.urandom(24)
-
 UPLOAD_FOLDER = 'uploads'
-ALLOWED_EXTENSIONS = {'mp3', 'wav', 'ogg', 'm4a', 'flac'}
-MAX_FILE_SIZE = 50 * 1024 * 1024
 os.makedirs(UPLOAD_FOLDER, exist_ok=True)
 app.config['UPLOAD_FOLDER'] = UPLOAD_FOLDER
-app.config['MAX_CONTENT_LENGTH'] = MAX_FILE_SIZE
+app.config['MAX_CONTENT_LENGTH'] = 50 * 1024 * 1024
 
 def allowed_file(filename):
-    return '.' in filename and filename.rsplit('.', 1)[1].lower() in ALLOWED_EXTENSIONS
+    return '.' in filename and filename.rsplit('.', 1)[1].lower() in {'mp3', 'wav', 'ogg', 'm4a', 'flac'}
 
-# --- DATABASE CONNECTION (REDIS) ---
 try:
     redis_url = os.getenv('REDIS_URL')
-    if not redis_url:
-        raise ValueError("REDIS_URL environment variable not set.")
+    if not redis_url: raise ValueError("REDIS_URL environment variable not set.")
     r = redis.from_url(redis_url, decode_responses=True)
     r.ping()
     app.logger.info(f"Successfully connected to Redis at {redis_url.split('@')[-1]}")
 except (redis.exceptions.ConnectionError, ValueError) as e:
     app.logger.error(f"FATAL: Could not connect to Redis. Error: {e}")
     exit(1)
+    
+lrc_kit_available = False
+try:
+    from lrc_kit.lrc import parse_lyrics
+    lrc_kit_available = True
+except ImportError:
+    app.logger.warning("lrc_kit not found. Lyrics functionality will be disabled.")
 
-# --- GLOBAL CONFIG & FALLBACKS ---
+@app.route('/ping', methods=['GET'])
+def ping_pong():
+    return jsonify({'serverTime': time.time()})
+
 spotify_token_cache = {'token': None, 'expires': 0}
 token_failure_count, last_token_failure = 0, 0
 
@@ -87,7 +73,6 @@ FALLBACK_PLAYLIST = [
     {'name': 'As It Was', 'artist': 'Harry Styles', 'albumArt': 'https://i.scdn.co/image/ab67616d0000b273b46f74097652c7f3a3a08237', 'youtubeId': 'H5v3kku4y6Q'},
 ]
 
-# --- API FUNCTIONS ---
 @lru_cache(maxsize=1)
 def get_spotify_credentials(): return os.getenv('SPOTIFY_CLIENT_ID'), os.getenv('SPOTIFY_CLIENT_SECRET')
 
@@ -114,25 +99,22 @@ def get_youtube_video_id(song_name, artist_name):
     try:
         cached_id = r.get(cache_key)
         if cached_id: return None if cached_id == "none" else cached_id
-    except redis.exceptions.ConnectionError: pass # Ignore cache if Redis is down
+    except redis.exceptions.ConnectionError: pass
     youtube_api_key = os.getenv('YOUTUBE_API_KEY')
     query = f"{song_name} {artist_name} official audio"
+    video_id = None
     if youtube_api_key:
         try:
             youtube = build('youtube', 'v3', developerKey=youtube_api_key)
             req = youtube.search().list(q=query, part='snippet', maxResults=1, type='video', videoCategoryId='10')
             res = req.execute()
             video_id = res['items'][0]['id']['videoId'] if res.get('items') else None
-        except Exception as e:
-            app.logger.error(f"YouTube API Error: {e}")
-            video_id = None
-    else: video_id = None
+        except Exception as e: app.logger.error(f"YouTube API Error: {e}")
     if not video_id:
-        app.logger.info(f"Using Invidious fallback for '{query}'")
         try:
             res = requests.get(f"https://invidious.io.gg/api/v1/search?q={query}", timeout=10).json()
             video_id = res[0].get('videoId') if res and isinstance(res, list) else None
-        except Exception as e: app.logger.error(f"Invidious fallback failed: {e}"); video_id = None
+        except Exception as e: app.logger.error(f"Invidious fallback failed: {e}")
     try: r.set(cache_key, video_id if video_id else "none", ex=86400 * 7)
     except redis.exceptions.ConnectionError: pass
     return video_id
@@ -168,11 +150,9 @@ def generate_playlist(genre):
         app.logger.warning(f"Playlist generation for '{genre}' failed: {e}. Using fallback.")
         return FALLBACK_PLAYLIST
 
-# --- ROUTES & SOCKETS ---
 @app.route('/generate', methods=['POST', 'OPTIONS'])
 def generate_route():
-    if request.method == 'OPTIONS':
-        return '', 204
+    if request.method == 'OPTIONS': return '', 204
     data = request.get_json()
     genre = data.get('mood', 'default').lower()
     playlist = generate_playlist(genre)
@@ -234,8 +214,10 @@ def add_upload_to_playlist(room_code):
 @app.route('/api/lyrics/<string:video_id>')
 def get_lyrics(video_id):
     cache_key = f"lyrics:v2:{video_id}"
-    cached_lyrics = r.get(cache_key)
-    if cached_lyrics: return jsonify(json.loads(cached_lyrics))
+    try:
+        cached_lyrics = r.get(cache_key)
+        if cached_lyrics: return jsonify(json.loads(cached_lyrics))
+    except redis.exceptions.ConnectionError: pass
     lyrics_json = []
     if lrc_kit_available:
         try:
@@ -244,9 +226,9 @@ def get_lyrics(video_id):
                 for line in result[0]:
                     if hasattr(line, 'time') and hasattr(line, 'text') and line.text.strip():
                         lyrics_json.append({'time': line.time, 'text': line.text})
-        except Exception as e:
-            app.logger.error(f"lrc_kit error: {e}")
-    r.set(cache_key, json.dumps(lyrics_json), ex=86400)
+        except Exception as e: app.logger.error(f"lrc_kit error: {e}")
+    try: r.set(cache_key, json.dumps(lyrics_json), ex=86400)
+    except redis.exceptions.ConnectionError: pass
     return jsonify(lyrics_json)
 
 @socketio.on('join_room')
@@ -256,8 +238,7 @@ def handle_join_room(data):
     sid = request.sid
     room_data_json = r.get(f"room:{room_code}")
     if not room_data_json: emit('error', {'message': 'Room not found'}); return
-    room_data = json.loads(room_data_json)
-    join_room(room_code)
+    room_data = json.loads(room_data_json); join_room(room_code)
     is_admin = not room_data.get('users') or not room_data.get('admin_sid')
     if is_admin: room_data['admin_sid'] = sid
     room_data['users'][sid] = {'name': username, 'isAdmin': is_admin}
@@ -301,13 +282,16 @@ def handle_disconnect():
                         room_data['admin_sid'] = new_admin_sid
                         room_data['users'][new_admin_sid]['isAdmin'] = True
                     else: room_data['admin_sid'] = None
-                r.set(key, json.dumps(room_data), ex=86400)
-                emit('update_user_list', list(room_data['users'].values()), to=room_code)
+                if room_data['users']:
+                    r.set(key, json.dumps(room_data), ex=86400)
+                    emit('update_user_list', list(room_data['users'].values()), to=room_code)
+                else:
+                    r.delete(key) # Delete room if empty
                 break
         except (json.JSONDecodeError, TypeError): continue
 
 if __name__ == '__main__':
     logging.basicConfig(level=logging.INFO, format='%(asctime)s %(levelname)s: %(message)s')
-    app.logger.info("=== Starting MoodSync API Server ===")
+    app.logger.info("=== Starting MoodSync API Server (Enterprise Sync Edition) ===")
     app.logger.info(f"CORS allowed for: {allowed_origins}")
     socketio.run(app, debug=False, use_reloader=False, host='0.0.0.0', port=5001)

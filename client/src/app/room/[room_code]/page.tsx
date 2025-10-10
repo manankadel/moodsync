@@ -2,7 +2,7 @@
 
 import { useParams } from 'next/navigation';
 import Link from 'next/link';
-import { useEffect, useState, useRef } from 'react';
+import { useEffect, useState } from 'react';
 import { motion, AnimatePresence } from 'framer-motion';
 import Image from 'next/image';
 import Script from 'next/script';
@@ -109,11 +109,9 @@ export default function RoomPage() {
   const [showNameModal, setShowNameModal] = useState(true);
   const [showUploadModal, setShowUploadModal] = useState(false);
 
-  // State selectors from Zustand store
   const { playlistTitle, playlist, currentTrackIndex, isLoading, error, users, isAdmin, volume, isCollaborative, isPlaying } = useRoomStore();
   
-  // Action selectors from Zustand store
-  // FIX: Removed setCurrentTime as it's no longer needed or exported from the store
+  // FIX: Re-added setLoading and setError to the destructuring
   const { initializePlayer, setPlaylistData, setLoading, setError, playPause, nextTrack, prevTrack, selectTrack, setVolume, connect, disconnect, toggleCollaborative, primePlayer } = useRoomStore.getState();
   
   const currentTrack = playlist[currentTrackIndex];
@@ -136,14 +134,9 @@ export default function RoomPage() {
     };
     fetchRoomData();
   }, [roomCode, showNameModal, setPlaylistData, setLoading, setError]);
-  
-  // FIX: This entire useEffect block has been removed.
-  // The room-store now handles updating `currentTime` internally via the 'timeupdate' event listener,
-  // which is more efficient than using requestAnimationFrame in a component.
 
   const handleNameSubmit = (name: string) => {
     primePlayer(); 
-    
     if (roomCode) {
       connect(roomCode, name);
       setShowNameModal(false);
@@ -158,7 +151,7 @@ export default function RoomPage() {
 
   return (
     <div className="min-h-screen bg-black text-white overflow-hidden">
-      <Script src="https://www.youtube.com/iframe_api" />
+      <Script src="https://www.youtube.com/iframe_api" strategy="afterInteractive" />
       <div id="youtube-player-container" className="fixed -z-10 top-0 left-0"></div>
       <div className="absolute inset-0 z-0 opacity-50"><AnimatePresence>{currentTrack?.albumArt && (<motion.div key={currentTrack.youtubeId || currentTrack.audioUrl} initial={{ opacity: 0, scale: 1.1 }} animate={{ opacity: 1, scale: 1 }} exit={{ opacity: 0, scale: 1.1 }} transition={{ duration: 1.5, ease: "easeInOut" }} className="absolute inset-0"><Image src={currentTrack.albumArt} alt="background" layout="fill" objectFit="cover" className="blur-3xl saturate-50" /></motion.div>)}</AnimatePresence><div className="absolute inset-0 bg-black/70" /></div>
       
