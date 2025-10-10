@@ -10,7 +10,6 @@ import redis
 from werkzeug.utils import secure_filename
 from werkzeug.middleware.proxy_fix import ProxyFix
 
-# --- APP INITIALIZATION ---
 load_dotenv()
 app = Flask(__name__)
 app.wsgi_app = ProxyFix(app.wsgi_app, x_for=1, x_proto=1, x_host=1, x_prefix=1)
@@ -233,9 +232,7 @@ def get_lyrics(video_id):
 
 @socketio.on('join_room')
 def handle_join_room(data):
-    room_code = data['room_code'].upper()
-    username = data.get('username', 'Guest')
-    sid = request.sid
+    room_code = data['room_code'].upper(); username = data.get('username', 'Guest'); sid = request.sid
     room_data_json = r.get(f"room:{room_code}")
     if not room_data_json: emit('error', {'message': 'Room not found'}); return
     room_data = json.loads(room_data_json); join_room(room_code)
@@ -248,9 +245,7 @@ def handle_join_room(data):
 
 @socketio.on('update_player_state')
 def handle_player_state_update(data):
-    room_code = data['room_code'].upper()
-    sid = request.sid
-    room_data_json = r.get(f"room:{room_code}")
+    room_code = data['room_code'].upper(); sid = request.sid; room_data_json = r.get(f"room:{room_code}")
     if not room_data_json: return
     room_data = json.loads(room_data_json)
     if room_data.get('admin_sid') != sid and not room_data['current_state'].get('isCollaborative', False): return
@@ -286,7 +281,7 @@ def handle_disconnect():
                     r.set(key, json.dumps(room_data), ex=86400)
                     emit('update_user_list', list(room_data['users'].values()), to=room_code)
                 else:
-                    r.delete(key) # Delete room if empty
+                    r.delete(key)
                 break
         except (json.JSONDecodeError, TypeError): continue
 

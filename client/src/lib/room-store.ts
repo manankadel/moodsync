@@ -3,14 +3,12 @@ import { io, Socket } from 'socket.io-client';
 
 const API_URL = process.env.NEXT_PUBLIC_API_URL || 'http://localhost:5001';
 
-// --- ENTERPRISE SYNC CONSTANTS ---
-const HARD_SYNC_THRESHOLD = 0.35;         // 350ms: If drift is > this, force a seek.
-const ADAPTIVE_RATE_THRESHOLD = 0.05;     // 50ms: If drift is < this, use playback rate adjustment.
-const PLAYBACK_RATE_ADJUST = 0.02;        // Adjust playback by 2% (1.02x or 0.98x).
-const SYNC_HEARTBEAT_INTERVAL = 1000;     // Admin's periodic state broadcast.
-const CLOCK_SYNC_INTERVAL = 5000;         // How often to recalibrate the clock with the server.
+const HARD_SYNC_THRESHOLD = 0.35;
+const ADAPTIVE_RATE_THRESHOLD = 0.05;
+const PLAYBACK_RATE_ADJUST = 0.02;
+const SYNC_HEARTBEAT_INTERVAL = 1000;
+const CLOCK_SYNC_INTERVAL = 5000;
 
-// --- INTERFACES ---
 interface Song { name: string; artist: string; albumArt: string | null; youtubeId?: string; isUpload?: boolean; audioUrl?: string; }
 interface User { name: string; isAdmin: boolean; }
 declare global { interface Window { onYouTubeIframeAPIReady: () => void; YT: any; } }
@@ -43,17 +41,12 @@ export const useRoomStore = create<RoomState>((set, get) => ({
   setLoading: (loading) => set({ isLoading: loading }),
   setError: (error) => set({ error, isLoading: false }),
   setIsSeeking: (isSeeking) => set({ isSeeking }),
-
-  setManualLatencyOffset: (offset) => {
-    // This function is now purely proactive and does not fight the sync system.
-    set({ manualLatencyOffset: offset });
-  },
+  setManualLatencyOffset: (offset) => set({ manualLatencyOffset: offset }),
 
   connect: (roomCode, username) => {
     if (get().socket) return;
     const socket = io(API_URL, { transports: ['websocket'] });
     set({ socket, username, roomCode });
-
     socket.on('connect', () => {
       console.log('✅ Connected with Enterprise Sync Engine');
       socket.emit('join_room', { room_code: roomCode, username });
@@ -61,12 +54,7 @@ export const useRoomStore = create<RoomState>((set, get) => ({
       const clockInterval = setInterval(() => get()._syncClock(), CLOCK_SYNC_INTERVAL);
       set({ clockSyncInterval: clockInterval });
     });
-    socket.on('disconnect', () => {
-      const { syncInterval, clockSyncInterval } = get();
-      if (syncInterval) clearInterval(syncInterval);
-      if (clockSyncInterval) clearInterval(clockSyncInterval);
-      set({ users: [], isAdmin: false, syncInterval: null, clockSyncInterval: null });
-    });
+    socket.on('disconnect', () => get().disconnect());
     socket.on('error', (data) => get().setError(data.message));
     socket.on('update_user_list', (users: User[]) => { const self = users.find(u => u.name === get().username); set({ users, isAdmin: self?.isAdmin || false }); });
     socket.on('load_current_state', (state) => get().syncPlayerState(state));
@@ -81,7 +69,7 @@ export const useRoomStore = create<RoomState>((set, get) => ({
     player?.destroy();
     audioElement?.pause();
     socket?.disconnect();
-    set({ socket: null, syncInterval: null, clockSyncInterval: null, player: null, audioElement: null });
+    set({ socket: null, syncInterval: null, clockSyncInterval: null, player: null, isAudioGraphConnected: false });
   },
 
   _emitStateUpdate: (overrideState) => {
@@ -98,14 +86,16 @@ export const useRoomStore = create<RoomState>((set, get) => ({
     if (isSeeking) return;
 
     if (state.trackIndex !== undefined && state.trackIndex !== currentTrackIndex) {
-        set({ currentTrackIndex: state.trackIndex });
+        set({ currentTrackIndex: state.trackIndex, isPlaying: state.isPlaying }); // Sync isPlaying state on track change
         const track = playlist[state.trackIndex];
         if (track?.isUpload && track.audioUrl && audioElement) { audioElement.src = track.audioUrl; audioElement.load(); }
-        else if (track?.youtubeId && player) { player.cueVideoById(track.youtubeId, state.currentTime); get().fetchLyrics(track.youtubeId); }
+        else if (track?.youtubeId && player) { player.cueVideoById(track.youtubeId); get().fetchLyrics(track.youtubeId); }
     }
     
     const targetTrack = playlist[get().currentTrackIndex];
     const isUpload = targetTrack?.isUpload;
+    const target = isUpload ? audioElement : player;
+    if (!target) return;
 
     if (state.currentTime !== undefined && state.serverTimestamp !== undefined) {
         const serverTimeNow = Date.now() / 1000 - serverClockOffset;
@@ -132,8 +122,8 @@ export const useRoomStore = create<RoomState>((set, get) => ({
         if (Math.abs(drift) > HARD_SYNC_THRESHOLD) {
             const seekTime = projectedTime + manualLatencyOffset;
             if (isFinite(seekTime)) {
-                if (isUpload && audioElement) audioElement.currentTime = seekTime;
-                else player?.seekTo(seekTime, true);
+                if (isUpload) target.currentTime = seekTime;
+                else target.seekTo(seekTime, true);
             }
         }
     }
@@ -180,11 +170,13 @@ export const useRoomStore = create<RoomState>((set, get) => ({
     } catch (e) { console.error("Error setting up AudioContext:", e); }
     
     const onPlayerStateChange = (e: any) => {
-        const { isAdmin, isPlaying } = get();
-        if (!isAdmin) return;
+        const { isAdmin, isPlaying, nextTrack, _emitStateUpdate } = get();
         const newIsPlaying = e.data === window.YT.PlayerState.PLAYING;
-        if (e.data === window.YT.PlayerState.ENDED) { get().nextTrack(); return; }
-        if (newIsPlaying !== isPlaying) { set({ isPlaying: newIsPlaying }); }
+        set({ isPlaying: newIsPlaying }); // Update local state immediately for UI responsiveness
+        if (isAdmin) {
+            if (e.data === window.YT.PlayerState.ENDED) { nextTrack(); return; }
+            if (newIsPlaying !== isPlaying) { _emitStateUpdate({ isPlaying: newIsPlaying }); }
+        }
     };
 
     window.onYouTubeIframeAPIReady = () => { new window.YT.Player(domId, { height: '0', width: '0', playerVars: { origin: window.location.origin, controls: 0, disablekb: 1 }, events: { onReady: (e: any) => set({ player: e.target }), onStateChange: onPlayerStateChange }, }); };
@@ -193,15 +185,12 @@ export const useRoomStore = create<RoomState>((set, get) => ({
 
   setPlaylistData: (title, playlist) => { set({ playlistTitle: title, playlist, isLoading: false, error: null }); if (playlist.length > 0 && playlist[0].youtubeId) get().fetchLyrics(playlist[0].youtubeId); },
   
-  // --- COMMAND & CONTROL ACTIONS ---
   playPause: () => {
     const { isAdmin, isCollaborative, isPlaying, player, audioElement, playlist, currentTrackIndex } = get();
     if (!isAdmin && !isCollaborative) return;
     const isUpload = playlist[currentTrackIndex]?.isUpload;
-    // Perform local action immediately
     if (isUpload && audioElement) { !isPlaying ? audioElement.play().catch(()=>{}) : audioElement.pause(); }
     else if (player) { !isPlaying ? player.playVideo() : player.pauseVideo(); }
-    // Broadcast the new state
     get()._emitStateUpdate({ isPlaying: !isPlaying });
   },
 
@@ -209,33 +198,27 @@ export const useRoomStore = create<RoomState>((set, get) => ({
     const { isAdmin, isCollaborative, currentTrackIndex, playlist, player, audioElement } = get();
     if (!isAdmin && !isCollaborative) return;
     const newIndex = (currentTrackIndex + 1) % playlist.length;
-    // Perform local action immediately
     player?.stopVideo();
-    if (audioElement) { audioElement.src = ''; audioElement.load(); }
-    // Broadcast the new state
-    get()._emitStateUpdate({ trackIndex: newIndex, currentTime: 0, isPlaying: true });
+    if (audioElement) { audioElement.pause(); audioElement.src = ''; }
+    get()._emitStateUpdate({ trackIndex: newIndex, currentTime: 0 });
   },
 
   prevTrack: () => {
     const { isAdmin, isCollaborative, currentTrackIndex, playlist, player, audioElement } = get();
     if (!isAdmin && !isCollaborative) return;
     const newIndex = (currentTrackIndex - 1 + playlist.length) % playlist.length;
-    // Perform local action immediately
     player?.stopVideo();
-    if (audioElement) { audioElement.src = ''; audioElement.load(); }
-    // Broadcast the new state
-    get()._emitStateUpdate({ trackIndex: newIndex, currentTime: 0, isPlaying: true });
+    if (audioElement) { audioElement.pause(); audioElement.src = ''; }
+    get()._emitStateUpdate({ trackIndex: newIndex, currentTime: 0 });
   },
 
   selectTrack: (index) => {
     const { isAdmin, isCollaborative, currentTrackIndex, player, audioElement } = get();
     if (!isAdmin && !isCollaborative) return;
     if (index !== currentTrackIndex) {
-        // Perform local action immediately
         player?.stopVideo();
-        if (audioElement) { audioElement.src = ''; audioElement.load(); }
-        // Broadcast the new state
-        get()._emitStateUpdate({ trackIndex: index, currentTime: 0, isPlaying: true });
+        if (audioElement) { audioElement.pause(); audioElement.src = ''; }
+        get()._emitStateUpdate({ trackIndex: index, currentTime: 0 });
     } else {
         get().playPause();
     }
