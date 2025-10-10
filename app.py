@@ -348,14 +348,34 @@ def handle_player_state_update(data):
     if room_data.get('admin_sid') != sid and not room_data['current_state'].get('isCollaborative', False): 
         return
     
-    # Critical: Update with server timestamp
-    room_data['current_state']['serverTimestamp'] = time.time()
-    room_data['current_state'].update(data['state'])
-    room_data['current_state']['timestamp'] = time.time()
+    # --- START OF SYNCHRONIZATION FIX ---
+    client_state = data['state']
+    
+    # Server becomes authoritative on time. Update state with client data first.
+    room_data['current_state'].update(client_state)
+    
+    # Now, refine the time based on latency from the controller to the server.
+    # This makes the broadcasted state's time a better representation of reality *at the moment of broadcast*.
+    client_timestamp = client_state.get('timestamp', 0)
+    server_receive_time = time.time()
+    
+    if client_timestamp > 0 and client_state.get('isPlaying', False):
+        # Calculate latency of the admin's message to the server
+        latency_to_server = server_receive_time - client_timestamp
+        
+        # Sanity check: ignore wildly delayed packets (e.g., after a network reconnect)
+        if 0 < latency_to_server < 2.0:
+            # Project the client's currentTime forward by the time it took to reach the server.
+            projected_time = room_data['current_state'].get('currentTime', 0) + latency_to_server
+            room_data['current_state']['currentTime'] = projected_time
+    
+    # Set the final server timestamp for broadcasting
+    room_data['current_state']['serverTimestamp'] = server_receive_time
+    # --- END OF SYNCHRONIZATION FIX ---
     
     r.set(f"room:{room_code}", json.dumps(room_data), ex=86400)
     
-    # Broadcast to all clients with server timestamp
+    # Broadcast to all clients with the refined, server-authoritative state
     emit('sync_player_state', room_data['current_state'], to=room_code, include_self=False)
 
 @socketio.on('disconnect')
