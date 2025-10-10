@@ -1,6 +1,6 @@
 import os, base64, random, string, logging, time, requests, json
 from functools import lru_cache
-from flask import Flask, jsonify, request, send_from_directory
+from flask import Flask, jsonify, request, send_from_directory, url_for
 from flask_socketio import SocketIO, join_room, emit, rooms
 from flask_cors import CORS
 from dotenv import load_dotenv
@@ -9,8 +9,6 @@ from googleapiclient import errors
 import redis
 from werkzeug.utils import secure_filename
 from werkzeug.middleware.proxy_fix import ProxyFix
-import mimetypes
-from datetime import datetime
 
 # Imports for lrc_kit
 lrc_kit_available = False
@@ -42,6 +40,7 @@ if frontend_url:
 
 CORS(app, origins=allowed_origins, supports_credentials=True)
 socketio = SocketIO(app, cors_allowed_origins=allowed_origins, ping_timeout=60, ping_interval=25)
+
 
 app.secret_key = os.urandom(24)
 
@@ -170,9 +169,9 @@ def generate_playlist(genre):
         return FALLBACK_PLAYLIST
 
 # --- ROUTES & SOCKETS ---
-@app.route('/generate', methods=['POST', 'OPTIONS']) # FIX: ADDED 'OPTIONS'
+@app.route('/generate', methods=['POST', 'OPTIONS'])
 def generate_route():
-    if request.method == 'OPTIONS': # FIX: HANDLE PREFLIGHT REQUEST
+    if request.method == 'OPTIONS':
         return '', 204
     data = request.get_json()
     genre = data.get('mood', 'default').lower()
@@ -190,38 +189,52 @@ def generate_route():
     app.logger.info(f"Room {room_code} created.")
     return jsonify({'room_code': room_code}), 200
 
-# Other routes remain the same...
 @app.route('/api/room/<string:room_code>')
-def get_room_data(room_code): room_code = room_code.upper(); room_data_json = r.get(f"room:{room_code}");
+def get_room_data(room_code):
+    room_code = room_code.upper()
+    room_data_json = r.get(f"room:{room_code}")
     if not room_data_json: return jsonify({'error': 'Room not found'}), 404
-    return jsonify({'playlist_title': json.loads(room_data_json)['title'], 'playlist': json.loads(room_data_json)['playlist']}), 200
+    room_data = json.loads(room_data_json)
+    return jsonify({'playlist_title': room_data['title'], 'playlist': room_data['playlist']}), 200
 
 @app.route('/uploads/<filename>')
-def uploaded_file(filename): return send_from_directory(UPLOAD_FOLDER, secure_filename(filename))
+def uploaded_file(filename):
+    return send_from_directory(UPLOAD_FOLDER, secure_filename(filename))
 
 @app.route('/api/upload', methods=['POST'])
 def upload_file_route():
     if 'file' not in request.files: return jsonify({'error': 'No file part'}), 400
-    file = request.files['file'];
+    file = request.files['file']
     if file.filename == '': return jsonify({'error': 'No selected file'}), 400
     if file and allowed_file(file.filename):
-        filename = f"{os.urandom(8).hex()}_{secure_filename(file.filename)}"; file_path = os.path.join(app.config['UPLOAD_FOLDER'], filename)
-        try: file.save(file_path); audio_url = url_for('uploaded_file', filename=filename, _external=True); return jsonify({'filename': filename, 'audioUrl': audio_url}), 200
-        except Exception as e: app.logger.error(f"File save error: {e}"); return jsonify({'error': 'Failed to save file'}), 500
+        filename = f"{os.urandom(8).hex()}_{secure_filename(file.filename)}"
+        file_path = os.path.join(app.config['UPLOAD_FOLDER'], filename)
+        try:
+            file.save(file_path)
+            audio_url = url_for('uploaded_file', filename=filename, _external=True)
+            return jsonify({'filename': filename, 'audioUrl': audio_url}), 200
+        except Exception as e:
+            app.logger.error(f"File save error: {e}")
+            return jsonify({'error': 'Failed to save file'}), 500
     return jsonify({'error': 'File type not allowed'}), 400
 
 @app.route('/api/room/<string:room_code>/add-upload', methods=['POST'])
 def add_upload_to_playlist(room_code):
-    room_code = room_code.upper(); data = request.get_json(); room_data_json = r.get(f"room:{room_code}")
+    room_code = room_code.upper()
+    data = request.get_json()
+    room_data_json = r.get(f"room:{room_code}")
     if not room_data_json: return jsonify({'error': 'Room not found'}), 404
     room_data = json.loads(room_data_json)
     new_track = {'name': data.get('title'), 'artist': data.get('artist'), 'albumArt': None, 'youtubeId': None, 'isUpload': True, 'audioUrl': data.get('audioUrl')}
-    room_data['playlist'].append(new_track); r.set(f"room:{room_code}", json.dumps(room_data), ex=86400); socketio.emit('refresh_playlist', to=room_code)
+    room_data['playlist'].append(new_track)
+    r.set(f"room:{room_code}", json.dumps(room_data), ex=86400)
+    socketio.emit('refresh_playlist', to=room_code)
     return jsonify({'message': 'Track added', 'track': new_track}), 200
 
 @app.route('/api/lyrics/<string:video_id>')
 def get_lyrics(video_id):
-    cache_key = f"lyrics:v2:{video_id}"; cached_lyrics = r.get(cache_key)
+    cache_key = f"lyrics:v2:{video_id}"
+    cached_lyrics = r.get(cache_key)
     if cached_lyrics: return jsonify(json.loads(cached_lyrics))
     lyrics_json = []
     if lrc_kit_available:
@@ -229,19 +242,23 @@ def get_lyrics(video_id):
             result = parse_lyrics(f"https://www.youtube.com/watch?v={video_id}")
             if isinstance(result, tuple) and len(result) >= 2 and result[0]:
                 for line in result[0]:
-                    if hasattr(line, 'time') and hasattr(line, 'text') and line.text.strip(): lyrics_json.append({'time': line.time, 'text': line.text})
-        except Exception as e: app.logger.error(f"lrc_kit error: {e}")
+                    if hasattr(line, 'time') and hasattr(line, 'text') and line.text.strip():
+                        lyrics_json.append({'time': line.time, 'text': line.text})
+        except Exception as e:
+            app.logger.error(f"lrc_kit error: {e}")
     r.set(cache_key, json.dumps(lyrics_json), ex=86400)
     return jsonify(lyrics_json)
 
-# Socket.IO handlers remain the same...
 @socketio.on('join_room')
 def handle_join_room(data):
-    room_code = data['room_code'].upper(); username = data.get('username', 'Guest'); sid = request.sid
+    room_code = data['room_code'].upper()
+    username = data.get('username', 'Guest')
+    sid = request.sid
     room_data_json = r.get(f"room:{room_code}")
     if not room_data_json: emit('error', {'message': 'Room not found'}); return
-    room_data = json.loads(room_data_json); join_room(room_code)
-    is_admin = not room_data.get('admin_sid') or not room_data.get('users')
+    room_data = json.loads(room_data_json)
+    join_room(room_code)
+    is_admin = not room_data.get('users') or not room_data.get('admin_sid')
     if is_admin: room_data['admin_sid'] = sid
     room_data['users'][sid] = {'name': username, 'isAdmin': is_admin}
     r.set(f"room:{room_code}", json.dumps(room_data), ex=86400)
@@ -250,7 +267,9 @@ def handle_join_room(data):
 
 @socketio.on('update_player_state')
 def handle_player_state_update(data):
-    room_code = data['room_code'].upper(); sid = request.sid; room_data_json = r.get(f"room:{room_code}")
+    room_code = data['room_code'].upper()
+    sid = request.sid
+    room_data_json = r.get(f"room:{room_code}")
     if not room_data_json: return
     room_data = json.loads(room_data_json)
     if room_data.get('admin_sid') != sid and not room_data['current_state'].get('isCollaborative', False): return
@@ -274,14 +293,17 @@ def handle_disconnect():
             if not room_data_str: continue
             room_data = json.loads(room_data_str)
             if sid in room_data.get('users', {}):
-                room_code = key.split(":")[1]; del room_data['users'][sid]
+                room_code = key.split(":")[1]
+                del room_data['users'][sid]
                 if room_data.get('admin_sid') == sid:
                     if room_data['users']:
-                        new_admin_sid = next(iter(room_data['users'])); room_data['admin_sid'] = new_admin_sid
+                        new_admin_sid = next(iter(room_data['users']))
+                        room_data['admin_sid'] = new_admin_sid
                         room_data['users'][new_admin_sid]['isAdmin'] = True
                     else: room_data['admin_sid'] = None
                 r.set(key, json.dumps(room_data), ex=86400)
-                emit('update_user_list', list(room_data['users'].values()), to=room_code); break
+                emit('update_user_list', list(room_data['users'].values()), to=room_code)
+                break
         except (json.JSONDecodeError, TypeError): continue
 
 if __name__ == '__main__':
