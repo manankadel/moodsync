@@ -110,8 +110,6 @@ export default function RoomPage() {
   const [showUploadModal, setShowUploadModal] = useState(false);
 
   const { playlistTitle, playlist, currentTrackIndex, isLoading, error, users, isAdmin, volume, isCollaborative, isPlaying } = useRoomStore();
-  
-  // FIX: Re-added setLoading and setError to the destructuring
   const { initializePlayer, setPlaylistData, setLoading, setError, playPause, nextTrack, prevTrack, selectTrack, setVolume, connect, disconnect, toggleCollaborative, primePlayer } = useRoomStore.getState();
   
   const currentTrack = playlist[currentTrackIndex];

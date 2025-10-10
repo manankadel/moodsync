@@ -10,6 +10,7 @@ const PLAYBACK_RATE_ADJUST = 0.02;        // Adjust playback by 2% (1.02x or 0.9
 const SYNC_HEARTBEAT_INTERVAL = 1000;     // Admin's periodic state broadcast.
 const CLOCK_SYNC_INTERVAL = 5000;         // How often to recalibrate the clock with the server.
 
+// --- INTERFACES ---
 interface Song { name: string; artist: string; albumArt: string | null; youtubeId?: string; isUpload?: boolean; audioUrl?: string; }
 interface User { name: string; isAdmin: boolean; }
 declare global { interface Window { onYouTubeIframeAPIReady: () => void; YT: any; } }
@@ -21,46 +22,30 @@ interface LyricLine { time: number; text: string; }
 interface RoomState {
   socket: Socket | null; player: any; audioElement: HTMLAudioElement | null;
   playlist: Song[]; currentTrackIndex: number; isPlaying: boolean;
-  isSeeking: boolean; manualLatencyOffset: number; serverClockOffset: number;
+  isSeeking: boolean; manualLatencyOffset: number; serverClockOffset: number; isAudioGraphConnected: boolean;
   syncInterval: NodeJS.Timeout | null; clockSyncInterval: NodeJS.Timeout | null;
   roomCode: string; playlistTitle: string; users: User[]; volume: number; isCollaborative: boolean; isLoading: boolean; error: string | null; isAdmin: boolean; username: string; equalizer: EqualizerSettings; audioNodes: AudioNodes; currentTime: number; lyrics: { lines: LyricLine[]; isLoading: boolean; };
   connect: (roomCode: string, username: string) => void; disconnect: () => void; initializePlayer: (domId: string) => void;
   setPlaylistData: (title: string, playlist: Song[]) => void; playPause: () => void; nextTrack: () => void; prevTrack: () => void; selectTrack: (index: number) => void; setVolume: (volume: number) => void; setEqualizer: (settings: EqualizerSettings) => void; toggleCollaborative: () => void; setIsSeeking: (isSeeking: boolean) => void; setManualLatencyOffset: (offset: number) => void;
   _emitStateUpdate: (overrideState?: Partial<Omit<SyncState, 'serverTimestamp'>>) => void;
-  syncPlayerState: (state: SyncState) => void;
-  _syncClock: () => Promise<void>;
-  primePlayer: () => void;
-  fetchLyrics: (youtubeId: string) => void;
-  refreshPlaylist: () => void;
+  syncPlayerState: (state: SyncState) => void; _syncClock: () => Promise<void>; primePlayer: () => void; fetchLyrics: (youtubeId: string) => void; refreshPlaylist: () => void;
   uploadFile: (file: File, title?: string, artist?: string) => Promise<any>;
-  setLoading: (loading: boolean) => void; // FIX: Re-added
-  setError: (error: string | null) => void; // FIX: Re-added
+  setLoading: (loading: boolean) => void; setError: (error: string | null) => void;
 }
 
 export const useRoomStore = create<RoomState>((set, get) => ({
   socket: null, player: null, audioElement: null,
   playlist: [], currentTrackIndex: 0, isPlaying: false,
-  isSeeking: false, manualLatencyOffset: 0, serverClockOffset: 0,
+  isSeeking: false, manualLatencyOffset: 0, serverClockOffset: 0, isAudioGraphConnected: false,
   syncInterval: null, clockSyncInterval: null,
   roomCode: '', playlistTitle: '', users: [], volume: 80, isCollaborative: false, isLoading: true, error: null, isAdmin: false, username: '', equalizer: { bass: 0, mids: 0, treble: 0 }, audioNodes: { context: null, source: null, bass: null, mids: null, treble: null }, currentTime: 0, lyrics: { lines: [], isLoading: false },
   
   setLoading: (loading) => set({ isLoading: loading }),
   setError: (error) => set({ error, isLoading: false }),
-
   setIsSeeking: (isSeeking) => set({ isSeeking }),
+
   setManualLatencyOffset: (offset) => {
-    const { isPlaying, player, audioElement, playlist, currentTrackIndex } = get();
-    if (!isPlaying) { set({ manualLatencyOffset: offset }); return; }
-    const oldOffset = get().manualLatencyOffset;
-    const adjustment = offset - oldOffset;
-    const target = playlist[currentTrackIndex]?.isUpload ? audioElement : player;
-    if (target && typeof target.currentTime === 'number') {
-      const newTime = target.currentTime - adjustment;
-      if (isFinite(newTime)) {
-          if (target.seekTo) target.seekTo(newTime, true);
-          else target.currentTime = newTime;
-      }
-    }
+    // This function is now purely proactive and does not fight the sync system.
     set({ manualLatencyOffset: offset });
   },
 
@@ -119,42 +104,43 @@ export const useRoomStore = create<RoomState>((set, get) => ({
         else if (track?.youtubeId && player) { player.cueVideoById(track.youtubeId, state.currentTime); get().fetchLyrics(track.youtubeId); }
     }
     
-    const target = playlist[get().currentTrackIndex]?.isUpload ? audioElement : player;
-    if (!target) return;
+    const targetTrack = playlist[get().currentTrackIndex];
+    const isUpload = targetTrack?.isUpload;
 
     if (state.currentTime !== undefined && state.serverTimestamp !== undefined) {
         const serverTimeNow = Date.now() / 1000 - serverClockOffset;
         const timeSinceUpdate = serverTimeNow - state.serverTimestamp;
-        
         if (timeSinceUpdate < 0 || timeSinceUpdate > 5) return;
 
         const projectedTime = state.currentTime + (state.isPlaying ? timeSinceUpdate : 0);
         let playerTime = 0;
-        try { playerTime = (target.currentTime || 0) - manualLatencyOffset; } catch(e) {}
+        try {
+            const rawPlayerTime = isUpload && audioElement ? audioElement.currentTime : player?.getCurrentTime() || 0;
+            playerTime = rawPlayerTime - manualLatencyOffset;
+        } catch(e) {}
         const drift = projectedTime - playerTime;
-        
-        const canSetRate = typeof target.playbackRate === 'number' || typeof target.setPlaybackRate === 'function';
 
-        if (canSetRate) {
+        if (player && typeof player.setPlaybackRate === 'function') {
             if (Math.abs(drift) > ADAPTIVE_RATE_THRESHOLD && Math.abs(drift) < HARD_SYNC_THRESHOLD) {
                 const newRate = 1.0 + (drift > 0 ? PLAYBACK_RATE_ADJUST : -PLAYBACK_RATE_ADJUST);
-                if (target.playbackRate !== newRate) target.playbackRate = newRate;
+                if (player.getPlaybackRate() !== newRate) player.setPlaybackRate(newRate);
             } else {
-                if (target.playbackRate !== 1.0) target.playbackRate = 1.0;
+                if (player.getPlaybackRate() !== 1.0) player.setPlaybackRate(1.0);
             }
         }
         
         if (Math.abs(drift) > HARD_SYNC_THRESHOLD) {
             const seekTime = projectedTime + manualLatencyOffset;
             if (isFinite(seekTime)) {
-                if (target.seekTo) target.seekTo(seekTime, true);
-                else target.currentTime = seekTime;
+                if (isUpload && audioElement) audioElement.currentTime = seekTime;
+                else player?.seekTo(seekTime, true);
             }
         }
     }
     
     if (state.isPlaying !== undefined && state.isPlaying !== isPlaying) {
-        state.isPlaying ? target.play()?.catch(()=>{}) : target.pause();
+        if (isUpload && audioElement) { state.isPlaying ? audioElement.play().catch(()=>{}) : audioElement.pause(); }
+        else if (player) { state.isPlaying ? player.playVideo() : player.pauseVideo(); }
         set({ isPlaying: state.isPlaying });
     }
   },
@@ -176,60 +162,84 @@ export const useRoomStore = create<RoomState>((set, get) => ({
     const audioEl = new Audio();
     audioEl.crossOrigin = 'anonymous';
     audioEl.addEventListener('timeupdate', () => { if (!get().isSeeking) set({ currentTime: audioEl.currentTime }); });
-    audioEl.addEventListener('play', () => { set({ isPlaying: true }); if (get().isAdmin) { const intv = setInterval(() => get()._emitStateUpdate({}), SYNC_HEARTBEAT_INTERVAL); set({ syncInterval: intv }); }});
-    audioEl.addEventListener('pause', () => { set({ isPlaying: false }); const { syncInterval } = get(); if(syncInterval) { clearInterval(syncInterval); set({ syncInterval: null }); }});
+    audioEl.addEventListener('play', () => { set({ isPlaying: true }); });
+    audioEl.addEventListener('pause', () => { set({ isPlaying: false }); });
     audioEl.addEventListener('ended', () => { if (get().isAdmin) get().nextTrack(); });
     set({ audioElement: audioEl });
 
     try {
-        const audioContext = new (window.AudioContext || (window as any).webkitAudioContext)();
-        const source = audioContext.createMediaElementSource(audioEl);
-        const bass = audioContext.createBiquadFilter(); bass.type = 'lowshelf';
-        const mids = audioContext.createBiquadFilter(); mids.type = 'peaking';
-        const treble = audioContext.createBiquadFilter(); treble.type = 'highshelf';
-        source.connect(bass).connect(mids).connect(treble).connect(audioContext.destination);
-        set({ audioNodes: { context: audioContext, source, bass, mids, treble } });
-    } catch (e) { console.error("Could not create Web Audio graph:", e); }
+        if (!get().isAudioGraphConnected) {
+            const audioContext = new (window.AudioContext || (window as any).webkitAudioContext)();
+            const source = audioContext.createMediaElementSource(audioEl);
+            const bass = audioContext.createBiquadFilter(); bass.type = 'lowshelf';
+            const mids = audioContext.createBiquadFilter(); mids.type = 'peaking';
+            const treble = audioContext.createBiquadFilter(); treble.type = 'highshelf';
+            source.connect(bass).connect(mids).connect(treble).connect(audioContext.destination);
+            set({ audioNodes: { context: audioContext, source, bass, mids, treble }, isAudioGraphConnected: true });
+        }
+    } catch (e) { console.error("Error setting up AudioContext:", e); }
     
-    // FIX: Define onStateChange in a scope accessible to the constructor
     const onPlayerStateChange = (e: any) => {
-        const { isAdmin, isPlaying, nextTrack, _emitStateUpdate } = get();
+        const { isAdmin, isPlaying } = get();
         if (!isAdmin) return;
         const newIsPlaying = e.data === window.YT.PlayerState.PLAYING;
-        if (e.data === window.YT.PlayerState.ENDED) { nextTrack(); return; }
-        if (newIsPlaying !== isPlaying) {
-            _emitStateUpdate({ isPlaying: newIsPlaying });
-            const { syncInterval } = get();
-            if (newIsPlaying) { 
-                if(syncInterval) clearInterval(syncInterval); 
-                const intv = setInterval(() => _emitStateUpdate({}), SYNC_HEARTBEAT_INTERVAL); 
-                set({ isPlaying: true, syncInterval: intv });
-            } else { 
-                if (syncInterval) clearInterval(syncInterval); 
-                set({ isPlaying: false, syncInterval: null }); 
-            }
-        }
+        if (e.data === window.YT.PlayerState.ENDED) { get().nextTrack(); return; }
+        if (newIsPlaying !== isPlaying) { set({ isPlaying: newIsPlaying }); }
     };
 
-    window.onYouTubeIframeAPIReady = () => { 
-        new window.YT.Player(domId, { 
-            height: '0', width: '0', 
-            playerVars: { origin: window.location.origin, controls: 0, disablekb: 1 }, 
-            events: { 
-                onReady: (e: any) => set({ player: e.target }), 
-                onStateChange: onPlayerStateChange // Now correctly referenced
-            }, 
-        }); 
-    };
+    window.onYouTubeIframeAPIReady = () => { new window.YT.Player(domId, { height: '0', width: '0', playerVars: { origin: window.location.origin, controls: 0, disablekb: 1 }, events: { onReady: (e: any) => set({ player: e.target }), onStateChange: onPlayerStateChange }, }); };
     if (window.YT?.Player) window.onYouTubeIframeAPIReady();
   },
 
   setPlaylistData: (title, playlist) => { set({ playlistTitle: title, playlist, isLoading: false, error: null }); if (playlist.length > 0 && playlist[0].youtubeId) get().fetchLyrics(playlist[0].youtubeId); },
   
-  playPause: () => { const { isAdmin, isPlaying } = get(); if (!isAdmin) return; get()._emitStateUpdate({ isPlaying: !isPlaying }); },
-  nextTrack: () => { const { isAdmin, currentTrackIndex, playlist } = get(); if (!isAdmin) return; get()._emitStateUpdate({ trackIndex: (currentTrackIndex + 1) % playlist.length, currentTime: 0 }); },
-  prevTrack: () => { const { isAdmin, currentTrackIndex, playlist } = get(); if (!isAdmin) return; get()._emitStateUpdate({ trackIndex: (currentTrackIndex - 1 + playlist.length) % playlist.length, currentTime: 0 }); },
-  selectTrack: (index) => { const { isAdmin, currentTrackIndex } = get(); if (!isAdmin) return; if (index !== currentTrackIndex) { get()._emitStateUpdate({ trackIndex: index, currentTime: 0 }); } else { get().playPause(); } },
+  // --- COMMAND & CONTROL ACTIONS ---
+  playPause: () => {
+    const { isAdmin, isCollaborative, isPlaying, player, audioElement, playlist, currentTrackIndex } = get();
+    if (!isAdmin && !isCollaborative) return;
+    const isUpload = playlist[currentTrackIndex]?.isUpload;
+    // Perform local action immediately
+    if (isUpload && audioElement) { !isPlaying ? audioElement.play().catch(()=>{}) : audioElement.pause(); }
+    else if (player) { !isPlaying ? player.playVideo() : player.pauseVideo(); }
+    // Broadcast the new state
+    get()._emitStateUpdate({ isPlaying: !isPlaying });
+  },
+
+  nextTrack: () => {
+    const { isAdmin, isCollaborative, currentTrackIndex, playlist, player, audioElement } = get();
+    if (!isAdmin && !isCollaborative) return;
+    const newIndex = (currentTrackIndex + 1) % playlist.length;
+    // Perform local action immediately
+    player?.stopVideo();
+    if (audioElement) { audioElement.src = ''; audioElement.load(); }
+    // Broadcast the new state
+    get()._emitStateUpdate({ trackIndex: newIndex, currentTime: 0, isPlaying: true });
+  },
+
+  prevTrack: () => {
+    const { isAdmin, isCollaborative, currentTrackIndex, playlist, player, audioElement } = get();
+    if (!isAdmin && !isCollaborative) return;
+    const newIndex = (currentTrackIndex - 1 + playlist.length) % playlist.length;
+    // Perform local action immediately
+    player?.stopVideo();
+    if (audioElement) { audioElement.src = ''; audioElement.load(); }
+    // Broadcast the new state
+    get()._emitStateUpdate({ trackIndex: newIndex, currentTime: 0, isPlaying: true });
+  },
+
+  selectTrack: (index) => {
+    const { isAdmin, isCollaborative, currentTrackIndex, player, audioElement } = get();
+    if (!isAdmin && !isCollaborative) return;
+    if (index !== currentTrackIndex) {
+        // Perform local action immediately
+        player?.stopVideo();
+        if (audioElement) { audioElement.src = ''; audioElement.load(); }
+        // Broadcast the new state
+        get()._emitStateUpdate({ trackIndex: index, currentTime: 0, isPlaying: true });
+    } else {
+        get().playPause();
+    }
+  },
 
   setVolume: (volume) => { const { player, audioElement, isAdmin } = get(); if (audioElement) audioElement.volume = volume / 100; if (player?.setVolume) player.setVolume(volume); set({ volume }); if (isAdmin) get()._emitStateUpdate({ volume }); },
   setEqualizer: (settings) => { const { audioNodes, isAdmin } = get(); if (audioNodes.bass) audioNodes.bass.gain.value = settings.bass; if (audioNodes.mids) audioNodes.mids.gain.value = settings.mids; if (audioNodes.treble) audioNodes.treble.gain.value = settings.treble; set({ equalizer: settings }); if (isAdmin) get()._emitStateUpdate({ equalizer: settings }); },
