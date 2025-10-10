@@ -8,20 +8,20 @@ export default function BeatVisualizer() {
   const analyserRef = useRef<AnalyserNode | null>(null);
   const sourceRef = useRef<MediaElementAudioSourceNode | null>(null);
   
-  // Add error boundary for store access
-  let player, isPlaying;
+  let player, isPlaying, audioElement;
   try {
     player = useRoomStore(state => state.player);
     isPlaying = useRoomStore(state => state.isPlaying);
+    audioElement = useRoomStore(state => state.audioElement); // Access the dedicated HTML5 audio element
   } catch (error) {
     console.error('Error accessing room store:', error);
-    return null; // Don't render if store is unavailable
+    return null; 
   }
 
-  // Effect for setting up the one-time AudioContext
+  // Effect for setting up the one-time AudioContext and connecting the dedicated Audio Element
   useEffect(() => {
-    // This effect runs only when the player object becomes available
-    if (!player || sourceRef.current) return;
+    // This effect runs only when the dedicated audioElement becomes available
+    if (!audioElement || sourceRef.current) return;
     
     try {
       if (!audioContextRef.current) {
@@ -32,23 +32,24 @@ export default function BeatVisualizer() {
         analyser.fftSize = 256;
         analyserRef.current = analyser;
         
-        // This is a more robust way to get the video element from the iframe
-        const iframe = player.getIframe();
-        if (iframe && iframe.contentWindow) {
-          const videoElement = iframe.contentWindow.document.querySelector('video');
-          if (videoElement) {
-            videoElement.crossOrigin = "anonymous";
-            const source = audioContext.createMediaElementSource(videoElement);
-            sourceRef.current = source;
-            source.connect(analyser);
-            analyser.connect(audioContext.destination);
-          }
-        }
+        // CRITICAL FIX: ONLY connect to the dedicated HTML5 Audio Element
+        // The YouTube iframe is cross-origin and will throw a SecurityError (as seen in log)
+        const source = audioContext.createMediaElementSource(audioElement);
+        sourceRef.current = source;
+        source.connect(analyser);
+        analyser.connect(audioContext.destination);
       }
     } catch (e) {
-      console.error("Error setting up AudioContext:", e);
+      console.error("Error setting up AudioContext for Uploaded Audio:", e);
     }
-  }, [player]);
+    // Cleanup function to disconnect the audio graph
+    return () => {
+        if (sourceRef.current) {
+            sourceRef.current.disconnect();
+            sourceRef.current = null;
+        }
+    };
+  }, [audioElement]); // Dependency on audioElement ensures it runs once when the element is set
 
   // Effect for handling the animation loop
   useEffect(() => {
@@ -75,6 +76,7 @@ export default function BeatVisualizer() {
       let x = 0;
 
       for (let i = 0; i < numBars; i++) {
+        // Simple visualization for uploaded audio
         const barHeight = Math.pow(dataArray[i] / 255, 2.5) * canvas.height;
         const r = 50 + (dataArray[i] * 0.5);
         const g = 150 + (dataArray[i] * 0.2);
