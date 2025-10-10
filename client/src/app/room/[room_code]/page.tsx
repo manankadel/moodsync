@@ -109,12 +109,14 @@ export default function RoomPage() {
   const [showNameModal, setShowNameModal] = useState(true);
   const [showUploadModal, setShowUploadModal] = useState(false);
 
-  const { playlistTitle, playlist, currentTrackIndex, isLoading, error, users, isAdmin, volume, isCollaborative } = useRoomStore();
-  const { player, isPlaying } = useRoomStore();
-  const { initializePlayer, setPlaylistData, setLoading, setError, playPause, nextTrack, prevTrack, selectTrack, setVolume, connect, disconnect, toggleCollaborative, setCurrentTime, primePlayer } = useRoomStore.getState();
+  // State selectors from Zustand store
+  const { playlistTitle, playlist, currentTrackIndex, isLoading, error, users, isAdmin, volume, isCollaborative, isPlaying } = useRoomStore();
+  
+  // Action selectors from Zustand store
+  // FIX: Removed setCurrentTime as it's no longer needed or exported from the store
+  const { initializePlayer, setPlaylistData, setLoading, setError, playPause, nextTrack, prevTrack, selectTrack, setVolume, connect, disconnect, toggleCollaborative, primePlayer } = useRoomStore.getState();
   
   const currentTrack = playlist[currentTrackIndex];
-  const animationFrameId = useRef<number | null>(null);
 
   useEffect(() => {
     initializePlayer('youtube-player-container');
@@ -135,28 +137,9 @@ export default function RoomPage() {
     fetchRoomData();
   }, [roomCode, showNameModal, setPlaylistData, setLoading, setError]);
   
-  useEffect(() => {
-    const update = () => {
-      if (player && typeof player.getCurrentTime === 'function') {
-        setCurrentTime(player.getCurrentTime());
-      }
-      animationFrameId.current = requestAnimationFrame(update);
-    };
-
-    if (isPlaying) {
-      animationFrameId.current = requestAnimationFrame(update);
-    } else {
-      if (animationFrameId.current) {
-        cancelAnimationFrame(animationFrameId.current);
-      }
-    }
-
-    return () => {
-      if (animationFrameId.current) {
-        cancelAnimationFrame(animationFrameId.current);
-      }
-    };
-  }, [isPlaying, player, setCurrentTime]);
+  // FIX: This entire useEffect block has been removed.
+  // The room-store now handles updating `currentTime` internally via the 'timeupdate' event listener,
+  // which is more efficient than using requestAnimationFrame in a component.
 
   const handleNameSubmit = (name: string) => {
     primePlayer(); 
