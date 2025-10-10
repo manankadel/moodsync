@@ -18,6 +18,7 @@ client/
           page.tsx
     components/
       Equalizer.tsx
+      FileUploadModal.tsx
       Lyrics.tsx
       cta.tsx
       features.tsx

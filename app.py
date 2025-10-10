@@ -9,6 +9,9 @@ from dotenv import load_dotenv
 from googleapiclient.discovery import build
 from googleapiclient import errors
 import redis
+from werkzeug.utils import secure_filename
+from flask import send_from_directory
+import mimetypes
 
 # Try different import patterns for lrc_kit
 lrc_kit_available = False
@@ -40,6 +43,17 @@ app.secret_key = os.urandom(24)
 
 # Also use it for SocketIO
 socketio = SocketIO(app, cors_allowed_origins=cors_origin)
+
+UPLOAD_FOLDER = 'uploads'
+ALLOWED_EXTENSIONS = {'mp3', 'wav', 'ogg', 'm4a', 'flac'}
+MAX_FILE_SIZE = 50 * 1024 * 1024  # 50MB
+
+os.makedirs(UPLOAD_FOLDER, exist_ok=True)
+app.config['UPLOAD_FOLDER'] = UPLOAD_FOLDER
+app.config['MAX_CONTENT_LENGTH'] = MAX_FILE_SIZE
+
+def allowed_file(filename):
+    return '.' in filename and filename.rsplit('.', 1)[1].lower() in ALLOWED_EXTENSIONS
 
 
 # --- DATABASE CONNECTION (REDIS) ---

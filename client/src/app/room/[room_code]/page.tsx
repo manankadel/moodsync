@@ -8,8 +8,9 @@ import Image from 'next/image';
 import Script from 'next/script';
 import Player from '@/components/player';
 import { useRoomStore } from '@/lib/room-store';
-import { Users, Crown, Copy, Link as LinkIcon, Share2 } from 'lucide-react';
+import { Users, Crown, Copy, Link as LinkIcon, Share2, Upload } from 'lucide-react';
 import WaveButton from '@/components/ui/WaveButton';
+import FileUploadModal from '@/components/FileUploadModal';
 
 const API_URL = process.env.NEXT_PUBLIC_API_URL || 'http://localhost:5001';
 
@@ -28,7 +29,14 @@ const UsernameModal = ({ onSubmit }: { onSubmit: (name: string) => void }) => {
   );
 };
 
-const RoomSidebar = ({ roomCode, users, isAdmin, isCollaborative, onToggleCollaborative }: { roomCode: string, users: {name: string, isAdmin: boolean}[], isAdmin: boolean, isCollaborative: boolean, onToggleCollaborative: () => void }) => {
+const RoomSidebar = ({ roomCode, users, isAdmin, isCollaborative, onToggleCollaborative, onOpenUpload }: { 
+  roomCode: string, 
+  users: {name: string, isAdmin: boolean}[], 
+  isAdmin: boolean, 
+  isCollaborative: boolean, 
+  onToggleCollaborative: () => void,
+  onOpenUpload: () => void
+}) => {
     const [copied, setCopied] = useState(false);
     const copyToClipboard = () => {
         navigator.clipboard.writeText(window.location.href);
@@ -49,6 +57,7 @@ const RoomSidebar = ({ roomCode, users, isAdmin, isCollaborative, onToggleCollab
                 </div>
                 {copied && <p className="text-xs text-cyan-400 mt-2 animate-pulse">Link copied!</p>}
             </motion.div>
+            
             <motion.div initial={{opacity: 0, x: 20}} animate={{opacity: 1, x: 0}} transition={{delay: 0.6}}>
                 <h2 className="text-sm font-light text-gray-400 mb-3">In The Room ({users.length})</h2>
                 <div className="space-y-2 max-h-64 overflow-y-auto pr-2">
@@ -60,22 +69,33 @@ const RoomSidebar = ({ roomCode, users, isAdmin, isCollaborative, onToggleCollab
                     ))}
                 </div>
             </motion.div>
+            
             {isAdmin && (
                 <motion.div initial={{opacity: 0, x: 20}} animate={{opacity: 1, x: 0}} transition={{delay: 0.7}}>
                     <h2 className="text-sm font-light text-gray-400 mb-3">Admin Controls</h2>
-                    <div className="p-4 rounded-lg bg-white/5 border border-white/10">
-                        <label htmlFor="collaborative-toggle" className="flex items-center justify-between cursor-pointer">
-                            <div className="flex items-center gap-3">
-                                <Share2 size={16} className="text-cyan-400"/>
-                                <span className="text-white font-medium">Collaborative Playback</span>
-                            </div>
-                            <div className="relative">
-                                <input id="collaborative-toggle" type="checkbox" className="sr-only" checked={isCollaborative} onChange={onToggleCollaborative} />
-                                <div className="block bg-gray-600 w-10 h-6 rounded-full"></div>
-                                <div className={`dot absolute left-1 top-1 bg-white w-4 h-4 rounded-full transition-transform ${isCollaborative ? 'translate-x-4 bg-cyan-400' : ''}`}></div>
-                            </div>
-                        </label>
-                        <p className="text-xs text-gray-500 mt-2">Allow anyone in the room to control the music.</p>
+                    <div className="space-y-3">
+                        <div className="p-4 rounded-lg bg-white/5 border border-white/10">
+                            <label htmlFor="collaborative-toggle" className="flex items-center justify-between cursor-pointer">
+                                <div className="flex items-center gap-3">
+                                    <Share2 size={16} className="text-cyan-400"/>
+                                    <span className="text-white font-medium">Collaborative</span>
+                                </div>
+                                <div className="relative">
+                                    <input id="collaborative-toggle" type="checkbox" className="sr-only" checked={isCollaborative} onChange={onToggleCollaborative} />
+                                    <div className="block bg-gray-600 w-10 h-6 rounded-full"></div>
+                                    <div className={`dot absolute left-1 top-1 bg-white w-4 h-4 rounded-full transition-transform ${isCollaborative ? 'translate-x-4 bg-cyan-400' : ''}`}></div>
+                                </div>
+                            </label>
+                            <p className="text-xs text-gray-500 mt-2">Allow anyone to control playback.</p>
+                        </div>
+                        
+                        <button
+                            onClick={onOpenUpload}
+                            className="w-full p-4 rounded-lg bg-gradient-to-r from-purple-500/20 to-pink-500/20 border border-purple-400/30 hover:border-purple-400/50 transition-all flex items-center justify-center gap-2 text-white font-medium"
+                        >
+                            <Upload size={18} />
+                            Upload Music
+                        </button>
                     </div>
                 </motion.div>
             )}
@@ -87,6 +107,7 @@ export default function RoomPage() {
   const params = useParams();
   const roomCode = params.room_code as string;
   const [showNameModal, setShowNameModal] = useState(true);
+  const [showUploadModal, setShowUploadModal] = useState(false);
 
   const { playlistTitle, playlist, currentTrackIndex, isLoading, error, users, isAdmin, volume, isCollaborative } = useRoomStore();
   const { player, isPlaying } = useRoomStore();
@@ -138,7 +159,6 @@ export default function RoomPage() {
   }, [isPlaying, player, setCurrentTime]);
 
   const handleNameSubmit = (name: string) => {
-    // This is the first user interaction. We "prime" the player here.
     primePlayer(); 
     
     if (roomCode) {
@@ -157,7 +177,7 @@ export default function RoomPage() {
     <div className="min-h-screen bg-black text-white overflow-hidden">
       <Script src="https://www.youtube.com/iframe_api" />
       <div id="youtube-player-container" className="fixed -z-10 top-0 left-0"></div>
-      <div className="absolute inset-0 z-0 opacity-50"><AnimatePresence>{currentTrack?.albumArt && (<motion.div key={currentTrack.youtubeId} initial={{ opacity: 0, scale: 1.1 }} animate={{ opacity: 1, scale: 1 }} exit={{ opacity: 0, scale: 1.1 }} transition={{ duration: 1.5, ease: "easeInOut" }} className="absolute inset-0"><Image src={currentTrack.albumArt} alt="background" layout="fill" objectFit="cover" className="blur-3xl saturate-50" /></motion.div>)}</AnimatePresence><div className="absolute inset-0 bg-black/70" /></div>
+      <div className="absolute inset-0 z-0 opacity-50"><AnimatePresence>{currentTrack?.albumArt && (<motion.div key={currentTrack.youtubeId || currentTrack.audioUrl} initial={{ opacity: 0, scale: 1.1 }} animate={{ opacity: 1, scale: 1 }} exit={{ opacity: 0, scale: 1.1 }} transition={{ duration: 1.5, ease: "easeInOut" }} className="absolute inset-0"><Image src={currentTrack.albumArt} alt="background" layout="fill" objectFit="cover" className="blur-3xl saturate-50" /></motion.div>)}</AnimatePresence><div className="absolute inset-0 bg-black/70" /></div>
       
       <main className="relative z-10 grid grid-cols-1 lg:grid-cols-[2fr_1fr] gap-8 xl:gap-16 max-w-7xl mx-auto p-4 sm:p-8 h-screen">
         <div className="flex flex-col h-full pt-8 pb-32">
@@ -166,20 +186,42 @@ export default function RoomPage() {
           </motion.div>
           <motion.ul initial="hidden" animate="visible" className="mt-8 space-y-2 pr-4 -mr-4 flex-1 overflow-y-auto">
             {playlist.map((song, index) => (
-              <motion.li key={song.youtubeId || index} onClick={() => selectTrack(index)} className={`relative flex items-center gap-4 p-3 rounded-lg border transition-all duration-300 ${(isAdmin || isCollaborative) ? 'cursor-pointer' : 'cursor-default'} ${currentTrackIndex === index ? 'bg-white/10 border-white/20' : 'bg-transparent border-transparent hover:bg-white/5'}`}>
+              <motion.li key={song.youtubeId || song.audioUrl || index} onClick={() => selectTrack(index)} className={`relative flex items-center gap-4 p-3 rounded-lg border transition-all duration-300 ${(isAdmin || isCollaborative) ? 'cursor-pointer' : 'cursor-default'} ${currentTrackIndex === index ? 'bg-white/10 border-white/20' : 'bg-transparent border-transparent hover:bg-white/5'}`}>
                 <AnimatePresence>{currentTrackIndex === index && (<motion.div layoutId="playing-indicator" className="absolute inset-0 rounded-lg border-2 border-cyan-400"/>)}</AnimatePresence>
-                <div className="relative h-12 w-12 rounded-md overflow-hidden bg-gray-800 flex-shrink-0">{song.albumArt ? <Image src={song.albumArt} alt={song.name} layout="fill" objectFit="cover" /> : null}</div>
-                <div className="relative flex-grow min-w-0"><p className="font-semibold text-white truncate">{song.name}</p><p className="text-sm text-gray-400 truncate">{song.artist}</p></div>
+                <div className="relative h-12 w-12 rounded-md overflow-hidden bg-gray-800 flex-shrink-0">
+                  {song.albumArt ? <Image src={song.albumArt} alt={song.name} layout="fill" objectFit="cover" /> : <div className="flex items-center justify-center h-full text-gray-500">{song.isUpload ? '🎵' : '🎧'}</div>}
+                </div>
+                <div className="relative flex-grow min-w-0">
+                  <p className="font-semibold text-white truncate">{song.name}</p>
+                  <p className="text-sm text-gray-400 truncate">{song.artist}</p>
+                </div>
+                {song.isUpload && (
+                  <span className="px-2 py-1 text-xs bg-purple-500/20 text-purple-300 rounded-full border border-purple-400/30">
+                    Uploaded
+                  </span>
+                )}
               </motion.li>
             ))}
           </motion.ul>
         </div>
         <div className="h-full flex flex-col justify-start pt-8">
-            <RoomSidebar roomCode={roomCode} users={users} isAdmin={isAdmin} isCollaborative={isCollaborative} onToggleCollaborative={toggleCollaborative} />
+            <RoomSidebar 
+              roomCode={roomCode} 
+              users={users} 
+              isAdmin={isAdmin} 
+              isCollaborative={isCollaborative} 
+              onToggleCollaborative={toggleCollaborative}
+              onOpenUpload={() => setShowUploadModal(true)}
+            />
         </div>
       </main>
       
       <AnimatePresence>{currentTrack && (<Player albumArt={currentTrack.albumArt} title={currentTrack.name} artist={currentTrack.artist} isPlaying={isPlaying} onPlayPause={playPause} onNext={nextTrack} onPrev={prevTrack} volume={volume} onVolumeChange={setVolume} />)}</AnimatePresence>
+      
+      <FileUploadModal 
+        isOpen={showUploadModal} 
+        onClose={() => setShowUploadModal(false)} 
+      />
     </div>
   );
 }
