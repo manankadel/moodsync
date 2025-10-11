@@ -71,7 +71,7 @@ try:
 except (redis.exceptions.ConnectionError, ValueError) as e:
     app.logger.error(f"FATAL: Could not connect to Redis. Error: {e}")
     exit(1)
-    
+
 lrc_kit_available = False
 try:
     from lrc_kit.lrc import parse_lyrics
@@ -104,32 +104,48 @@ FALLBACK_PLAYLIST = [
 ]
 
 @lru_cache(maxsize=1)
-def get_spotify_credentials(): return os.getenv('SPOTIFY_CLIENT_ID'), os.getenv('SPOTIFY_CLIENT_SECRET')
+def get_spotify_credentials(): 
+    return os.getenv('SPOTIFY_CLIENT_ID'), os.getenv('SPOTIFY_CLIENT_SECRET')
 
 def get_spotify_token():
     global token_failure_count, last_token_failure
-    if token_failure_count >= 3 and time.time() - last_token_failure < 300: return None
-    if time.time() < spotify_token_cache['expires'] and spotify_token_cache['token']: return spotify_token_cache['token']
+    if token_failure_count >= 3 and time.time() - last_token_failure < 300: 
+        return None
+    if time.time() < spotify_token_cache['expires'] and spotify_token_cache['token']: 
+        return spotify_token_cache['token']
     client_id, client_secret = get_spotify_credentials()
-    if not client_id or not client_secret: return None
+    if not client_id or not client_secret: 
+        return None
     try:
         auth_str = base64.b64encode(f"{client_id}:{client_secret}".encode()).decode()
         response = requests.post("https://accounts.spotify.com/api/token", headers={"Authorization": f"Basic {auth_str}", "Content-Type": "application/x-www-form-urlencoded"}, data={"grant_type": "client_credentials"}, timeout=10)
-        if response.status_code != 200: token_failure_count += 1; last_token_failure = time.time(); return None
+        if response.status_code != 200: 
+            token_failure_count += 1
+            last_token_failure = time.time()
+            return None
         data = response.json()
-        if 'access_token' not in data: token_failure_count += 1; last_token_failure = time.time(); return None
+        if 'access_token' not in data: 
+            token_failure_count += 1
+            last_token_failure = time.time()
+            return None
         spotify_token_cache['token'] = data['access_token']
         spotify_token_cache['expires'] = time.time() + data.get('expires_in', 3600) - 60
         token_failure_count = 0
         return data['access_token']
-    except Exception: token_failure_count += 1; last_token_failure = time.time(); return None
+    except Exception as e:
+        app.logger.error(f"Spotify token error: {e}")
+        token_failure_count += 1
+        last_token_failure = time.time()
+        return None
 
 def get_youtube_video_id(song_name, artist_name):
     cache_key = f"youtube:v2:{song_name}_{artist_name}".lower().replace(' ', '_')
     try:
         cached_id = r.get(cache_key)
-        if cached_id: return None if cached_id == "none" else cached_id
-    except redis.exceptions.ConnectionError: pass
+        if cached_id: 
+            return None if cached_id == "none" else cached_id
+    except redis.exceptions.ConnectionError: 
+        pass
     youtube_api_key = os.getenv('YOUTUBE_API_KEY')
     query = f"{song_name} {artist_name} official audio"
     video_id = None
@@ -139,21 +155,26 @@ def get_youtube_video_id(song_name, artist_name):
             req = youtube.search().list(q=query, part='snippet', maxResults=1, type='video', videoCategoryId='10')
             res = req.execute()
             video_id = res['items'][0]['id']['videoId'] if res.get('items') else None
-        except Exception as e: app.logger.error(f"YouTube API Error: {e}")
+        except Exception as e: 
+            app.logger.error(f"YouTube API Error: {e}")
     if not video_id:
         try:
             res = requests.get(f"https://invidious.io.gg/api/v1/search?q={query}", timeout=10).json()
             video_id = res[0].get('videoId') if res and isinstance(res, list) else None
-        except Exception as e: app.logger.error(f"Invidious fallback failed: {e}")
-    try: r.set(cache_key, video_id if video_id else "none", ex=86400 * 7)
-    except redis.exceptions.ConnectionError: pass
+        except Exception as e: 
+            app.logger.error(f"Invidious fallback failed: {e}")
+    try: 
+        r.set(cache_key, video_id if video_id else "none", ex=86400 * 7)
+    except redis.exceptions.ConnectionError: 
+        pass
     return video_id
 
 def generate_playlist(genre):
     try:
         config = GENRE_CONFIGS.get(genre, GENRE_CONFIGS['default'])
         token = get_spotify_token()
-        if not token: return FALLBACK_PLAYLIST
+        if not token: 
+            return FALLBACK_PLAYLIST
         if 'search_query' in config:
             params = {'q': config['search_query'], 'type': 'track', 'limit': 30, 'market': 'US'}
             response = requests.get("https://api.spotify.com/v1/search", headers={"Authorization": f"Bearer {token}"}, params=params)
@@ -163,10 +184,12 @@ def generate_playlist(genre):
             response = requests.get("https://api.spotify.com/v1/recommendations", headers={"Authorization": f"Bearer {token}"}, params=params)
         response.raise_for_status()
         tracks = response.json().get('tracks', {}).get('items', []) or response.json().get('tracks', [])
-        if not tracks: raise Exception(f"No tracks for genre: {genre}")
+        if not tracks: 
+            raise Exception(f"No tracks for genre: {genre}")
         playlist = []
         for track in sorted(tracks, key=lambda x: x.get('popularity', 0), reverse=True):
-            if len(playlist) >= 15: break
+            if len(playlist) >= 15: 
+                break
             song_name = track.get('name')
             artist_name = track.get('artists', [{}])[0].get('name')
             if song_name and artist_name:
@@ -174,7 +197,8 @@ def generate_playlist(genre):
                 if video_id:
                     album_art = track['album']['images'][0]['url'] if track.get('album', {}).get('images') else None
                     playlist.append({'name': song_name, 'artist': artist_name, 'albumArt': album_art, 'youtubeId': video_id})
-        if not playlist: raise Exception("No valid tracks after YouTube processing.")
+        if not playlist: 
+            raise Exception("No valid tracks after YouTube processing.")
         return playlist
     except Exception as e:
         app.logger.warning(f"Playlist generation for '{genre}' failed: {e}. Using fallback.")
@@ -182,13 +206,15 @@ def generate_playlist(genre):
 
 @app.route('/generate', methods=['POST', 'OPTIONS'])
 def generate_route():
-    if request.method == 'OPTIONS': return '', 204
+    if request.method == 'OPTIONS': 
+        return '', 204
     data = request.get_json()
     genre = data.get('mood', 'default').lower()
     playlist = generate_playlist(genre)
     while True:
         room_code = ''.join(random.choices(string.ascii_uppercase + string.digits, k=6))
-        if not r.exists(f"room:{room_code}"): break
+        if not r.exists(f"room:{room_code}"): 
+            break
     title = genre.replace('-', ' ').title() if genre != 'default' else "Curated Vibes"
     room_data = {
         'playlist': playlist, 'title': title, 'users': {}, 'admin_sid': None,
@@ -203,7 +229,8 @@ def generate_route():
 def get_room_data(room_code):
     room_code = room_code.upper()
     room_data_json = r.get(f"room:{room_code}")
-    if not room_data_json: return jsonify({'error': 'Room not found'}), 404
+    if not room_data_json: 
+        return jsonify({'error': 'Room not found'}), 404
     room_data = json.loads(room_data_json)
     return jsonify({'playlist_title': room_data['title'], 'playlist': room_data['playlist']}), 200
 
@@ -213,9 +240,11 @@ def uploaded_file(filename):
 
 @app.route('/api/upload', methods=['POST'])
 def upload_file_route():
-    if 'file' not in request.files: return jsonify({'error': 'No file part'}), 400
+    if 'file' not in request.files: 
+        return jsonify({'error': 'No file part'}), 400
     file = request.files['file']
-    if file.filename == '': return jsonify({'error': 'No selected file'}), 400
+    if file.filename == '': 
+        return jsonify({'error': 'No selected file'}), 400
     if file and allowed_file(file.filename):
         filename = f"{os.urandom(8).hex()}_{secure_filename(file.filename)}"
         file_path = os.path.join(app.config['UPLOAD_FOLDER'], filename)
@@ -233,7 +262,8 @@ def add_upload_to_playlist(room_code):
     room_code = room_code.upper()
     data = request.get_json()
     room_data_json = r.get(f"room:{room_code}")
-    if not room_data_json: return jsonify({'error': 'Room not found'}), 404
+    if not room_data_json: 
+        return jsonify({'error': 'Room not found'}), 404
     room_data = json.loads(room_data_json)
     new_track = {'name': data.get('title'), 'artist': data.get('artist'), 'albumArt': None, 'youtubeId': None, 'isUpload': True, 'audioUrl': data.get('audioUrl')}
     room_data['playlist'].append(new_track)
@@ -246,8 +276,10 @@ def get_lyrics(video_id):
     cache_key = f"lyrics:v2:{video_id}"
     try:
         cached_lyrics = r.get(cache_key)
-        if cached_lyrics: return jsonify(json.loads(cached_lyrics))
-    except redis.exceptions.ConnectionError: pass
+        if cached_lyrics: 
+            return jsonify(json.loads(cached_lyrics))
+    except redis.exceptions.ConnectionError: 
+        pass
     lyrics_json = []
     if lrc_kit_available:
         try:
@@ -256,19 +288,28 @@ def get_lyrics(video_id):
                 for line in result[0]:
                     if hasattr(line, 'time') and hasattr(line, 'text') and line.text.strip():
                         lyrics_json.append({'time': line.time, 'text': line.text})
-        except Exception as e: app.logger.error(f"lrc_kit error: {e}")
-    try: r.set(cache_key, json.dumps(lyrics_json), ex=86400)
-    except redis.exceptions.ConnectionError: pass
+        except Exception as e: 
+            app.logger.error(f"lrc_kit error: {e}")
+    try: 
+        r.set(cache_key, json.dumps(lyrics_json), ex=86400)
+    except redis.exceptions.ConnectionError: 
+        pass
     return jsonify(lyrics_json)
 
 @socketio.on('join_room')
 def handle_join_room(data):
-    room_code = data['room_code'].upper(); username = data.get('username', 'Guest'); sid = request.sid
+    room_code = data['room_code'].upper()
+    username = data.get('username', 'Guest')
+    sid = request.sid
     room_data_json = r.get(f"room:{room_code}")
-    if not room_data_json: emit('error', {'message': 'Room not found'}); return
-    room_data = json.loads(room_data_json); join_room(room_code)
+    if not room_data_json: 
+        emit('error', {'message': 'Room not found'})
+        return
+    room_data = json.loads(room_data_json)
+    join_room(room_code)
     is_admin = not room_data.get('users') or not room_data.get('admin_sid')
-    if is_admin: room_data['admin_sid'] = sid
+    if is_admin: 
+        room_data['admin_sid'] = sid
     room_data['users'][sid] = {'name': username, 'isAdmin': is_admin}
     r.set(f"room:{room_code}", json.dumps(room_data), ex=86400)
     emit('load_current_state', room_data['current_state'], to=sid)
@@ -276,17 +317,22 @@ def handle_join_room(data):
 
 @socketio.on('update_player_state')
 def handle_player_state_update(data):
-    room_code = data['room_code'].upper(); sid = request.sid; room_data_json = r.get(f"room:{room_code}")
-    if not room_data_json: return
+    room_code = data['room_code'].upper()
+    sid = request.sid
+    room_data_json = r.get(f"room:{room_code}")
+    if not room_data_json: 
+        return
     room_data = json.loads(room_data_json)
-    if room_data.get('admin_sid') != sid and not room_data['current_state'].get('isCollaborative', False): return
+    if room_data.get('admin_sid') != sid and not room_data['current_state'].get('isCollaborative', False): 
+        return
     client_state = data['state']
     room_data['current_state'].update(client_state)
     client_timestamp = client_state.get('timestamp', 0)
     server_receive_time = time.time()
     if client_timestamp > 0 and client_state.get('isPlaying', False):
         latency = server_receive_time - client_timestamp
-        if 0 < latency < 2.0: room_data['current_state']['currentTime'] += latency
+        if 0 < latency < 2.0: 
+            room_data['current_state']['currentTime'] += latency
     room_data['current_state']['serverTimestamp'] = server_receive_time
     r.set(f"room:{room_code}", json.dumps(room_data), ex=86400)
     emit('sync_player_state', room_data['current_state'], to=room_code, include_self=False)
@@ -297,7 +343,8 @@ def handle_disconnect():
     for key in r.scan_iter("room:*"):
         try:
             room_data_str = r.get(key)
-            if not room_data_str: continue
+            if not room_data_str: 
+                continue
             room_data = json.loads(room_data_str)
             if sid in room_data.get('users', {}):
                 room_code = key.split(":")[1]
@@ -307,14 +354,16 @@ def handle_disconnect():
                         new_admin_sid = next(iter(room_data['users']))
                         room_data['admin_sid'] = new_admin_sid
                         room_data['users'][new_admin_sid]['isAdmin'] = True
-                    else: room_data['admin_sid'] = None
+                    else: 
+                        room_data['admin_sid'] = None
                 if room_data['users']:
                     r.set(key, json.dumps(room_data), ex=86400)
                     emit('update_user_list', list(room_data['users'].values()), to=room_code)
                 else:
                     r.delete(key)
                 break
-        except (json.JSONDecodeError, TypeError): continue
+        except (json.JSONDecodeError, TypeError): 
+            continue
 
 if __name__ == '__main__':
     logging.basicConfig(level=logging.INFO, format='%(asctime)s %(levelname)s: %(message)s')
@@ -750,6 +799,7 @@ export default Equalizer;
 
 ### ./client/src/components/FileUploadModal.tsx ###
 
+"use client";
 import { useState, useRef } from 'react';
 import { motion, AnimatePresence } from 'framer-motion';
 import { Upload, X, Music, Check, AlertCircle } from 'lucide-react';
@@ -769,14 +819,12 @@ export default function FileUploadModal({ isOpen, onClose }: { isOpen: boolean; 
   const handleFileSelect = (e: React.ChangeEvent<HTMLInputElement>) => {
     const selectedFile = e.target.files?.[0];
     if (selectedFile) {
-      // Check file type
       const allowedTypes = ['audio/mpeg', 'audio/wav', 'audio/ogg', 'audio/m4a', 'audio/flac'];
       if (!allowedTypes.includes(selectedFile.type) && !selectedFile.name.match(/\.(mp3|wav|ogg|m4a|flac)$/i)) {
         setError('Please select a valid audio file (MP3, WAV, OGG, M4A, or FLAC)');
         return;
       }
       
-      // Check file size (50MB max)
       if (selectedFile.size > 50 * 1024 * 1024) {
         setError('File size must be less than 50MB');
         return;
@@ -784,7 +832,6 @@ export default function FileUploadModal({ isOpen, onClose }: { isOpen: boolean; 
       
       setFile(selectedFile);
       setError('');
-      // Auto-fill title from filename
       if (!title) {
         setTitle(selectedFile.name.replace(/\.[^/.]+$/, ''));
       }
@@ -799,7 +846,6 @@ export default function FileUploadModal({ isOpen, onClose }: { isOpen: boolean; 
     setUploadProgress(0);
     
     try {
-      // Simulate progress for better UX
       const progressInterval = setInterval(() => {
         setUploadProgress(prev => Math.min(prev + 10, 90));
       }, 200);
@@ -810,7 +856,6 @@ export default function FileUploadModal({ isOpen, onClose }: { isOpen: boolean; 
       setUploadProgress(100);
       setSuccess(true);
       
-      // Reset and close after success
       setTimeout(() => {
         resetForm();
         onClose();
@@ -874,7 +919,6 @@ export default function FileUploadModal({ isOpen, onClose }: { isOpen: boolean; 
               </button>
             </div>
 
-            {/* File Drop Zone */}
             <div
               onClick={() => fileInputRef.current?.click()}
               className={`border-2 border-dashed rounded-xl p-8 mb-6 cursor-pointer transition-all ${
@@ -915,7 +959,6 @@ export default function FileUploadModal({ isOpen, onClose }: { isOpen: boolean; 
               </div>
             </div>
 
-            {/* Metadata Inputs */}
             {file && (
               <motion.div
                 initial={{ opacity: 0, y: 10 }}
@@ -952,7 +995,6 @@ export default function FileUploadModal({ isOpen, onClose }: { isOpen: boolean; 
               </motion.div>
             )}
 
-            {/* Progress Bar */}
             {isUploading && (
               <motion.div
                 initial={{ opacity: 0, y: 10 }}
@@ -974,7 +1016,6 @@ export default function FileUploadModal({ isOpen, onClose }: { isOpen: boolean; 
               </motion.div>
             )}
 
-            {/* Error Message */}
             {error && (
               <motion.div
                 initial={{ opacity: 0, y: 10 }}
@@ -986,7 +1027,6 @@ export default function FileUploadModal({ isOpen, onClose }: { isOpen: boolean; 
               </motion.div>
             )}
 
-            {/* Success Message */}
             {success && (
               <motion.div
                 initial={{ opacity: 0, scale: 0.9 }}
@@ -998,7 +1038,6 @@ export default function FileUploadModal({ isOpen, onClose }: { isOpen: boolean; 
               </motion.div>
             )}
 
-            {/* Action Buttons */}
             <div className="flex gap-3">
               <button
                 onClick={handleClose}
@@ -1767,57 +1806,39 @@ import { useRoomStore } from '@/lib/room-store';
 
 export default function BeatVisualizer() {
   const canvasRef = useRef<HTMLCanvasElement>(null);
-  const audioContextRef = useRef<AudioContext | null>(null);
   const analyserRef = useRef<AnalyserNode | null>(null);
-  const sourceRef = useRef<MediaElementAudioSourceNode | null>(null);
   
-  let player, isPlaying, audioElement;
-  try {
-    player = useRoomStore(state => state.player);
-    isPlaying = useRoomStore(state => state.isPlaying);
-    audioElement = useRoomStore(state => state.audioElement); // Access the dedicated HTML5 audio element
-  } catch (error) {
-    console.error('Error accessing room store:', error);
-    return null; 
-  }
+  const isPlaying = useRoomStore(state => state.isPlaying);
+  const audioNodes = useRoomStore(state => state.audioNodes);
 
-  // Effect for setting up the one-time AudioContext and connecting the dedicated Audio Element
   useEffect(() => {
-    // This effect runs only when the dedicated audioElement becomes available
-    if (!audioElement || sourceRef.current) return;
+    if (!audioNodes.context || analyserRef.current) return;
     
     try {
-      if (!audioContextRef.current) {
-        const audioContext = new (window.AudioContext || (window as any).webkitAudioContext)();
-        audioContextRef.current = audioContext;
-        
-        const analyser = audioContext.createAnalyser();
-        analyser.fftSize = 256;
-        analyserRef.current = analyser;
-        
-        // CRITICAL FIX: ONLY connect to the dedicated HTML5 Audio Element
-        // The YouTube iframe is cross-origin and will throw a SecurityError (as seen in log)
-        const source = audioContext.createMediaElementSource(audioElement);
-        sourceRef.current = source;
-        source.connect(analyser);
-        analyser.connect(audioContext.destination);
+      const analyser = audioNodes.context.createAnalyser();
+      analyser.fftSize = 256;
+      analyserRef.current = analyser;
+      
+      if (audioNodes.source && audioNodes.bass) {
+        audioNodes.source.connect(analyser);
+        console.log("✅ Analyser connected");
       }
     } catch (e) {
-      console.error("Error setting up AudioContext for Uploaded Audio:", e);
+      console.error("Analyser error:", e);
     }
-    // Cleanup function to disconnect the audio graph
-    return () => {
-        if (sourceRef.current) {
-            sourceRef.current.disconnect();
-            sourceRef.current = null;
-        }
-    };
-  }, [audioElement]); // Dependency on audioElement ensures it runs once when the element is set
 
-  // Effect for handling the animation loop
+    return () => {
+      if (analyserRef.current) {
+        try {
+          analyserRef.current.disconnect();
+        } catch (e) {}
+      }
+    };
+  }, [audioNodes.context, audioNodes.source, audioNodes.bass]);
+
   useEffect(() => {
     const canvas = canvasRef.current;
-    if (!canvas) return; 
+    if (!canvas) return;
     
     const ctx = canvas.getContext('2d');
     if (!ctx || !analyserRef.current) return;
@@ -1830,16 +1851,21 @@ export default function BeatVisualizer() {
       if (!analyserRef.current || !ctx || !canvas) return;
       
       animationFrameId = requestAnimationFrame(renderFrame);
-      analyserRef.current.getByteFrequencyData(dataArray);
+      
+      try {
+        analyserRef.current.getByteFrequencyData(dataArray);
+      } catch (e) {
+        ctx.clearRect(0, 0, canvas.width, canvas.height);
+        return;
+      }
       
       ctx.clearRect(0, 0, canvas.width, canvas.height);
 
       const barWidth = 4;
-      const numBars = canvas.width / (barWidth + 1);
+      const numBars = Math.floor(canvas.width / (barWidth + 1));
       let x = 0;
 
-      for (let i = 0; i < numBars; i++) {
-        // Simple visualization for uploaded audio
+      for (let i = 0; i < numBars && i < dataArray.length; i++) {
         const barHeight = Math.pow(dataArray[i] / 255, 2.5) * canvas.height;
         const r = 50 + (dataArray[i] * 0.5);
         const g = 150 + (dataArray[i] * 0.2);
@@ -1851,8 +1877,10 @@ export default function BeatVisualizer() {
       }
     };
 
-    if (isPlaying) {
-      audioContextRef.current?.resume();
+    if (isPlaying && audioNodes.context) {
+      if (audioNodes.context.state === 'suspended') {
+        audioNodes.context.resume().catch(() => {});
+      }
       renderFrame();
     } else {
       ctx.clearRect(0, 0, canvas.width, canvas.height);
@@ -1863,7 +1891,7 @@ export default function BeatVisualizer() {
         cancelAnimationFrame(animationFrameId);
       }
     };
-  }, [isPlaying]);
+  }, [isPlaying, audioNodes.context]);
 
   return <canvas ref={canvasRef} width="300" height="60" className="absolute bottom-0 left-1/2 -translate-x-1/2 opacity-25 blur-[1px]" />;
 }
@@ -1903,6 +1931,10 @@ interface RoomState {
   setLoading: (loading: boolean) => void; setError: (error: string | null) => void;
 }
 
+// Global AudioContext - CRITICAL: Only create once, never duplicate
+let globalAudioContext: AudioContext | null = null;
+let globalAudioSource: MediaElementAudioSourceNode | null = null;
+
 export const useRoomStore = create<RoomState>((set, get) => ({
   socket: null, player: null, audioElement: null,
   playlist: [], currentTrackIndex: 0, isPlaying: false,
@@ -1939,7 +1971,7 @@ export const useRoomStore = create<RoomState>((set, get) => ({
     if (syncInterval) clearInterval(syncInterval);
     if (clockSyncInterval) clearInterval(clockSyncInterval);
     player?.destroy();
-    audioElement?.pause();
+    if (audioElement) audioElement.pause();
     socket?.disconnect();
     set({ socket: null, syncInterval: null, clockSyncInterval: null, player: null, isAudioGraphConnected: false });
   },
@@ -1958,7 +1990,7 @@ export const useRoomStore = create<RoomState>((set, get) => ({
     if (isSeeking) return;
 
     if (state.trackIndex !== undefined && state.trackIndex !== currentTrackIndex) {
-        set({ currentTrackIndex: state.trackIndex, isPlaying: state.isPlaying }); // Sync isPlaying state on track change
+        set({ currentTrackIndex: state.trackIndex, isPlaying: state.isPlaying });
         const track = playlist[state.trackIndex];
         if (track?.isUpload && track.audioUrl && audioElement) { audioElement.src = track.audioUrl; audioElement.load(); }
         else if (track?.youtubeId && player) { player.cueVideoById(track.youtubeId); get().fetchLyrics(track.youtubeId); }
@@ -2001,8 +2033,12 @@ export const useRoomStore = create<RoomState>((set, get) => ({
     }
     
     if (state.isPlaying !== undefined && state.isPlaying !== isPlaying) {
-        if (isUpload && audioElement) { state.isPlaying ? audioElement.play().catch(()=>{}) : audioElement.pause(); }
-        else if (player) { state.isPlaying ? player.playVideo() : player.pauseVideo(); }
+        if (isUpload && audioElement) { 
+          state.isPlaying ? audioElement.play().catch(e => console.warn("Play failed:", e)) : audioElement.pause(); 
+        }
+        else if (player) { 
+          state.isPlaying ? player.playVideo() : player.pauseVideo(); 
+        }
         set({ isPlaying: state.isPlaying });
     }
   },
@@ -2021,6 +2057,12 @@ export const useRoomStore = create<RoomState>((set, get) => ({
   },
 
   initializePlayer: (domId) => {
+    // Guard: Only initialize once
+    if (get().audioElement && get().isAudioGraphConnected) {
+      console.log("Player already initialized, skipping duplicate initialization");
+      return;
+    }
+
     const audioEl = new Audio();
     audioEl.crossOrigin = 'anonymous';
     audioEl.addEventListener('timeupdate', () => { if (!get().isSeeking) set({ currentTime: audioEl.currentTime }); });
@@ -2030,28 +2072,76 @@ export const useRoomStore = create<RoomState>((set, get) => ({
     set({ audioElement: audioEl });
 
     try {
-        if (!get().isAudioGraphConnected) {
-            const audioContext = new (window.AudioContext || (window as any).webkitAudioContext)();
-            const source = audioContext.createMediaElementSource(audioEl);
-            const bass = audioContext.createBiquadFilter(); bass.type = 'lowshelf';
-            const mids = audioContext.createBiquadFilter(); mids.type = 'peaking';
-            const treble = audioContext.createBiquadFilter(); treble.type = 'highshelf';
-            source.connect(bass).connect(mids).connect(treble).connect(audioContext.destination);
-            set({ audioNodes: { context: audioContext, source, bass, mids, treble }, isAudioGraphConnected: true });
+        // CRITICAL FIX: Only create global context and source ONCE
+        if (!globalAudioContext) {
+            globalAudioContext = new (window.AudioContext || (window as any).webkitAudioContext)();
+            globalAudioSource = globalAudioContext.createMediaElementSource(audioEl);
+            
+            // Set up filter chain
+            const bass = globalAudioContext.createBiquadFilter(); 
+            bass.type = 'lowshelf';
+            bass.frequency.value = 200;
+            bass.gain.value = 0;
+            
+            const mids = globalAudioContext.createBiquadFilter(); 
+            mids.type = 'peaking';
+            mids.frequency.value = 2000;
+            mids.Q.value = 1;
+            mids.gain.value = 0;
+            
+            const treble = globalAudioContext.createBiquadFilter(); 
+            treble.type = 'highshelf';
+            treble.frequency.value = 5000;
+            treble.gain.value = 0;
+            
+            // Connect chain: source -> bass -> mids -> treble -> destination
+            globalAudioSource.connect(bass);
+            bass.connect(mids);
+            mids.connect(treble);
+            treble.connect(globalAudioContext.destination);
+            
+            set({ 
+              audioNodes: { 
+                context: globalAudioContext, 
+                source: globalAudioSource, 
+                bass, 
+                mids, 
+                treble 
+              }, 
+              isAudioGraphConnected: true 
+            });
+            
+            console.log("✅ AudioContext and filters initialized successfully");
         }
-    } catch (e) { console.error("Error setting up AudioContext:", e); }
+    } catch (e) { 
+      console.error("Error setting up AudioContext:", e); 
+    }
     
     const onPlayerStateChange = (e: any) => {
         const { isAdmin, isPlaying, nextTrack, _emitStateUpdate } = get();
         const newIsPlaying = e.data === window.YT.PlayerState.PLAYING;
-        set({ isPlaying: newIsPlaying }); // Update local state immediately for UI responsiveness
+        set({ isPlaying: newIsPlaying });
         if (isAdmin) {
             if (e.data === window.YT.PlayerState.ENDED) { nextTrack(); return; }
             if (newIsPlaying !== isPlaying) { _emitStateUpdate({ isPlaying: newIsPlaying }); }
         }
     };
 
-    window.onYouTubeIframeAPIReady = () => { new window.YT.Player(domId, { height: '0', width: '0', playerVars: { origin: window.location.origin, controls: 0, disablekb: 1 }, events: { onReady: (e: any) => set({ player: e.target }), onStateChange: onPlayerStateChange }, }); };
+    window.onYouTubeIframeAPIReady = () => { 
+      new window.YT.Player(domId, { 
+        height: '0', 
+        width: '0', 
+        playerVars: { 
+          origin: window.location.origin, 
+          controls: 0, 
+          disablekb: 1 
+        }, 
+        events: { 
+          onReady: (e: any) => set({ player: e.target }), 
+          onStateChange: onPlayerStateChange 
+        }, 
+      }); 
+    };
     if (window.YT?.Player) window.onYouTubeIframeAPIReady();
   },
 
@@ -2061,8 +2151,12 @@ export const useRoomStore = create<RoomState>((set, get) => ({
     const { isAdmin, isCollaborative, isPlaying, player, audioElement, playlist, currentTrackIndex } = get();
     if (!isAdmin && !isCollaborative) return;
     const isUpload = playlist[currentTrackIndex]?.isUpload;
-    if (isUpload && audioElement) { !isPlaying ? audioElement.play().catch(()=>{}) : audioElement.pause(); }
-    else if (player) { !isPlaying ? player.playVideo() : player.pauseVideo(); }
+    if (isUpload && audioElement) { 
+      !isPlaying ? audioElement.play().catch(e => console.warn("Play failed:", e)) : audioElement.pause(); 
+    }
+    else if (player) { 
+      !isPlaying ? player.playVideo() : player.pauseVideo(); 
+    }
     get()._emitStateUpdate({ isPlaying: !isPlaying });
   },
 
@@ -2097,13 +2191,68 @@ export const useRoomStore = create<RoomState>((set, get) => ({
   },
 
   setVolume: (volume) => { const { player, audioElement, isAdmin } = get(); if (audioElement) audioElement.volume = volume / 100; if (player?.setVolume) player.setVolume(volume); set({ volume }); if (isAdmin) get()._emitStateUpdate({ volume }); },
+  
   setEqualizer: (settings) => { const { audioNodes, isAdmin } = get(); if (audioNodes.bass) audioNodes.bass.gain.value = settings.bass; if (audioNodes.mids) audioNodes.mids.gain.value = settings.mids; if (audioNodes.treble) audioNodes.treble.gain.value = settings.treble; set({ equalizer: settings }); if (isAdmin) get()._emitStateUpdate({ equalizer: settings }); },
+  
   toggleCollaborative: () => { const { isAdmin, isCollaborative } = get(); if (isAdmin) { const newState = !isCollaborative; set({ isCollaborative: newState }); get()._emitStateUpdate({ isCollaborative: newState }); } },
   
-  primePlayer: () => { const { player, audioElement, audioNodes } = get(); if (audioNodes.context?.state === 'suspended') audioNodes.context.resume(); if (audioElement) { audioElement.volume = 0; audioElement.play().then(() => audioElement.pause()); } if (player?.playVideo) { player.mute(); player.playVideo(); setTimeout(() => { player.pauseVideo(); player.unMute(); }, 250); } },
-  fetchLyrics: async (youtubeId) => { try { const res = await fetch(`${API_URL}/api/lyrics/${youtubeId}`); if(res.ok) { const lines = await res.json(); set({ lyrics: { lines, isLoading: false } }); } } catch (e) { set({ lyrics: { lines: [], isLoading: false } }); } },
-  refreshPlaylist: async () => { const { roomCode, playlist } = get(); if (!roomCode) return; try { const res = await fetch(`${API_URL}/api/room/${roomCode}`); if (res.ok) { const data = await res.json(); if (JSON.stringify(data.playlist) !== JSON.stringify(playlist)) set({ playlist: data.playlist }); } } catch (e) {} },
-  uploadFile: async (file, title, artist) => { const { roomCode } = get(); const formData = new FormData(); formData.append('file', file); const res = await fetch(`${API_URL}/api/upload`, { method: 'POST', body: formData }); if (!res.ok) throw new Error('Upload failed'); const data = await res.json(); await fetch(`${API_URL}/api/room/${roomCode}/add-upload`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ filename: data.filename, title: title || file.name.replace(/\.[^/.]+$/, ''), artist: artist || 'Unknown Artist', audioUrl: data.audioUrl }) }); return data; },
+  primePlayer: () => { 
+    const { player, audioElement, audioNodes } = get(); 
+    if (audioNodes.context?.state === 'suspended') audioNodes.context.resume().catch(() => {}); 
+    if (audioElement) { 
+      audioElement.volume = 0; 
+      audioElement.play().catch(e => console.warn("Priming failed:", e)).then(() => audioElement.pause()); 
+    } 
+    if (player?.playVideo) { 
+      player.mute(); 
+      player.playVideo(); 
+      setTimeout(() => { player.pauseVideo(); player.unMute(); }, 250); 
+    } 
+  },
+  
+  fetchLyrics: async (youtubeId) => { 
+    try { 
+      const res = await fetch(`${API_URL}/api/lyrics/${youtubeId}`); 
+      if(res.ok) { 
+        const lines = await res.json(); 
+        set({ lyrics: { lines, isLoading: false } }); 
+      } 
+    } catch (e) { 
+      set({ lyrics: { lines: [], isLoading: false } }); 
+    } 
+  },
+  
+  refreshPlaylist: async () => { 
+    const { roomCode, playlist } = get(); 
+    if (!roomCode) return; 
+    try { 
+      const res = await fetch(`${API_URL}/api/room/${roomCode}`); 
+      if (res.ok) { 
+        const data = await res.json(); 
+        if (JSON.stringify(data.playlist) !== JSON.stringify(playlist)) set({ playlist: data.playlist }); 
+      } 
+    } catch (e) {} 
+  },
+  
+  uploadFile: async (file, title, artist) => { 
+    const { roomCode } = get(); 
+    const formData = new FormData(); 
+    formData.append('file', file); 
+    const res = await fetch(`${API_URL}/api/upload`, { method: 'POST', body: formData }); 
+    if (!res.ok) throw new Error('Upload failed'); 
+    const data = await res.json(); 
+    await fetch(`${API_URL}/api/room/${roomCode}/add-upload`, { 
+      method: 'POST', 
+      headers: { 'Content-Type': 'application/json' }, 
+      body: JSON.stringify({ 
+        filename: data.filename, 
+        title: title || file.name.replace(/\.[^/.]+$/, ''), 
+        artist: artist || 'Unknown Artist', 
+        audioUrl: data.audioUrl 
+      }) 
+    }); 
+    return data; 
+  },
 }));
 
 ### ./client/tailwind.config.ts ###

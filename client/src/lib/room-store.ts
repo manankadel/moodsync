@@ -3,11 +3,11 @@ import { io, Socket } from 'socket.io-client';
 
 const API_URL = process.env.NEXT_PUBLIC_API_URL || 'http://localhost:5001';
 
-const HARD_SYNC_THRESHOLD = 0.35;
+const HARD_SYNC_THRESHOLD = 0.3;
 const ADAPTIVE_RATE_THRESHOLD = 0.05;
-const PLAYBACK_RATE_ADJUST = 0.02;
-const SYNC_HEARTBEAT_INTERVAL = 1000;
-const CLOCK_SYNC_INTERVAL = 5000;
+const PLAYBACK_RATE_ADJUST = 0.015;
+const SYNC_HEARTBEAT_INTERVAL = 500;
+const CLOCK_SYNC_INTERVAL = 10000;
 
 interface Song { name: string; artist: string; albumArt: string | null; youtubeId?: string; isUpload?: boolean; audioUrl?: string; }
 interface User { name: string; isAdmin: boolean; }
@@ -23,6 +23,7 @@ interface RoomState {
   isSeeking: boolean; manualLatencyOffset: number; serverClockOffset: number; isAudioGraphConnected: boolean;
   syncInterval: NodeJS.Timeout | null; clockSyncInterval: NodeJS.Timeout | null;
   roomCode: string; playlistTitle: string; users: User[]; volume: number; isCollaborative: boolean; isLoading: boolean; error: string | null; isAdmin: boolean; username: string; equalizer: EqualizerSettings; audioNodes: AudioNodes; currentTime: number; lyrics: { lines: LyricLine[]; isLoading: boolean; };
+  playerReady: boolean; audioPrimed: boolean;
   connect: (roomCode: string, username: string) => void; disconnect: () => void; initializePlayer: (domId: string) => void;
   setPlaylistData: (title: string, playlist: Song[]) => void; playPause: () => void; nextTrack: () => void; prevTrack: () => void; selectTrack: (index: number) => void; setVolume: (volume: number) => void; setEqualizer: (settings: EqualizerSettings) => void; toggleCollaborative: () => void; setIsSeeking: (isSeeking: boolean) => void; setManualLatencyOffset: (offset: number) => void;
   _emitStateUpdate: (overrideState?: Partial<Omit<SyncState, 'serverTimestamp'>>) => void;
@@ -31,7 +32,6 @@ interface RoomState {
   setLoading: (loading: boolean) => void; setError: (error: string | null) => void;
 }
 
-// Global AudioContext - CRITICAL: Only create once, never duplicate
 let globalAudioContext: AudioContext | null = null;
 let globalAudioSource: MediaElementAudioSourceNode | null = null;
 
@@ -41,6 +41,7 @@ export const useRoomStore = create<RoomState>((set, get) => ({
   isSeeking: false, manualLatencyOffset: 0, serverClockOffset: 0, isAudioGraphConnected: false,
   syncInterval: null, clockSyncInterval: null,
   roomCode: '', playlistTitle: '', users: [], volume: 80, isCollaborative: false, isLoading: true, error: null, isAdmin: false, username: '', equalizer: { bass: 0, mids: 0, treble: 0 }, audioNodes: { context: null, source: null, bass: null, mids: null, treble: null }, currentTime: 0, lyrics: { lines: [], isLoading: false },
+  playerReady: false, audioPrimed: false,
   
   setLoading: (loading) => set({ isLoading: loading }),
   setError: (error) => set({ error, isLoading: false }),
@@ -49,18 +50,23 @@ export const useRoomStore = create<RoomState>((set, get) => ({
 
   connect: (roomCode, username) => {
     if (get().socket) return;
-    const socket = io(API_URL, { transports: ['websocket'] });
+    const socket = io(API_URL, { transports: ['websocket'], reconnection: true });
     set({ socket, username, roomCode });
+    
     socket.on('connect', () => {
-      console.log('✅ Connected with Enterprise Sync Engine');
+      console.log('✅ Connected to server');
       socket.emit('join_room', { room_code: roomCode, username });
       get()._syncClock();
       const clockInterval = setInterval(() => get()._syncClock(), CLOCK_SYNC_INTERVAL);
       set({ clockSyncInterval: clockInterval });
     });
-    socket.on('disconnect', () => get().disconnect());
+    
+    socket.on('disconnect', () => console.log('Disconnected from server'));
     socket.on('error', (data) => get().setError(data.message));
-    socket.on('update_user_list', (users: User[]) => { const self = users.find(u => u.name === get().username); set({ users, isAdmin: self?.isAdmin || false }); });
+    socket.on('update_user_list', (users: User[]) => { 
+      const self = users.find(u => u.name === get().username); 
+      set({ users, isAdmin: self?.isAdmin || false }); 
+    });
     socket.on('load_current_state', (state) => get().syncPlayerState(state));
     socket.on('sync_player_state', (state) => get().syncPlayerState(state));
     socket.on('refresh_playlist', () => get().refreshPlaylist());
@@ -70,30 +76,52 @@ export const useRoomStore = create<RoomState>((set, get) => ({
     const { socket, syncInterval, clockSyncInterval, player, audioElement } = get();
     if (syncInterval) clearInterval(syncInterval);
     if (clockSyncInterval) clearInterval(clockSyncInterval);
-    player?.destroy();
-    if (audioElement) audioElement.pause();
+    if (player?.destroy) player.destroy();
+    if (audioElement) { audioElement.pause(); audioElement.src = ''; }
     socket?.disconnect();
-    set({ socket: null, syncInterval: null, clockSyncInterval: null, player: null, isAudioGraphConnected: false });
+    set({ socket: null, syncInterval: null, clockSyncInterval: null, player: null });
   },
 
   _emitStateUpdate: (overrideState) => {
-    const { socket, roomCode, isPlaying, currentTrackIndex, isAdmin, isCollaborative, playlist, audioElement, player } = get();
+    const { socket, roomCode, isPlaying, currentTrackIndex, isAdmin, isCollaborative, playlist, audioElement, player, playerReady } = get();
     if (!isAdmin && !isCollaborative) return;
+    if (!playerReady) return;
+    
     let currentTime = 0;
-    try { currentTime = playlist[currentTrackIndex]?.isUpload && audioElement ? audioElement.currentTime : player?.getCurrentTime() || 0; } catch(e) {}
-    const stateToSend = { isPlaying, trackIndex: currentTrackIndex, currentTime, timestamp: Date.now() / 1000, ...overrideState };
+    try { 
+      const track = playlist[currentTrackIndex];
+      if (track?.isUpload && audioElement) {
+        currentTime = audioElement.currentTime || 0;
+      } else if (player?.getCurrentTime) {
+        currentTime = player.getCurrentTime() || 0;
+      }
+    } catch(e) { console.warn('Error getting current time:', e); }
+    
+    const stateToSend = { 
+      isPlaying, 
+      trackIndex: currentTrackIndex, 
+      currentTime, 
+      timestamp: Date.now() / 1000, 
+      ...overrideState 
+    };
     socket?.emit('update_player_state', { room_code: roomCode, state: stateToSend });
   },
   
   syncPlayerState: (state) => {
-    const { player, audioElement, playlist, currentTrackIndex, isPlaying, isSeeking, manualLatencyOffset, serverClockOffset } = get();
-    if (isSeeking) return;
+    const { player, audioElement, playlist, currentTrackIndex, isPlaying, isSeeking, manualLatencyOffset, serverClockOffset, playerReady } = get();
+    if (isSeeking || !playerReady) return;
 
     if (state.trackIndex !== undefined && state.trackIndex !== currentTrackIndex) {
-        set({ currentTrackIndex: state.trackIndex, isPlaying: state.isPlaying });
+        set({ currentTrackIndex: state.trackIndex });
         const track = playlist[state.trackIndex];
-        if (track?.isUpload && track.audioUrl && audioElement) { audioElement.src = track.audioUrl; audioElement.load(); }
-        else if (track?.youtubeId && player) { player.cueVideoById(track.youtubeId); get().fetchLyrics(track.youtubeId); }
+        
+        if (track?.isUpload && track.audioUrl && audioElement) { 
+          audioElement.src = track.audioUrl;
+          audioElement.load();
+        } else if (track?.youtubeId && player?.loadVideoById) { 
+          player.loadVideoById(track.youtubeId);
+          get().fetchLyrics(track.youtubeId);
+        }
     }
     
     const targetTrack = playlist[get().currentTrackIndex];
@@ -109,37 +137,61 @@ export const useRoomStore = create<RoomState>((set, get) => ({
         const projectedTime = state.currentTime + (state.isPlaying ? timeSinceUpdate : 0);
         let playerTime = 0;
         try {
-            const rawPlayerTime = isUpload && audioElement ? audioElement.currentTime : player?.getCurrentTime() || 0;
-            playerTime = rawPlayerTime - manualLatencyOffset;
+            if (isUpload && audioElement) {
+              playerTime = (audioElement.currentTime || 0) - manualLatencyOffset;
+            } else if (player?.getCurrentTime) {
+              playerTime = (player.getCurrentTime() || 0) - manualLatencyOffset;
+            }
         } catch(e) {}
+        
         const drift = projectedTime - playerTime;
 
-        if (player && typeof player.setPlaybackRate === 'function') {
+        if (player?.setPlaybackRate && !isUpload) {
             if (Math.abs(drift) > ADAPTIVE_RATE_THRESHOLD && Math.abs(drift) < HARD_SYNC_THRESHOLD) {
                 const newRate = 1.0 + (drift > 0 ? PLAYBACK_RATE_ADJUST : -PLAYBACK_RATE_ADJUST);
-                if (player.getPlaybackRate() !== newRate) player.setPlaybackRate(newRate);
-            } else {
-                if (player.getPlaybackRate() !== 1.0) player.setPlaybackRate(1.0);
+                if (Math.abs(player.getPlaybackRate() - newRate) > 0.001) {
+                  player.setPlaybackRate(newRate);
+                }
+            } else if (Math.abs(drift) < ADAPTIVE_RATE_THRESHOLD) {
+                if (Math.abs(player.getPlaybackRate() - 1.0) > 0.001) {
+                  player.setPlaybackRate(1.0);
+                }
             }
         }
         
         if (Math.abs(drift) > HARD_SYNC_THRESHOLD) {
             const seekTime = projectedTime + manualLatencyOffset;
-            if (isFinite(seekTime)) {
-                if (isUpload) target.currentTime = seekTime;
-                else target.seekTo(seekTime, true);
+            if (isFinite(seekTime) && seekTime >= 0) {
+                try {
+                  if (isUpload && audioElement) {
+                    audioElement.currentTime = seekTime;
+                  } else if (player?.seekTo) {
+                    player.seekTo(seekTime, true);
+                  }
+                } catch(e) { console.warn('Seek error:', e); }
             }
         }
     }
     
     if (state.isPlaying !== undefined && state.isPlaying !== isPlaying) {
-        if (isUpload && audioElement) { 
-          state.isPlaying ? audioElement.play().catch(e => console.warn("Play failed:", e)) : audioElement.pause(); 
-        }
-        else if (player) { 
-          state.isPlaying ? player.playVideo() : player.pauseVideo(); 
-        }
-        set({ isPlaying: state.isPlaying });
+        const newPlayState = state.isPlaying;
+        set({ isPlaying: newPlayState });
+        
+        try {
+          if (isUpload && audioElement) { 
+            if (newPlayState) {
+              audioElement.play().catch(e => console.warn("Play failed:", e));
+            } else {
+              audioElement.pause();
+            }
+          } else if (player) { 
+            if (newPlayState) {
+              player.playVideo();
+            } else {
+              player.pauseVideo();
+            }
+          }
+        } catch(e) { console.warn('Play/pause error:', e); }
     }
   },
 
@@ -157,9 +209,8 @@ export const useRoomStore = create<RoomState>((set, get) => ({
   },
 
   initializePlayer: (domId) => {
-    // Guard: Only initialize once
-    if (get().audioElement && get().isAudioGraphConnected) {
-      console.log("Player already initialized, skipping duplicate initialization");
+    if (get().isAudioGraphConnected) {
+      console.log("Player already initialized");
       return;
     }
 
@@ -172,12 +223,10 @@ export const useRoomStore = create<RoomState>((set, get) => ({
     set({ audioElement: audioEl });
 
     try {
-        // CRITICAL FIX: Only create global context and source ONCE
         if (!globalAudioContext) {
             globalAudioContext = new (window.AudioContext || (window as any).webkitAudioContext)();
             globalAudioSource = globalAudioContext.createMediaElementSource(audioEl);
             
-            // Set up filter chain
             const bass = globalAudioContext.createBiquadFilter(); 
             bass.type = 'lowshelf';
             bass.frequency.value = 200;
@@ -194,7 +243,6 @@ export const useRoomStore = create<RoomState>((set, get) => ({
             treble.frequency.value = 5000;
             treble.gain.value = 0;
             
-            // Connect chain: source -> bass -> mids -> treble -> destination
             globalAudioSource.connect(bass);
             bass.connect(mids);
             mids.connect(treble);
@@ -211,112 +259,197 @@ export const useRoomStore = create<RoomState>((set, get) => ({
               isAudioGraphConnected: true 
             });
             
-            console.log("✅ AudioContext and filters initialized successfully");
+            console.log("✅ AudioContext initialized");
         }
     } catch (e) { 
-      console.error("Error setting up AudioContext:", e); 
+      console.error("AudioContext error:", e); 
     }
     
+    const onPlayerReady = (e: any) => {
+      console.log('✅ YouTube player ready');
+      set({ player: e.target, playerReady: true });
+      const vol = get().volume;
+      if (e.target?.setVolume) e.target.setVolume(vol);
+    };
+
     const onPlayerStateChange = (e: any) => {
-        const { isAdmin, isPlaying, nextTrack, _emitStateUpdate } = get();
+        const { isAdmin, nextTrack, _emitStateUpdate, playerReady } = get();
+        if (!playerReady) return;
+        
         const newIsPlaying = e.data === window.YT.PlayerState.PLAYING;
-        set({ isPlaying: newIsPlaying });
-        if (isAdmin) {
-            if (e.data === window.YT.PlayerState.ENDED) { nextTrack(); return; }
-            if (newIsPlaying !== isPlaying) { _emitStateUpdate({ isPlaying: newIsPlaying }); }
+        
+        if (e.data === window.YT.PlayerState.ENDED && isAdmin) { 
+          nextTrack(); 
+          return; 
+        }
+        
+        if (isAdmin && get().isPlaying !== newIsPlaying) {
+          set({ isPlaying: newIsPlaying });
+          _emitStateUpdate({ isPlaying: newIsPlaying });
         }
     };
 
     window.onYouTubeIframeAPIReady = () => { 
-      new window.YT.Player(domId, { 
+      const ytPlayer = new window.YT.Player(domId, { 
         height: '0', 
         width: '0', 
         playerVars: { 
-          origin: window.location.origin, 
           controls: 0, 
-          disablekb: 1 
+          disablekb: 1,
+          enablejsapi: 1,
+          playsinline: 1
         }, 
         events: { 
-          onReady: (e: any) => set({ player: e.target }), 
+          onReady: onPlayerReady, 
           onStateChange: onPlayerStateChange 
         }, 
       }); 
     };
+    
     if (window.YT?.Player) window.onYouTubeIframeAPIReady();
   },
 
-  setPlaylistData: (title, playlist) => { set({ playlistTitle: title, playlist, isLoading: false, error: null }); if (playlist.length > 0 && playlist[0].youtubeId) get().fetchLyrics(playlist[0].youtubeId); },
+  setPlaylistData: (title, playlist) => { 
+    set({ playlistTitle: title, playlist, isLoading: false, error: null }); 
+    if (playlist.length > 0 && playlist[0].youtubeId) get().fetchLyrics(playlist[0].youtubeId); 
+  },
   
   playPause: () => {
-    const { isAdmin, isCollaborative, isPlaying, player, audioElement, playlist, currentTrackIndex } = get();
+    const { isAdmin, isCollaborative, isPlaying, player, audioElement, playlist, currentTrackIndex, playerReady, audioPrimed } = get();
     if (!isAdmin && !isCollaborative) return;
-    const isUpload = playlist[currentTrackIndex]?.isUpload;
-    if (isUpload && audioElement) { 
-      !isPlaying ? audioElement.play().catch(e => console.warn("Play failed:", e)) : audioElement.pause(); 
+    if (!playerReady) return;
+    
+    const track = playlist[currentTrackIndex];
+    const isUpload = track?.isUpload;
+    
+    if (!audioPrimed) {
+      get().primePlayer();
+      set({ audioPrimed: true });
+      setTimeout(() => get().playPause(), 300);
+      return;
     }
-    else if (player) { 
-      !isPlaying ? player.playVideo() : player.pauseVideo(); 
+    
+    try {
+      if (isUpload && audioElement) { 
+        if (!isPlaying) {
+          audioElement.play().catch(e => console.warn("Play failed:", e)); 
+        } else {
+          audioElement.pause();
+        }
+      } else if (player) { 
+        if (!isPlaying) {
+          player.playVideo();
+        } else {
+          player.pauseVideo();
+        }
+      }
+      get()._emitStateUpdate({ isPlaying: !isPlaying });
+    } catch(e) {
+      console.error('Play/pause error:', e);
     }
-    get()._emitStateUpdate({ isPlaying: !isPlaying });
   },
 
   nextTrack: () => {
     const { isAdmin, isCollaborative, currentTrackIndex, playlist, player, audioElement } = get();
     if (!isAdmin && !isCollaborative) return;
     const newIndex = (currentTrackIndex + 1) % playlist.length;
-    player?.stopVideo();
+    if (player?.stopVideo) player.stopVideo();
     if (audioElement) { audioElement.pause(); audioElement.src = ''; }
-    get()._emitStateUpdate({ trackIndex: newIndex, currentTime: 0 });
+    get()._emitStateUpdate({ trackIndex: newIndex, currentTime: 0, isPlaying: false });
   },
 
   prevTrack: () => {
     const { isAdmin, isCollaborative, currentTrackIndex, playlist, player, audioElement } = get();
     if (!isAdmin && !isCollaborative) return;
     const newIndex = (currentTrackIndex - 1 + playlist.length) % playlist.length;
-    player?.stopVideo();
+    if (player?.stopVideo) player.stopVideo();
     if (audioElement) { audioElement.pause(); audioElement.src = ''; }
-    get()._emitStateUpdate({ trackIndex: newIndex, currentTime: 0 });
+    get()._emitStateUpdate({ trackIndex: newIndex, currentTime: 0, isPlaying: false });
   },
 
   selectTrack: (index) => {
     const { isAdmin, isCollaborative, currentTrackIndex, player, audioElement } = get();
     if (!isAdmin && !isCollaborative) return;
     if (index !== currentTrackIndex) {
-        player?.stopVideo();
+        if (player?.stopVideo) player.stopVideo();
         if (audioElement) { audioElement.pause(); audioElement.src = ''; }
-        get()._emitStateUpdate({ trackIndex: index, currentTime: 0 });
+        get()._emitStateUpdate({ trackIndex: index, currentTime: 0, isPlaying: false });
     } else {
         get().playPause();
     }
   },
 
-  setVolume: (volume) => { const { player, audioElement, isAdmin } = get(); if (audioElement) audioElement.volume = volume / 100; if (player?.setVolume) player.setVolume(volume); set({ volume }); if (isAdmin) get()._emitStateUpdate({ volume }); },
+  setVolume: (volume) => { 
+    const { player, audioElement, isAdmin } = get(); 
+    if (audioElement) audioElement.volume = volume / 100; 
+    if (player?.setVolume) player.setVolume(volume); 
+    set({ volume }); 
+    if (isAdmin) get()._emitStateUpdate({ volume }); 
+  },
   
-  setEqualizer: (settings) => { const { audioNodes, isAdmin } = get(); if (audioNodes.bass) audioNodes.bass.gain.value = settings.bass; if (audioNodes.mids) audioNodes.mids.gain.value = settings.mids; if (audioNodes.treble) audioNodes.treble.gain.value = settings.treble; set({ equalizer: settings }); if (isAdmin) get()._emitStateUpdate({ equalizer: settings }); },
+  setEqualizer: (settings) => { 
+    const { audioNodes, isAdmin } = get(); 
+    if (audioNodes.bass) audioNodes.bass.gain.value = settings.bass; 
+    if (audioNodes.mids) audioNodes.mids.gain.value = settings.mids; 
+    if (audioNodes.treble) audioNodes.treble.gain.value = settings.treble; 
+    set({ equalizer: settings }); 
+    if (isAdmin) get()._emitStateUpdate({ equalizer: settings }); 
+  },
   
-  toggleCollaborative: () => { const { isAdmin, isCollaborative } = get(); if (isAdmin) { const newState = !isCollaborative; set({ isCollaborative: newState }); get()._emitStateUpdate({ isCollaborative: newState }); } },
+  toggleCollaborative: () => { 
+    const { isAdmin, isCollaborative } = get(); 
+    if (isAdmin) { 
+      const newState = !isCollaborative; 
+      set({ isCollaborative: newState }); 
+      get()._emitStateUpdate({ isCollaborative: newState }); 
+    } 
+  },
   
   primePlayer: () => { 
     const { player, audioElement, audioNodes } = get(); 
-    if (audioNodes.context?.state === 'suspended') audioNodes.context.resume().catch(() => {}); 
+    
+    if (audioNodes.context?.state === 'suspended') {
+      audioNodes.context.resume().catch(e => console.warn('Resume failed:', e)); 
+    }
+    
     if (audioElement) { 
-      audioElement.volume = 0; 
-      audioElement.play().catch(e => console.warn("Priming failed:", e)).then(() => audioElement.pause()); 
+      const originalVolume = audioElement.volume;
+      audioElement.volume = 0.01; 
+      const playPromise = audioElement.play();
+      if (playPromise) {
+        playPromise
+          .then(() => {
+            setTimeout(() => {
+              audioElement.pause();
+              audioElement.currentTime = 0;
+              audioElement.volume = originalVolume;
+            }, 100);
+          })
+          .catch(e => console.warn("Audio prime failed:", e));
+      }
     } 
+    
     if (player?.playVideo) { 
-      player.mute(); 
+      const originalVol = player.getVolume?.() || 80;
+      player.setVolume(1);
       player.playVideo(); 
-      setTimeout(() => { player.pauseVideo(); player.unMute(); }, 250); 
+      setTimeout(() => { 
+        player.pauseVideo(); 
+        player.setVolume(originalVol);
+      }, 100); 
     } 
   },
   
   fetchLyrics: async (youtubeId) => { 
+    set({ lyrics: { lines: [], isLoading: true } });
     try { 
       const res = await fetch(`${API_URL}/api/lyrics/${youtubeId}`); 
       if(res.ok) { 
         const lines = await res.json(); 
         set({ lyrics: { lines, isLoading: false } }); 
-      } 
+      } else {
+        set({ lyrics: { lines: [], isLoading: false } });
+      }
     } catch (e) { 
       set({ lyrics: { lines: [], isLoading: false } }); 
     } 
@@ -329,9 +462,11 @@ export const useRoomStore = create<RoomState>((set, get) => ({
       const res = await fetch(`${API_URL}/api/room/${roomCode}`); 
       if (res.ok) { 
         const data = await res.json(); 
-        if (JSON.stringify(data.playlist) !== JSON.stringify(playlist)) set({ playlist: data.playlist }); 
+        if (JSON.stringify(data.playlist) !== JSON.stringify(playlist)) {
+          set({ playlist: data.playlist });
+        }
       } 
-    } catch (e) {} 
+    } catch (e) { console.warn('Refresh playlist error:', e); } 
   },
   
   uploadFile: async (file, title, artist) => { 
