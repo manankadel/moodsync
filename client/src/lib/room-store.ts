@@ -4,15 +4,10 @@ import { io, Socket } from 'socket.io-client';
 const API_URL = process.env.NEXT_PUBLIC_API_URL || 'http://localhost:5001';
 
 // --- Synchronization Constants ---
-// If a client's audio drift exceeds this value (in seconds), perform a hard seek to catch up.
 const HARD_SYNC_THRESHOLD = 0.25; 
-// If drift is smaller than the hard threshold but larger than this, adjust playback rate.
 const ADAPTIVE_RATE_THRESHOLD = 0.05; 
-// The maximum rate adjustment to apply (e.g., 1.5% faster or slower).
 const PLAYBACK_RATE_ADJUST = 0.015; 
-// How often the admin sends out state updates (in milliseconds).
 const SYNC_HEARTBEAT_INTERVAL = 500;
-// How often to resynchronize the local clock with the server's clock (in milliseconds).
 const CLOCK_SYNC_INTERVAL = 10000;
 
 interface Song { name: string; artist: string; albumArt: string | null; youtubeId?: string; isUpload?: boolean; audioUrl?: string; }
@@ -132,26 +127,40 @@ export const useRoomStore = create<RoomState>((set, get) => ({
   },
   
   syncPlayerState: (state) => {
-    const { player, audioElement, playlist, currentTrackIndex, isPlaying, isSeeking, manualLatencyOffset, serverClockOffset, playerReady, volume } = get();
+    const { player, audioElement, playlist, currentTrackIndex, isPlaying, isSeeking, manualLatencyOffset, serverClockOffset, playerReady, volume, isAdmin, nextTrack } = get();
     if (isSeeking || !playerReady) return;
 
     if (state.trackIndex !== undefined && state.trackIndex !== currentTrackIndex) {
         set({ currentTrackIndex: state.trackIndex });
         const track = playlist[state.trackIndex];
+
+        if (!track) {
+            console.error(`Error: Track at index ${state.trackIndex} is undefined. Skipping.`);
+            if (isAdmin) nextTrack();
+            return;
+        }
         
-        if (track?.isUpload && track.audioUrl && audioElement) { 
-          audioElement.src = track.audioUrl;
-          audioElement.volume = volume / 100;
-          audioElement.load();
-        } else if (track?.youtubeId && player?.loadVideoById) { 
-          player.loadVideoById(track.youtubeId);
-          player.setVolume(volume);
-          get().fetchLyrics(track.youtubeId);
+        // FIX: Add null check for audioElement to satisfy TypeScript
+        if (track.isUpload && track.audioUrl && audioElement) {
+            audioElement.src = track.audioUrl;
+            audioElement.volume = volume / 100;
+            audioElement.load();
+        } else if (track.youtubeId) {
+            player.loadVideoById(track.youtubeId);
+            player.setVolume(volume);
+            get().fetchLyrics(track.youtubeId);
+        } else {
+            console.error(`Track ${track.name} has no playable source. Skipping.`);
+            if (isAdmin) {
+                setTimeout(() => nextTrack(), 500);
+            }
+            return;
         }
     }
     
     const targetTrack = playlist[get().currentTrackIndex];
-    const isUpload = targetTrack?.isUpload;
+    if (!targetTrack) return;
+    const isUpload = targetTrack.isUpload;
     const target = isUpload ? audioElement : player;
     if (!target) return;
 
@@ -262,14 +271,16 @@ export const useRoomStore = create<RoomState>((set, get) => ({
     const audioEl = new Audio();
     audioEl.crossOrigin = 'anonymous';
     audioEl.addEventListener('timeupdate', () => { if (!get().isSeeking) set({ currentTime: audioEl.currentTime }); });
-    audioEl.addEventListener('play', () => { 
-      if (get().isAdmin) set({ isPlaying: true }); 
-    });
-    audioEl.addEventListener('pause', () => { 
-      if (get().isAdmin) set({ isPlaying: false }); 
-    });
+    audioEl.addEventListener('play', () => { if (get().isAdmin) set({ isPlaying: true }); });
+    audioEl.addEventListener('pause', () => { if (get().isAdmin) set({ isPlaying: false }); });
     audioEl.addEventListener('ended', () => { if (get().isAdmin) get().nextTrack(); });
-    audioEl.addEventListener('error', (e) => console.error('Audio error:', e));
+    audioEl.addEventListener('error', (e) => {
+        console.error('Audio element error:', e);
+        if(get().isAdmin) {
+            console.log("Audio error, admin skipping to next track.");
+            setTimeout(() => get().nextTrack(), 500);
+        }
+    });
     set({ audioElement: audioEl });
 
     try {
@@ -278,42 +289,18 @@ export const useRoomStore = create<RoomState>((set, get) => ({
             globalAudioSource = globalAudioContext.createMediaElementSource(audioEl);
             
             const bass = globalAudioContext.createBiquadFilter(); 
-            bass.type = 'lowshelf';
-            bass.frequency.value = 200;
-            bass.gain.value = 0;
-            
+            bass.type = 'lowshelf'; bass.frequency.value = 200; bass.gain.value = 0;
             const mids = globalAudioContext.createBiquadFilter(); 
-            mids.type = 'peaking';
-            mids.frequency.value = 2000;
-            mids.Q.value = 1;
-            mids.gain.value = 0;
-            
+            mids.type = 'peaking'; mids.frequency.value = 2000; mids.Q.value = 1; mids.gain.value = 0;
             const treble = globalAudioContext.createBiquadFilter(); 
-            treble.type = 'highshelf';
-            treble.frequency.value = 5000;
-            treble.gain.value = 0;
+            treble.type = 'highshelf'; treble.frequency.value = 5000; treble.gain.value = 0;
             
-            globalAudioSource.connect(bass);
-            bass.connect(mids);
-            mids.connect(treble);
-            treble.connect(globalAudioContext.destination);
+            globalAudioSource.connect(bass); bass.connect(mids); mids.connect(treble); treble.connect(globalAudioContext.destination);
             
-            set({ 
-              audioNodes: { 
-                context: globalAudioContext, 
-                source: globalAudioSource, 
-                bass, 
-                mids, 
-                treble 
-              }, 
-              isAudioGraphConnected: true 
-            });
-            
+            set({ audioNodes: { context: globalAudioContext, source: globalAudioSource, bass, mids, treble }, isAudioGraphConnected: true });
             console.log("✅ AudioContext initialized");
         }
-    } catch (e) { 
-      console.error("AudioContext error:", e); 
-    }
+    } catch (e) { console.error("AudioContext error:", e); }
     
     const onPlayerReady = (e: any) => {
       console.log('✅ YouTube player ready');
@@ -325,14 +312,8 @@ export const useRoomStore = create<RoomState>((set, get) => ({
     const onPlayerStateChange = (e: any) => {
         const { isAdmin, nextTrack, _emitStateUpdate, playerReady } = get();
         if (!playerReady) return;
-        
         const newIsPlaying = e.data === window.YT.PlayerState.PLAYING;
-        
-        if (e.data === window.YT.PlayerState.ENDED && isAdmin) { 
-          nextTrack(); 
-          return; 
-        }
-        
+        if (e.data === window.YT.PlayerState.ENDED && isAdmin) { nextTrack(); return; }
         if (isAdmin && get().isPlaying !== newIsPlaying) {
           set({ isPlaying: newIsPlaying });
           setTimeout(() => _emitStateUpdate({ isPlaying: newIsPlaying }), 100);
@@ -342,30 +323,18 @@ export const useRoomStore = create<RoomState>((set, get) => ({
     const onPlayerError = (e: any) => {
       console.error('YouTube player error:', e.data);
       if (get().isAdmin) {
+        console.log("YouTube error, admin skipping to next track.");
         setTimeout(() => get().nextTrack(), 1000);
       }
     };
 
     window.onYouTubeIframeAPIReady = () => { 
       new window.YT.Player(domId, { 
-        height: '0', 
-        width: '0', 
-        playerVars: { 
-          controls: 0, 
-          disablekb: 1,
-          enablejsapi: 1,
-          playsinline: 1,
-          // CRITICAL: This origin must match your frontend URL in production
-          origin: window.location.origin
-        }, 
-        events: { 
-          onReady: onPlayerReady, 
-          onStateChange: onPlayerStateChange,
-          onError: onPlayerError
-        }, 
+        height: '0', width: '0', 
+        playerVars: { controls: 0, disablekb: 1, enablejsapi: 1, playsinline: 1, origin: window.location.origin }, 
+        events: { onReady: onPlayerReady, onStateChange: onPlayerStateChange, onError: onPlayerError }, 
       }); 
     };
-    
     if (window.YT?.Player) window.onYouTubeIframeAPIReady();
   },
 
@@ -376,43 +345,22 @@ export const useRoomStore = create<RoomState>((set, get) => ({
   
   playPause: () => {
     const { isAdmin, isCollaborative, isPlaying, player, audioElement, playlist, currentTrackIndex, playerReady, contextUnlocked, audioNodes } = get();
-    if (!isAdmin && !isCollaborative) return;
-    if (!playerReady) return;
+    if (!isAdmin && !isCollaborative || !playerReady) return;
     
-    // Unlock audio context on first interaction
     if (!contextUnlocked && audioNodes.context) {
       if (audioNodes.context.state === 'suspended') {
-        audioNodes.context.resume().then(() => {
-          console.log('✅ AudioContext unlocked');
-          set({ contextUnlocked: true });
-        });
-      } else {
-        set({ contextUnlocked: true });
-      }
+        audioNodes.context.resume().then(() => set({ contextUnlocked: true }));
+      } else { set({ contextUnlocked: true }); }
     }
     
     const track = playlist[currentTrackIndex];
-    const isUpload = track?.isUpload;
+    if (!track) return;
     
     try {
-      if (isUpload && audioElement) { 
-        if (!isPlaying) {
-          audioElement.play().catch(e => {
-            console.warn("Play failed:", e);
-            // Try to unlock context again
-            if (audioNodes.context?.state === 'suspended') {
-              audioNodes.context.resume();
-            }
-          }); 
-        } else {
-          audioElement.pause();
-        }
+      if (track.isUpload && audioElement) { 
+        isPlaying ? audioElement.pause() : audioElement.play().catch(e => console.error("Audio play failed", e));
       } else if (player) { 
-        if (!isPlaying) {
-          player.playVideo();
-        } else {
-          player.pauseVideo();
-        }
+        isPlaying ? player.pauseVideo() : player.playVideo();
       }
       
       const newState = !isPlaying;
@@ -444,8 +392,16 @@ export const useRoomStore = create<RoomState>((set, get) => ({
   },
 
   selectTrack: (index) => {
-    const { isAdmin, isCollaborative, currentTrackIndex, player, audioElement } = get();
+    const { isAdmin, isCollaborative, currentTrackIndex, player, audioElement, playlist } = get();
     if (!isAdmin && !isCollaborative) return;
+    
+    const track = playlist[index];
+    if (!track || (!track.youtubeId && !track.audioUrl)) {
+        console.warn(`Attempted to select an invalid track at index ${index}.`);
+        if(isAdmin) get().nextTrack();
+        return;
+    }
+    
     if (index !== currentTrackIndex) {
         if (player?.stopVideo) player.stopVideo();
         if (audioElement) { audioElement.pause(); audioElement.src = ''; }
@@ -484,8 +440,6 @@ export const useRoomStore = create<RoomState>((set, get) => ({
   
   primePlayer: () => { 
     const { audioNodes } = get(); 
-    
-    // Only unlock AudioContext, don't touch players
     if (audioNodes.context?.state === 'suspended') {
       audioNodes.context.resume()
         .then(() => {
