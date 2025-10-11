@@ -8,26 +8,26 @@ import Player from '@/components/player';
 import { useRoomStore } from '@/lib/room-store';
 import { shallow } from 'zustand/shallow';
 import { Crown, Copy, Link as LinkIcon, Upload, WifiOff } from 'lucide-react';
-import WaveButton from '@/components/ui/WaveButton';
 import FileUploadModal from '@/components/FileUploadModal';
+import WaveButton from '@/components/ui/WaveButton';
 
 const API_URL = process.env.NEXT_PUBLIC_API_URL || 'http://localhost:5001';
 
 const MemoizedPlayer = memo(Player);
 
-const UsernameModal = ({ onSubmit }: { onSubmit: (name: string) => void }) => {
-  const [name, setName] = useState('');
-  return (
-    <motion.div initial={{ opacity: 0 }} animate={{ opacity: 1 }} exit={{ opacity: 0 }} className="fixed inset-0 z-50 bg-black/80 backdrop-blur-sm flex items-center justify-center p-4">
-      <motion.div initial={{ scale: 0.9, opacity: 0 }} animate={{ scale: 1, opacity: 1 }} transition={{ delay: 0.2 }} className="bg-black/50 border border-white/10 rounded-xl p-8 shadow-2xl w-full max-w-sm">
-        <h2 className="text-2xl font-semibold text-white mb-6 text-center">Enter Your Name</h2>
-        <form className="flex flex-col gap-4" onSubmit={(e) => { e.preventDefault(); if (name.trim()) onSubmit(name.trim()); }}>
-          <input type="text" value={name} onChange={(e) => setName(e.target.value)} placeholder="Your display name..." className="w-full rounded-md border border-white/10 bg-white/5 px-4 py-3 text-white text-center outline-none focus:border-cyan-400/50" autoFocus />
-          <WaveButton text="Enter Sonic Space" type="submit" disabled={!name.trim()} />
-        </form>
-      </motion.div>
-    </motion.div>
-  );
+const UsernameModal = ( { onSubmit }: { onSubmit: (name: string) => void }) => {
+    const [name, setName] = useState('');
+    return (
+        <motion.div initial={{ opacity: 0 }} animate={{ opacity: 1 }} className="fixed inset-0 z-50 bg-black/80 flex items-center justify-center p-4">
+          <motion.div initial={{ scale: 0.9 }} animate={{ scale: 1 }} className="bg-black/50 border border-white/10 rounded-xl p-8 w-full max-w-sm">
+            <h2 className="text-2xl font-semibold mb-6 text-center">Enter Your Name</h2>
+            <form onSubmit={(e) => { e.preventDefault(); if (name.trim()) onSubmit(name.trim()); }} className="flex flex-col gap-4">
+              <input type="text" value={name} onChange={(e) => setName(e.target.value)} placeholder="Your display name..." className="w-full rounded-md border-white/10 bg-white/5 p-3 text-center" autoFocus />
+              <WaveButton text="Enter Sonic Space" type="submit" disabled={!name.trim()} />
+            </form>
+          </motion.div>
+        </motion.div>
+    );
 };
 
 const DisconnectedOverlay = () => (
@@ -41,33 +41,34 @@ const RoomSidebar = memo(function RoomSidebar({ roomCode, onOpenUpload }: { room
     const [copied, setCopied] = useState(false);
     const copyToClipboard = () => {
         navigator.clipboard.writeText(`${window.location.protocol}//${window.location.host}/room/${roomCode}`);
-        setCopied(true); setTimeout(() => setCopied(false), 2000);
+        setCopied(true);
+        setTimeout(() => setCopied(false), 2000);
     };
 
     return (
         <aside className="hidden lg:flex flex-col gap-8 sticky top-8">
-            <motion.div initial={{opacity: 0, x: 20}} animate={{opacity: 1, x: 0}} transition={{delay: 0.5}}>
+            <motion.div initial={{opacity: 0, x: 20}} animate={{opacity: 1, x: 0}}>
                 <h2 className="text-sm font-light text-gray-400 mb-2">Share This Space</h2>
                 <div className="flex items-center gap-2 p-3 rounded-lg bg-white/5 border border-white/10">
                     <LinkIcon size={16} className="text-gray-500" />
-                    <span className="font-mono text-sm font-semibold tracking-wide text-gray-400 truncate">{`${window.location.host}/room/${roomCode}`}</span>
+                    <span className="font-mono text-sm font-semibold text-gray-400 truncate">{`${window.location.host}/room/${roomCode}`}</span>
                     <button onClick={copyToClipboard} className="ml-auto p-2 rounded-md hover:bg-white/10" title="Copy link"><Copy size={16} className={copied ? "text-cyan-400" : "text-gray-400"} /></button>
                 </div>
                 {copied && <p className="text-xs text-cyan-400 mt-2 animate-pulse">Link copied!</p>}
             </motion.div>
-            <motion.div initial={{opacity: 0, x: 20}} animate={{opacity: 1, x: 0}} transition={{delay: 0.6}}>
+            <motion.div initial={{opacity: 0, x: 20}} animate={{opacity: 1, x: 0}}>
                 <h2 className="text-sm font-light text-gray-400 mb-3">In The Room ({users.length})</h2>
                 <div className="space-y-2 max-h-64 overflow-y-auto pr-2">
                     {users.map((user, idx) => (
-                        <div key={`${user.name}-${idx}`} className="flex items-center gap-3 p-2 rounded-md bg-white/5">
-                            <span className="text-sm text-white truncate">{user.name}</span>
+                        <div key={idx} className="flex items-center gap-3 p-2 rounded-md bg-white/5">
+                            <span className="text-sm truncate">{user.name}</span>
                             {user.isAdmin && <Crown size={14} className="ml-auto text-amber-400 flex-shrink-0" />}
                         </div>
                     ))}
                 </div>
             </motion.div>
             {isAdmin && (
-                <motion.div initial={{opacity: 0, x: 20}} animate={{opacity: 1, x: 0}} transition={{delay: 0.7}}>
+                <motion.div initial={{opacity: 0, x: 20}} animate={{opacity: 1, x: 0}}>
                     <h2 className="text-sm font-light text-gray-400 mb-3">Admin Controls</h2>
                     <button onClick={onOpenUpload} className="w-full p-4 rounded-lg bg-gradient-to-r from-purple-500/20 to-pink-500/20 border border-purple-400/30 hover:border-purple-400/50 flex items-center justify-center gap-2 text-white font-medium"><Upload size={18} />Upload Music</button>
                 </motion.div>
@@ -75,6 +76,7 @@ const RoomSidebar = memo(function RoomSidebar({ roomCode, onOpenUpload }: { room
         </aside>
     );
 });
+
 
 export default function RoomPage() {
   const params = useParams();
@@ -85,65 +87,73 @@ export default function RoomPage() {
   const state = useRoomStore();
   const currentTrack = state.playlist[state.currentTrackIndex];
 
-  useEffect(() => { return () => { state.disconnect() }; }, [state.disconnect]);
-
   useEffect(() => {
-    if (!roomCode || showNameModal) return;
-    const fetchRoomData = async () => {
-      state.setLoading(true);
-      try {
-        const res = await fetch(`${API_URL}/api/room/${roomCode}`);
-        if (!res.ok) throw new Error('Room not found.');
-        const data = await res.json();
-        state.setRoomData(data);
-      } catch (err) { state.setError(err instanceof Error ? err.message : 'An unknown error occurred.'); }
+    if (!roomCode) return;
+    const initialConnect = (name: string) => {
+        state.primePlayer();
+        state.connect(roomCode, name);
     };
-    fetchRoomData();
-  }, [roomCode, showNameModal, state.setLoading, state.setError, state.setRoomData]);
 
+    if (!showNameModal && !state.socket) {
+        initialConnect("Guest");
+    }
+
+    return () => state.disconnect();
+  }, [roomCode, showNameModal, state.connect, state.disconnect, state.primePlayer, state.socket]);
+  
+  useEffect(() => {
+    if (!roomCode || showNameModal || !state.socket) return;
+    state.setLoading(true);
+    fetch(`${API_URL}/api/room/${roomCode}`)
+      .then(res => res.ok ? res.json() : Promise.reject(new Error('Room not found.')))
+      .then(data => state.setRoomData(data))
+      .catch(err => state.setError(err.message || 'An unknown error occurred.'));
+  }, [roomCode, showNameModal, state.socket]);
+  
   const handleNameSubmit = (name: string) => {
-    if (roomCode) { state.primePlayer(); state.connect(roomCode, name); setShowNameModal(false); }
+    setShowNameModal(false);
+    state.connect(roomCode, name);
+    state.primePlayer(); 
   };
   
-  if (showNameModal) return <AnimatePresence><UsernameModal onSubmit={handleNameSubmit} /></AnimatePresence>;
-  if (state.isLoading) return <main className="flex min-h-screen items-center justify-center bg-black"><p className="text-gray-400">Loading...</p></main>;
-  if (state.error) return <main className="flex min-h-screen flex-col items-center justify-center bg-black p-8 text-center"><h1 className="text-3xl text-red-500">Error</h1><p className="mt-2 text-gray-400">{state.error}</p><Link href="/" className="mt-8 text-cyan-400">&larr; Home</Link></main>;
+  if (showNameModal) return <UsernameModal onSubmit={handleNameSubmit} />;
+  if (state.isLoading) return <main className="flex min-h-screen items-center justify-center bg-black"><p>Loading Room...</p></main>;
+  if (state.error) return <main className="flex min-h-screen items-center justify-center bg-black p-4 text-center"><p>{state.error}</p></main>;
 
   return (
-    <div className="min-h-screen bg-black text-white overflow-hidden">
-      <div className="absolute inset-0 bg-black/70" />
-      <main className="relative z-10 grid grid-cols-1 lg:grid-cols-[2fr_1fr] gap-8 max-w-7xl mx-auto p-4 sm:p-8 h-screen">
-        <div className="flex flex-col h-full pt-8 pb-32">
-          <motion.div initial={{ opacity: 0 }} animate={{ opacity: 1 }}><h1 className="text-3xl font-bold text-white">{state.playlistTitle}</h1></motion.div>
-          <motion.ul className="mt-8 space-y-2 pr-4 -mr-4 flex-1 overflow-y-auto">
+    <div className="min-h-screen bg-black text-white">
+      <div className="absolute inset-0 bg-black/70 z-[-1]" />
+      <main className="grid grid-cols-1 lg:grid-cols-[1fr_350px] gap-4 md:gap-8 max-w-7xl mx-auto p-4 sm:p-8 min-h-screen">
+        <div className="flex flex-col pt-4 md:pt-8 lg:pb-32 pb-48">
+          <motion.div initial={{ opacity: 0 }} animate={{ opacity: 1 }} className="mb-4 md:mb-8">
+            <h1 className="text-2xl sm:text-3xl md:text-4xl font-bold">{state.playlistTitle}</h1>
+            {state.isAdmin && (
+                <div className='lg:hidden mt-4'>
+                    <button onClick={() => setShowUploadModal(true)} className="p-2 bg-purple-500 rounded-md text-sm flex items-center gap-2"><Upload size={16} /> Upload Music</button>
+                </div>
+            )}
+          </motion.div>
+          <ul className="space-y-2 overflow-y-auto">
             {state.playlist.map((song, index) => (
-              <motion.li key={`${song.audioUrl || index}`} onClick={() => state.selectTrack(index)} className={`relative flex items-center gap-4 p-3 rounded-lg border ${(state.isAdmin) ? 'cursor-pointer' : 'cursor-default'} ${state.currentTrackIndex === index ? 'bg-white/10 border-white/20' : 'bg-transparent border-transparent hover:bg-white/5'}`}>
-                <AnimatePresence>{state.currentTrackIndex === index && (<motion.div layoutId="playing-indicator" className="absolute inset-0 rounded-lg border-2 border-cyan-400"/>)}</AnimatePresence>
-                <div className="relative h-12 w-12 rounded-md bg-gray-800 flex-shrink-0 flex items-center justify-center text-gray-500 text-2xl">🎵</div>
-                <div className="relative flex-grow min-w-0"><p className="font-semibold text-white truncate">{song.name}</p><p className="text-sm text-gray-400 truncate">{song.artist}</p></div>
-              </motion.li>
+              <li key={index} onClick={() => state.selectTrack(index)} className={`flex items-center gap-4 p-3 rounded-lg ${state.currentTrackIndex === index ? 'bg-white/10' : 'hover:bg-white/5'} ${state.isAdmin ? 'cursor-pointer' : ''}`}>
+                <div className="h-12 w-12 bg-gray-800 rounded-md flex-shrink-0 flex items-center justify-center text-2xl">🎵</div>
+                <div><p className="font-semibold truncate text-sm md:text-base">{song.name}</p><p className="text-xs md:text-sm text-gray-400 truncate">{song.artist}</p></div>
+              </li>
             ))}
-          </motion.ul>
+          </ul>
         </div>
-        <div className="h-full flex flex-col justify-start pt-8"><RoomSidebar roomCode={roomCode} onOpenUpload={() => setShowUploadModal(true)} /></div>
+        <div className="h-full hidden lg:flex flex-col justify-start pt-8"><RoomSidebar roomCode={roomCode} onOpenUpload={() => setShowUploadModal(true)} /></div>
       </main>
       
       <AnimatePresence>
         {currentTrack && (
             <MemoizedPlayer 
-                title={currentTrack.name} 
-                artist={currentTrack.artist} 
-                isPlaying={state.isPlaying}
-                volume={state.volume}
-                duration={state.duration}
-                onPlayPause={state.playPause} 
-                onNext={state.nextTrack} 
-                onPrev={state.prevTrack} 
-                onVolumeChange={state.setVolume}
+                title={currentTrack.name} artist={currentTrack.artist} 
+                isPlaying={state.isPlaying} volume={state.volume} duration={state.duration}
+                onPlayPause={state.playPause} onNext={state.nextTrack} onPrev={state.prevTrack} onVolumeChange={state.setVolume}
             />
         )}
       </AnimatePresence>
-      <AnimatePresence>{state.isDisconnected && <DisconnectedOverlay />}</AnimatePresence>
       <FileUploadModal isOpen={showUploadModal} onClose={() => setShowUploadModal(false)} />
     </div>
   );
