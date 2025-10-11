@@ -2,16 +2,17 @@ import { motion } from "framer-motion";
 import { useRoomStore } from "@/lib/room-store";
 
 const Equalizer = () => {
-  const { equalizer, setEqualizer, isAdmin, isCollaborative } = useRoomStore(
+  // SURGICAL FIX: We are no longer pulling 'isCollaborative' because it doesn't exist.
+  const { equalizer, setEqualizer, isAdmin } = useRoomStore(
     (state) => ({
       equalizer: state.equalizer,
       setEqualizer: state.setEqualizer,
       isAdmin: state.isAdmin,
-      isCollaborative: state.isCollaborative,
     })
   );
 
-  const canControl = isAdmin || isCollaborative;
+  // SURGICAL FIX: The logic is now simplified. Only the admin can control the equalizer.
+  const canControl = isAdmin;
 
   const handleChange = (band: "bass" | "mids" | "treble", value: string) => {
     const numericValue = Number(value);
