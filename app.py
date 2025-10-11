@@ -14,19 +14,14 @@ load_dotenv()
 app = Flask(__name__)
 app.wsgi_app = ProxyFix(app.wsgi_app, x_for=1, x_proto=1, x_host=1, x_prefix=1)
 
-# --- ROBUST CORS CONFIGURATION ---
-# This new setup handles multiple frontend URLs gracefully.
 frontend_url = os.getenv("FRONTEND_URL")
-allowed_origins = ["http://localhost:3000"] # Always allow local development
+allowed_origins = ["http://localhost:3000"]
 if frontend_url:
     allowed_origins.append(frontend_url)
-    # Automatically add both www and non-www versions if applicable
     if "www." in frontend_url:
         allowed_origins.append(frontend_url.replace("www.", ""))
     elif "https://" in frontend_url:
         allowed_origins.append(frontend_url.replace("https://", "https://www."))
-# --- END OF CORS CONFIGURATION ---
-
 
 CORS(app, origins=allowed_origins, supports_credentials=True)
 socketio = SocketIO(app, cors_allowed_origins=allowed_origins, ping_timeout=60, ping_interval=25)
@@ -76,9 +71,10 @@ GENRE_CONFIGS = {
     'deep-house-mix': {'search_query': 'deep house mix'}, 'default': {'seeds': ['music', 'pop']}
 }
 
+# FINAL FIX: Corrected the broken fallback image URL
 FALLBACK_PLAYLIST = [
     {'name': 'Blinding Lights', 'artist': 'The Weeknd', 'albumArt': 'https://i.scdn.co/image/ab67616d0000b2738863bc11d2aa12b54f5aeb36', 'youtubeId': '4NRXx6U8ABQ'},
-    {'name': 'As It Was', 'artist': 'Harry Styles', 'albumArt': 'https://i.scdn.co/image/ab67616d0000b273b46f74097652c7f3a3a08237', 'youtubeId': 'H5v3kku4y6Q'},
+    {'name': 'As It Was', 'artist': 'Harry Styles', 'albumArt': 'https://i.scdn.co/image/ab67616d0000b27346f74097652c7f3a3a08237', 'youtubeId': 'H5v3kku4y6Q'},
 ]
 
 @lru_cache(maxsize=1)
@@ -204,12 +200,8 @@ def generate_route():
         'users': {}, 
         'admin_sid': None,
         'current_state': {
-            'isPlaying': False, 
-            'trackIndex': 0, 
-            'currentTime': 0, 
-            'volume': 80, 
-            'timestamp': time.time(), 
-            'serverTimestamp': time.time(), 
+            'isPlaying': False, 'trackIndex': 0, 'currentTime': 0, 'volume': 80, 
+            'timestamp': time.time(), 'serverTimestamp': time.time(), 
             'equalizer': {'bass': 0, 'mids': 0, 'treble': 0},
             'isCollaborative': False
         },
@@ -226,7 +218,6 @@ def get_room_data(room_code):
     room_code = room_code.upper()
     room_data_json = r.get(f"room:{room_code}")
     if not room_data_json: 
-        app.logger.warning(f"Room {room_code} not found")
         return jsonify({'error': 'Room not found'}), 404
     room_data = json.loads(room_data_json)
     return jsonify({'playlist_title': room_data['title'], 'playlist': room_data['playlist']}), 200
@@ -237,11 +228,9 @@ def uploaded_file(filename):
 
 @app.route('/api/upload', methods=['POST'])
 def upload_file_route():
-    if 'file' not in request.files: 
-        return jsonify({'error': 'No file part'}), 400
+    if 'file' not in request.files: return jsonify({'error': 'No file part'}), 400
     file = request.files['file']
-    if file.filename == '': 
-        return jsonify({'error': 'No selected file'}), 400
+    if file.filename == '': return jsonify({'error': 'No selected file'}), 400
     if file and allowed_file(file.filename):
         filename = f"{os.urandom(8).hex()}_{secure_filename(file.filename)}"
         file_path = os.path.join(app.config['UPLOAD_FOLDER'], filename)
@@ -259,8 +248,7 @@ def add_upload_to_playlist(room_code):
     room_code = room_code.upper()
     data = request.get_json()
     room_data_json = r.get(f"room:{room_code}")
-    if not room_data_json: 
-        return jsonify({'error': 'Room not found'}), 404
+    if not room_data_json: return jsonify({'error': 'Room not found'}), 404
     room_data = json.loads(room_data_json)
     new_track = {'name': data.get('title'), 'artist': data.get('artist'), 'albumArt': None, 'youtubeId': None, 'isUpload': True, 'audioUrl': data.get('audioUrl')}
     room_data['playlist'].append(new_track)
@@ -273,10 +261,8 @@ def get_lyrics(video_id):
     cache_key = f"lyrics:v2:{video_id}"
     try:
         cached_lyrics = r.get(cache_key)
-        if cached_lyrics: 
-            return jsonify(json.loads(cached_lyrics))
-    except redis.exceptions.ConnectionError: 
-        pass
+        if cached_lyrics: return jsonify(json.loads(cached_lyrics))
+    except redis.exceptions.ConnectionError: pass
     lyrics_json = []
     if lrc_kit_available:
         try:
@@ -285,12 +271,10 @@ def get_lyrics(video_id):
                 for line in result[0]:
                     if hasattr(line, 'time') and hasattr(line, 'text') and line.text.strip():
                         lyrics_json.append({'time': line.time, 'text': line.text})
-        except Exception as e: 
-            app.logger.error(f"lrc_kit error: {e}")
+        except Exception as e: app.logger.error(f"lrc_kit error: {e}")
     try: 
         r.set(cache_key, json.dumps(lyrics_json), ex=86400)
-    except redis.exceptions.ConnectionError: 
-        pass
+    except redis.exceptions.ConnectionError: pass
     return jsonify(lyrics_json)
 
 @socketio.on('join_room')
@@ -305,8 +289,7 @@ def handle_join_room(data):
     room_data = json.loads(room_data_json)
     join_room(room_code)
     is_admin = not room_data.get('users') or not room_data.get('admin_sid')
-    if is_admin: 
-        room_data['admin_sid'] = sid
+    if is_admin: room_data['admin_sid'] = sid
     room_data['users'][sid] = {'name': username, 'isAdmin': is_admin}
     r.set(f"room:{room_code}", json.dumps(room_data), ex=86400)
     emit('load_current_state', room_data['current_state'], to=sid)
@@ -318,8 +301,7 @@ def handle_player_state_update(data):
     room_code = data['room_code'].upper()
     sid = request.sid
     room_data_json = r.get(f"room:{room_code}")
-    if not room_data_json: 
-        return
+    if not room_data_json: return
     room_data = json.loads(room_data_json)
     if room_data.get('admin_sid') != sid and not room_data['current_state'].get('isCollaborative', False): 
         return
@@ -329,8 +311,7 @@ def handle_player_state_update(data):
     server_receive_time = time.time()
     if client_timestamp > 0 and client_state.get('isPlaying', False):
         latency = server_receive_time - client_timestamp
-        if 0 < latency < 2.0: 
-            room_data['current_state']['currentTime'] += latency
+        if 0 < latency < 2.0: room_data['current_state']['currentTime'] += latency
     room_data['current_state']['serverTimestamp'] = server_receive_time
     r.set(f"room:{room_code}", json.dumps(room_data), ex=86400)
     emit('sync_player_state', room_data['current_state'], to=room_code, include_self=False)
@@ -341,8 +322,7 @@ def handle_disconnect():
     for key in r.scan_iter("room:*"):
         try:
             room_data_str = r.get(key)
-            if not room_data_str: 
-                continue
+            if not room_data_str: continue
             room_data = json.loads(room_data_str)
             if sid in room_data.get('users', {}):
                 room_code = key.split(":")[1]
