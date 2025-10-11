@@ -12,14 +12,13 @@ interface SyncState { isPlaying?: boolean; trackIndex?: number; volume?: number;
 
 declare global { interface Window { webkitAudioContext: any; } }
 
-// THIS IS THE FINAL, CORRECTED BLUEPRINT
 interface RoomState {
   socket: Socket | null; audioElement: HTMLAudioElement | null;
   playlist: Song[]; currentTrackIndex: number; isPlaying: boolean; isSeeking: boolean;
   isAudioGraphConnected: boolean; roomCode: string; playlistTitle: string; username: string;
   users: User[]; volume: number; isLoading: boolean; error: string | null; isAdmin: boolean;
   equalizer: EqualizerSettings; audioNodes: AudioNodes; currentTime: number; duration: number;
-  isConnecting: boolean; isDisconnected: boolean; // THIS PROPERTY WAS MISSING
+  isConnecting: boolean; isDisconnected: boolean;
   connect: (roomCode: string, username: string) => void;
   disconnect: () => void;
   primePlayer: () => void;
@@ -54,20 +53,26 @@ export const useRoomStore = create<RoomState>()((set, get) => ({
   currentTime: 0, duration: 0, isConnecting: false, isDisconnected: false,
 
   setLoading: (loading) => set({ isLoading: loading }),
+  // THIS IS THE FINAL FIX: Removed the duplicate 'isLoading' key.
   setError: (error) => set({ error, isLoading: false }),
   setIsSeeking: (seeking) => set({ isSeeking: seeking }),
 
   connect: (code, name) => {
     if (get().socket) return;
-    set({ username: name, roomCode: code });
+    set({ username: name, roomCode: code, isLoading: true });
     const socket = io(API_URL, { transports: ['websocket'] });
     set({ socket });
-    socket.on('connect', () => socket.emit('join_room', { room_code: code, username: name }));
+
+    socket.on('connect', () => {
+        console.log("✅ Socket connected. Emitting join_room.");
+        socket.emit('join_room', { room_code: code, username: name });
+    });
     socket.on('update_user_list', (users) => set({ users, isAdmin: users.find((u: User) => u.name === get().username)?.isAdmin ?? false }));
     socket.on('load_current_state', (state) => get().syncPlayerState(state));
     socket.on('sync_player_state', (state) => get().syncPlayerState(state));
     socket.on('refresh_playlist', (data) => get().setRoomData(data));
     socket.on('disconnect', () => set({ isDisconnected: true }));
+    socket.on('connect_error', () => get().setError("Connection failed. The server might be offline or misconfigured."));
   },
 
   disconnect: () => {
@@ -89,11 +94,12 @@ export const useRoomStore = create<RoomState>()((set, get) => ({
         const treble = context.createBiquadFilter(); treble.type = "highshelf"; treble.frequency.value = 3000;
         source.connect(bass).connect(mids).connect(treble).connect(context.destination);
         set({ audioNodes: { context, source, bass, mids, treble }, isAudioGraphConnected: true });
+
         audio.ontimeupdate = () => set({ currentTime: audio.currentTime });
         audio.onloadedmetadata = () => set({ duration: audio.duration });
         audio.onended = () => { if(get().isAdmin) get().nextTrack(); };
-        audio.onplaying = () => set({ isPlaying: true });
-        audio.onpause = () => set({ isPlaying: false });
+        audio.onplaying = () => { if(!get().isPlaying) set({ isPlaying: true }); };
+        audio.onpause = () => { if(get().isPlaying) set({ isPlaying: false }); };
     } catch (e) { console.error("Could not prime audio player.", e); }
   },
   
@@ -115,7 +121,10 @@ export const useRoomStore = create<RoomState>()((set, get) => ({
         set({ currentTrackIndex: state.trackIndex });
     }
     if (state.currentTime !== undefined && Math.abs(state.currentTime - audioElement.currentTime) > 2.0) { audioElement.currentTime = state.currentTime; }
-    if (state.isPlaying !== undefined && state.isPlaying !== isPlaying) { state.isPlaying ? audioElement.play().catch(()=>{}) : audioElement.pause(); }
+    if (state.isPlaying !== undefined && state.isPlaying !== isPlaying) {
+        set({ isPlaying: state.isPlaying });
+        state.isPlaying ? audioElement.play().catch(()=>{}) : audioElement.pause();
+    }
   },
 
   setRoomData: (data) => set({ playlistTitle: data.playlistTitle, playlist: data.playlist, isLoading: false, error: null }),
@@ -123,7 +132,7 @@ export const useRoomStore = create<RoomState>()((set, get) => ({
   playPause: () => {
     if (!get().isAdmin) return;
     const { audioElement, isPlaying } = get();
-    set({ isPlaying: !isPlaying });
+    set({ isPlaying: !isPlaying }); // Instantly update UI
     isPlaying ? audioElement?.pause() : audioElement?.play();
     get()._emitStateUpdate({ isPlaying: !isPlaying, currentTime: audioElement?.currentTime });
   },
@@ -169,7 +178,7 @@ export const useRoomStore = create<RoomState>()((set, get) => ({
       formData.append('file', file);
       
       const res = await fetch(`${API_URL}/api/upload-local`, { method: 'POST', body: formData });
-      if (!res.ok) throw new Error('Local upload failed');
+      if (!res.ok) throw new Error(`Upload failed: ${await res.text()}`);
       const { audioUrl } = await res.json();
       
       await fetch(`${API_URL}/api/room/${state.roomCode}/add-upload`, {
