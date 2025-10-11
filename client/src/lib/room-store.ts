@@ -21,7 +21,7 @@ interface RoomState {
   connect: (roomCode: string, username: string) => void; disconnect: () => void;
   primePlayer: () => void; _emitStateUpdate: (overrideState?: Partial<Omit<SyncState, 'serverTimestamp'>>) => void;
   syncPlayerState: (state: SyncState) => void;
-  setRoomData: (data: { playlist_title: string; playlist: Song[] }) => void;
+  setRoomData: (data: { playlistTitle: string; playlist: Song[] }) => void;
   selectTrack: (index: number) => void; playPause: () => void; nextTrack: () => void; prevTrack: () => void;
   setVolume: (volume: number) => void; setEqualizer: (settings: EqualizerSettings) => void;
   uploadFile: (file: File, title?: string, artist?: string) => Promise<any>;
@@ -92,7 +92,6 @@ export const useRoomStore = create<RoomState>()((set, get) => ({
       audioEl.onended = () => { if (get().isAdmin) get().nextTrack(); };
       audioEl.onplaying = () => { if(!get().isPlaying) set({ isPlaying: true }); };
       audioEl.onpause = () => { if(get().isPlaying) set({ isPlaying: false }); };
-      console.log("✅ Audio graph connected and primed.");
     } catch (e) { console.error("Critical error setting up Web Audio API.", e); }
   },
 
@@ -102,17 +101,15 @@ export const useRoomStore = create<RoomState>()((set, get) => ({
     const liveState: SyncState = {
       isPlaying: state.isPlaying, trackIndex: state.currentTrackIndex,
       currentTime: state.audioElement?.currentTime ?? 0, volume: state.volume,
-      equalizer: state.equalizer, isCollaborative: state.isCollaborative,
-      ...overrideState
+      equalizer: state.equalizer, isCollaborative: state.isCollaborative, ...overrideState
     };
     state.socket.emit('update_player_state', { 
-        room_code: state.roomCode, 
-        state: { ...liveState, serverTimestamp: Date.now() / 1000 } 
+        room_code: state.roomCode, state: { ...liveState, serverTimestamp: Date.now() / 1000 } 
     });
   },
   
   syncPlayerState: (state) => {
-    const { audioElement, currentTrackIndex, isPlaying, playlist } = get();
+    const { audioElement, currentTrackIndex, isPlaying, playlist, volume, equalizer, audioNodes } = get();
     if (!audioElement) return;
 
     if (state.trackIndex !== undefined && state.trackIndex !== currentTrackIndex) {
@@ -126,28 +123,72 @@ export const useRoomStore = create<RoomState>()((set, get) => ({
     }
     
     if (state.isPlaying !== undefined && state.isPlaying !== isPlaying) {
-        state.isPlaying ? audioElement.play().catch(e => console.warn("Autoplay blocked", e)) : audioElement.pause();
+        state.isPlaying ? audioElement.play().catch(e => console.warn("Autoplay was blocked by browser", e)) : audioElement.pause();
         set({ isPlaying: state.isPlaying });
     }
     
-    if (state.volume !== undefined) {
+    if (state.volume !== undefined && state.volume !== volume) {
       set({ volume: state.volume });
       audioElement.volume = state.volume / 100;
     }
+
+    if (state.equalizer && JSON.stringify(state.equalizer) !== JSON.stringify(equalizer)) { 
+      set({ equalizer: state.equalizer });
+      const { bass, mids, treble } = audioNodes;
+      if (bass && mids && treble) {
+        bass.gain.value = state.equalizer.bass;
+        mids.gain.value = state.equalizer.mids;
+        treble.gain.value = state.equalizer.treble;
+      }
+    }
   },
 
-  setRoomData: (data) => set({ playlistTitle: data.playlist_title, playlist: data.playlist, isLoading: false, error: null }),
-  selectTrack: (index) => {
-      const { playlist, currentTrackIndex } = get();
-      if (index === currentTrackIndex) return get().playPause();
-      if (playlist[index]?.audioUrl) get()._emitStateUpdate({ trackIndex: index, currentTime: 0, isPlaying: true });
-      else console.log("Cannot select track without audioUrl");
+  setRoomData: (data) => set({ playlistTitle: data.playlistTitle, playlist: data.playlist, isLoading: false, error: null }),
+
+  // --- SURGICAL FIX: "Act Locally First" Pattern ---
+  playPause: () => {
+    const { audioElement, isPlaying } = get();
+    if (!audioElement) return;
+    
+    isPlaying ? audioElement.pause() : audioElement.play().catch(e => console.warn("Autoplay blocked by browser", e));
+    set({isPlaying: !isPlaying}); // Update local state instantly for UI feedback
+    get()._emitStateUpdate({ isPlaying: !isPlaying }); // Then, inform the server
   },
-  playPause: () => get()._emitStateUpdate({ isPlaying: !get().isPlaying }),
+
+  selectTrack: (index) => {
+      const { audioElement, playlist, currentTrackIndex } = get();
+      if (!audioElement || index === currentTrackIndex) return;
+
+      const track = playlist[index];
+      if (track?.audioUrl) {
+        audioElement.src = track.audioUrl;
+        audioElement.load();
+        audioElement.play().catch(e => console.warn("Autoplay blocked by browser", e));
+        set({currentTrackIndex: index, isPlaying: true}); // Update local state instantly
+        get()._emitStateUpdate({ trackIndex: index, currentTime: 0, isPlaying: true }); // Then, inform the server
+      }
+  },
+
   nextTrack: () => { const newIndex = (get().currentTrackIndex + 1) % get().playlist.length; get().selectTrack(newIndex); },
   prevTrack: () => { const newIndex = (get().currentTrackIndex - 1 + get().playlist.length) % get().playlist.length; get().selectTrack(newIndex); },
-  setVolume: (volume) => get()._emitStateUpdate({ volume }),
-  setEqualizer: (settings) => get()._emitStateUpdate({ equalizer: settings }),
+  
+  setVolume: (volume) => {
+    const { audioElement } = get();
+    if (audioElement) audioElement.volume = volume / 100;
+    set({ volume });
+    get()._emitStateUpdate({ volume });
+  },
+
+  setEqualizer: (settings) => { 
+    const { bass, mids, treble } = get().audioNodes;
+    if (bass && mids && treble) {
+      bass.gain.value = settings.bass;
+      mids.gain.value = settings.mids;
+      treble.gain.value = settings.treble;
+    }
+    set({ equalizer: settings });
+    get()._emitStateUpdate({ equalizer: settings }); 
+  },
   
   uploadFile: async (file, title, artist) => {
     const { roomCode } = get();
