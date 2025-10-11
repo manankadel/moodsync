@@ -68,8 +68,8 @@ GENRE_CONFIGS = {
 }
 
 FALLBACK_PLAYLIST = [
-    {'name': 'Blinding Lights', 'artist': 'The Weeknd', 'albumArt': 'https://i.scdn.co/image/ab67616d0000b2738863bc11d2aa12b54f5aeb36', 'youtubeId': '4NRXx6U8ABQ'},
-    {'name': 'As It Was', 'artist': 'Harry Styles', 'albumArt': 'https://i.scdn.co/image/ab67616d0000b273b46f74097652c7f3a3a08237', 'youtubeId': 'H5v3kku4y6Q'},
+    {'name': 'Blinding Lights', 'artist': 'The Weeknd', 'albumArt': 'https://i.scdn.co/image/ab67616d00001e028863bc11d2aa12b54f5aeb36', 'youtubeId': '4NRXx6U8ABQ'},
+    {'name': 'As It Was', 'artist': 'Harry Styles', 'albumArt': 'https://i.scdn.co/image/ab67616d00001e02b46f74097652c7f3a3a08237', 'youtubeId': 'H5v3kku4y6Q'},
 ]
 
 @lru_cache(maxsize=1)
@@ -143,14 +143,15 @@ def generate_playlist(genre):
         config = GENRE_CONFIGS.get(genre, GENRE_CONFIGS['default'])
         token = get_spotify_token()
         if not token: 
+            app.logger.warning("No Spotify token, using fallback")
             return FALLBACK_PLAYLIST
         if 'search_query' in config:
             params = {'q': config['search_query'], 'type': 'track', 'limit': 30, 'market': 'US'}
-            response = requests.get("https://api.spotify.com/v1/search", headers={"Authorization": f"Bearer {token}"}, params=params)
+            response = requests.get("https://api.spotify.com/v1/search", headers={"Authorization": f"Bearer {token}"}, params=params, timeout=10)
         else:
             seeds = random.sample(config['seeds'], min(2, len(config['seeds'])))
             params = {'seed_genres': ','.join(seeds), 'limit': 30, 'market': 'US'}
-            response = requests.get("https://api.spotify.com/v1/recommendations", headers={"Authorization": f"Bearer {token}"}, params=params)
+            response = requests.get("https://api.spotify.com/v1/recommendations", headers={"Authorization": f"Bearer {token}"}, params=params, timeout=10)
         response.raise_for_status()
         tracks = response.json().get('tracks', {}).get('items', []) or response.json().get('tracks', [])
         if not tracks: 
@@ -164,7 +165,8 @@ def generate_playlist(genre):
             if song_name and artist_name:
                 video_id = get_youtube_video_id(song_name, artist_name)
                 if video_id:
-                    album_art = track['album']['images'][0]['url'] if track.get('album', {}).get('images') else None
+                    album_images = track.get('album', {}).get('images', [])
+                    album_art = album_images[1]['url'] if len(album_images) > 1 else (album_images[0]['url'] if album_images else None)
                     playlist.append({'name': song_name, 'artist': artist_name, 'albumArt': album_art, 'youtubeId': video_id})
         if not playlist: 
             raise Exception("No valid tracks after YouTube processing.")
@@ -179,19 +181,38 @@ def generate_route():
         return '', 204
     data = request.get_json()
     genre = data.get('mood', 'default').lower()
+    
+    app.logger.info(f"Generating playlist for genre: {genre}")
     playlist = generate_playlist(genre)
+    app.logger.info(f"Generated {len(playlist)} tracks")
+    
     while True:
         room_code = ''.join(random.choices(string.ascii_uppercase + string.digits, k=6))
         if not r.exists(f"room:{room_code}"): 
             break
+    
     title = genre.replace('-', ' ').title() if genre != 'default' else "Curated Vibes"
     room_data = {
-        'playlist': playlist, 'title': title, 'users': {}, 'admin_sid': None,
-        'current_state': {'isPlaying': False, 'trackIndex': 0, 'currentTime': 0, 'volume': 80, 'timestamp': time.time(), 'serverTimestamp': time.time(), 'equalizer': {'bass': 0, 'mids': 0, 'treble': 0}},
+        'playlist': playlist, 
+        'title': title, 
+        'users': {}, 
+        'admin_sid': None,
+        'current_state': {
+            'isPlaying': False, 
+            'trackIndex': 0, 
+            'currentTime': 0, 
+            'volume': 80, 
+            'timestamp': time.time(), 
+            'serverTimestamp': time.time(), 
+            'equalizer': {'bass': 0, 'mids': 0, 'treble': 0},
+            'isCollaborative': False
+        },
         'created_at': time.time()
     }
+    
     r.set(f"room:{room_code}", json.dumps(room_data), ex=86400)
-    app.logger.info(f"Room {room_code} created.")
+    app.logger.info(f"Room {room_code} created with {len(playlist)} tracks")
+    
     return jsonify({'room_code': room_code}), 200
 
 @app.route('/api/room/<string:room_code>')
@@ -199,6 +220,7 @@ def get_room_data(room_code):
     room_code = room_code.upper()
     room_data_json = r.get(f"room:{room_code}")
     if not room_data_json: 
+        app.logger.warning(f"Room {room_code} not found")
         return jsonify({'error': 'Room not found'}), 404
     room_data = json.loads(room_data_json)
     return jsonify({'playlist_title': room_data['title'], 'playlist': room_data['playlist']}), 200
@@ -283,6 +305,7 @@ def handle_join_room(data):
     r.set(f"room:{room_code}", json.dumps(room_data), ex=86400)
     emit('load_current_state', room_data['current_state'], to=sid)
     emit('update_user_list', list(room_data['users'].values()), to=room_code)
+    app.logger.info(f"User {username} joined room {room_code} (admin: {is_admin})")
 
 @socketio.on('update_player_state')
 def handle_player_state_update(data):
@@ -336,6 +359,6 @@ def handle_disconnect():
 
 if __name__ == '__main__':
     logging.basicConfig(level=logging.INFO, format='%(asctime)s %(levelname)s: %(message)s')
-    app.logger.info("=== Starting MoodSync API Server (Enterprise Sync Edition) ===")
+    app.logger.info("=== Starting MoodSync API Server ===")
     app.logger.info(f"CORS allowed for: {allowed_origins}")
     socketio.run(app, debug=False, use_reloader=False, host='0.0.0.0', port=5001)

@@ -60,7 +60,6 @@ export const useRoomStore = create<RoomState>((set, get) => ({
       const clockInterval = setInterval(() => get()._syncClock(), CLOCK_SYNC_INTERVAL);
       set({ clockSyncInterval: clockInterval });
       
-      // Start sync heartbeat
       const syncInt = setInterval(() => {
         if (get().isAdmin && get().playerReady) {
           get()._emitStateUpdate();
@@ -130,7 +129,6 @@ export const useRoomStore = create<RoomState>((set, get) => ({
     const { player, audioElement, playlist, currentTrackIndex, isPlaying, isSeeking, manualLatencyOffset, serverClockOffset, playerReady, volume } = get();
     if (isSeeking || !playerReady) return;
 
-    // Handle track change
     if (state.trackIndex !== undefined && state.trackIndex !== currentTrackIndex) {
         set({ currentTrackIndex: state.trackIndex });
         const track = playlist[state.trackIndex];
@@ -151,7 +149,6 @@ export const useRoomStore = create<RoomState>((set, get) => ({
     const target = isUpload ? audioElement : player;
     if (!target) return;
 
-    // Handle time sync
     if (state.currentTime !== undefined && state.serverTimestamp !== undefined) {
         const serverTimeNow = Date.now() / 1000 - serverClockOffset;
         const timeSinceUpdate = serverTimeNow - state.serverTimestamp;
@@ -169,7 +166,6 @@ export const useRoomStore = create<RoomState>((set, get) => ({
         
         const drift = projectedTime - playerTime;
 
-        // Adaptive rate adjustment for smooth sync
         if (player?.setPlaybackRate && !isUpload && state.isPlaying) {
             if (Math.abs(drift) > ADAPTIVE_RATE_THRESHOLD && Math.abs(drift) < HARD_SYNC_THRESHOLD) {
                 const newRate = 1.0 + Math.min(Math.max(drift * 0.5, -PLAYBACK_RATE_ADJUST * 2), PLAYBACK_RATE_ADJUST * 2);
@@ -183,7 +179,6 @@ export const useRoomStore = create<RoomState>((set, get) => ({
             }
         }
         
-        // Hard sync if drift is too large
         if (Math.abs(drift) > HARD_SYNC_THRESHOLD) {
             const seekTime = projectedTime + manualLatencyOffset;
             if (isFinite(seekTime) && seekTime >= 0) {
@@ -199,7 +194,6 @@ export const useRoomStore = create<RoomState>((set, get) => ({
         }
     }
     
-    // Handle play/pause state
     if (state.isPlaying !== undefined && state.isPlaying !== isPlaying) {
         const newPlayState = state.isPlaying;
         set({ isPlaying: newPlayState });
@@ -221,14 +215,12 @@ export const useRoomStore = create<RoomState>((set, get) => ({
         } catch(e) { console.warn('Play/pause error:', e); }
     }
     
-    // Handle volume sync
     if (state.volume !== undefined && state.volume !== volume) {
       set({ volume: state.volume });
       if (audioElement) audioElement.volume = state.volume / 100;
       if (player?.setVolume) player.setVolume(state.volume);
     }
     
-    // Handle equalizer sync
     if (state.equalizer) {
       const { audioNodes } = get();
       if (audioNodes.bass) audioNodes.bass.gain.value = state.equalizer.bass;
@@ -237,7 +229,6 @@ export const useRoomStore = create<RoomState>((set, get) => ({
       set({ equalizer: state.equalizer });
     }
     
-    // Handle collaborative mode sync
     if (state.isCollaborative !== undefined) {
       set({ isCollaborative: state.isCollaborative });
     }

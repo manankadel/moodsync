@@ -99,8 +99,8 @@ GENRE_CONFIGS = {
 }
 
 FALLBACK_PLAYLIST = [
-    {'name': 'Blinding Lights', 'artist': 'The Weeknd', 'albumArt': 'https://i.scdn.co/image/ab67616d0000b2738863bc11d2aa12b54f5aeb36', 'youtubeId': '4NRXx6U8ABQ'},
-    {'name': 'As It Was', 'artist': 'Harry Styles', 'albumArt': 'https://i.scdn.co/image/ab67616d0000b273b46f74097652c7f3a3a08237', 'youtubeId': 'H5v3kku4y6Q'},
+    {'name': 'Blinding Lights', 'artist': 'The Weeknd', 'albumArt': 'https://i.scdn.co/image/ab67616d00001e028863bc11d2aa12b54f5aeb36', 'youtubeId': '4NRXx6U8ABQ'},
+    {'name': 'As It Was', 'artist': 'Harry Styles', 'albumArt': 'https://i.scdn.co/image/ab67616d00001e02b46f74097652c7f3a3a08237', 'youtubeId': 'H5v3kku4y6Q'},
 ]
 
 @lru_cache(maxsize=1)
@@ -174,14 +174,15 @@ def generate_playlist(genre):
         config = GENRE_CONFIGS.get(genre, GENRE_CONFIGS['default'])
         token = get_spotify_token()
         if not token: 
+            app.logger.warning("No Spotify token, using fallback")
             return FALLBACK_PLAYLIST
         if 'search_query' in config:
             params = {'q': config['search_query'], 'type': 'track', 'limit': 30, 'market': 'US'}
-            response = requests.get("https://api.spotify.com/v1/search", headers={"Authorization": f"Bearer {token}"}, params=params)
+            response = requests.get("https://api.spotify.com/v1/search", headers={"Authorization": f"Bearer {token}"}, params=params, timeout=10)
         else:
             seeds = random.sample(config['seeds'], min(2, len(config['seeds'])))
             params = {'seed_genres': ','.join(seeds), 'limit': 30, 'market': 'US'}
-            response = requests.get("https://api.spotify.com/v1/recommendations", headers={"Authorization": f"Bearer {token}"}, params=params)
+            response = requests.get("https://api.spotify.com/v1/recommendations", headers={"Authorization": f"Bearer {token}"}, params=params, timeout=10)
         response.raise_for_status()
         tracks = response.json().get('tracks', {}).get('items', []) or response.json().get('tracks', [])
         if not tracks: 
@@ -195,7 +196,8 @@ def generate_playlist(genre):
             if song_name and artist_name:
                 video_id = get_youtube_video_id(song_name, artist_name)
                 if video_id:
-                    album_art = track['album']['images'][0]['url'] if track.get('album', {}).get('images') else None
+                    album_images = track.get('album', {}).get('images', [])
+                    album_art = album_images[1]['url'] if len(album_images) > 1 else (album_images[0]['url'] if album_images else None)
                     playlist.append({'name': song_name, 'artist': artist_name, 'albumArt': album_art, 'youtubeId': video_id})
         if not playlist: 
             raise Exception("No valid tracks after YouTube processing.")
@@ -210,19 +212,38 @@ def generate_route():
         return '', 204
     data = request.get_json()
     genre = data.get('mood', 'default').lower()
+    
+    app.logger.info(f"Generating playlist for genre: {genre}")
     playlist = generate_playlist(genre)
+    app.logger.info(f"Generated {len(playlist)} tracks")
+    
     while True:
         room_code = ''.join(random.choices(string.ascii_uppercase + string.digits, k=6))
         if not r.exists(f"room:{room_code}"): 
             break
+    
     title = genre.replace('-', ' ').title() if genre != 'default' else "Curated Vibes"
     room_data = {
-        'playlist': playlist, 'title': title, 'users': {}, 'admin_sid': None,
-        'current_state': {'isPlaying': False, 'trackIndex': 0, 'currentTime': 0, 'volume': 80, 'timestamp': time.time(), 'serverTimestamp': time.time(), 'equalizer': {'bass': 0, 'mids': 0, 'treble': 0}},
+        'playlist': playlist, 
+        'title': title, 
+        'users': {}, 
+        'admin_sid': None,
+        'current_state': {
+            'isPlaying': False, 
+            'trackIndex': 0, 
+            'currentTime': 0, 
+            'volume': 80, 
+            'timestamp': time.time(), 
+            'serverTimestamp': time.time(), 
+            'equalizer': {'bass': 0, 'mids': 0, 'treble': 0},
+            'isCollaborative': False
+        },
         'created_at': time.time()
     }
+    
     r.set(f"room:{room_code}", json.dumps(room_data), ex=86400)
-    app.logger.info(f"Room {room_code} created.")
+    app.logger.info(f"Room {room_code} created with {len(playlist)} tracks")
+    
     return jsonify({'room_code': room_code}), 200
 
 @app.route('/api/room/<string:room_code>')
@@ -230,6 +251,7 @@ def get_room_data(room_code):
     room_code = room_code.upper()
     room_data_json = r.get(f"room:{room_code}")
     if not room_data_json: 
+        app.logger.warning(f"Room {room_code} not found")
         return jsonify({'error': 'Room not found'}), 404
     room_data = json.loads(room_data_json)
     return jsonify({'playlist_title': room_data['title'], 'playlist': room_data['playlist']}), 200
@@ -314,6 +336,7 @@ def handle_join_room(data):
     r.set(f"room:{room_code}", json.dumps(room_data), ex=86400)
     emit('load_current_state', room_data['current_state'], to=sid)
     emit('update_user_list', list(room_data['users'].values()), to=room_code)
+    app.logger.info(f"User {username} joined room {room_code} (admin: {is_admin})")
 
 @socketio.on('update_player_state')
 def handle_player_state_update(data):
@@ -367,7 +390,7 @@ def handle_disconnect():
 
 if __name__ == '__main__':
     logging.basicConfig(level=logging.INFO, format='%(asctime)s %(levelname)s: %(message)s')
-    app.logger.info("=== Starting MoodSync API Server (Enterprise Sync Edition) ===")
+    app.logger.info("=== Starting MoodSync API Server ===")
     app.logger.info(f"CORS allowed for: {allowed_origins}")
     socketio.run(app, debug=False, use_reloader=False, host='0.0.0.0', port=5001)
 
@@ -382,12 +405,9 @@ if __name__ == '__main__':
 
 ### ./client/next.config.mjs ###
 
-// client/next.config.mjs
-
 /** @type {import('next').NextConfig} */
 const nextConfig = {
   reactStrictMode: true,
-  // THIS BLOCK IS THE FIX FOR THE ALBUM ART
   images: {
     remotePatterns: [
       {
@@ -397,6 +417,10 @@ const nextConfig = {
         pathname: '/image/**',
       },
     ],
+    unoptimized: true,
+    dangerouslyAllowSVG: true,
+    contentDispositionType: 'attachment',
+    contentSecurityPolicy: "default-src 'self'; script-src 'none'; sandbox;",
   },
 };
 
@@ -572,8 +596,8 @@ const RoomSidebar = ({ roomCode, users, isAdmin, isCollaborative, onToggleCollab
             <motion.div initial={{opacity: 0, x: 20}} animate={{opacity: 1, x: 0}} transition={{delay: 0.6}}>
                 <h2 className="text-sm font-light text-gray-400 mb-3">In The Room ({users.length})</h2>
                 <div className="space-y-2 max-h-64 overflow-y-auto pr-2">
-                    {users.map((user) => (
-                        <div key={user.name} className="flex items-center gap-3 p-2 rounded-md bg-white/5">
+                    {users.map((user, idx) => (
+                        <div key={`${user.name}-${idx}`} className="flex items-center gap-3 p-2 rounded-md bg-white/5">
                             <span className="text-sm text-white truncate">{user.name}</span>
                             {user.isAdmin && <Crown size={14} className="ml-auto text-amber-400 flex-shrink-0" aria-label="Room Admin" />}
                         </div>
@@ -621,7 +645,7 @@ export default function RoomPage() {
   const [showUploadModal, setShowUploadModal] = useState(false);
 
   const { playlistTitle, playlist, currentTrackIndex, isLoading, error, users, isAdmin, volume, isCollaborative, isPlaying } = useRoomStore();
-  const { initializePlayer, setPlaylistData, setLoading, setError, playPause, nextTrack, prevTrack, selectTrack, setVolume, connect, disconnect, toggleCollaborative, primePlayer } = useRoomStore.getState();
+  const { initializePlayer, setPlaylistData, setLoading, setError, playPause, nextTrack, prevTrack, selectTrack, setVolume, connect, disconnect, toggleCollaborative } = useRoomStore.getState();
   
   const currentTrack = playlist[currentTrackIndex];
 
@@ -645,7 +669,6 @@ export default function RoomPage() {
   }, [roomCode, showNameModal, setPlaylistData, setLoading, setError]);
 
   const handleNameSubmit = (name: string) => {
-    primePlayer(); 
     if (roomCode) {
       connect(roomCode, name);
       setShowNameModal(false);
@@ -661,8 +684,8 @@ export default function RoomPage() {
   return (
     <div className="min-h-screen bg-black text-white overflow-hidden">
       <Script src="https://www.youtube.com/iframe_api" strategy="afterInteractive" />
-      <div id="youtube-player-container" className="fixed -z-10 top-0 left-0"></div>
-      <div className="absolute inset-0 z-0 opacity-50"><AnimatePresence>{currentTrack?.albumArt && (<motion.div key={currentTrack.youtubeId || currentTrack.audioUrl} initial={{ opacity: 0, scale: 1.1 }} animate={{ opacity: 1, scale: 1 }} exit={{ opacity: 0, scale: 1.1 }} transition={{ duration: 1.5, ease: "easeInOut" }} className="absolute inset-0"><Image src={currentTrack.albumArt} alt="background" layout="fill" objectFit="cover" className="blur-3xl saturate-50" /></motion.div>)}</AnimatePresence><div className="absolute inset-0 bg-black/70" /></div>
+      <div id="youtube-player-container" className="fixed -z-10 top-0 left-0 w-0 h-0 opacity-0"></div>
+      <div className="absolute inset-0 z-0 opacity-50"><AnimatePresence>{currentTrack?.albumArt && (<motion.div key={currentTrack.youtubeId || currentTrack.audioUrl} initial={{ opacity: 0, scale: 1.1 }} animate={{ opacity: 1, scale: 1 }} exit={{ opacity: 0, scale: 1.1 }} transition={{ duration: 1.5, ease: "easeInOut" }} className="absolute inset-0"><Image src={currentTrack.albumArt} alt="background" fill className="blur-3xl saturate-50 object-cover" unoptimized onError={(e) => { e.currentTarget.style.display = 'none'; }} /></motion.div>)}</AnimatePresence><div className="absolute inset-0 bg-black/70" /></div>
       
       <main className="relative z-10 grid grid-cols-1 lg:grid-cols-[2fr_1fr] gap-8 xl:gap-16 max-w-7xl mx-auto p-4 sm:p-8 h-screen">
         <div className="flex flex-col h-full pt-8 pb-32">
@@ -671,10 +694,27 @@ export default function RoomPage() {
           </motion.div>
           <motion.ul initial="hidden" animate="visible" className="mt-8 space-y-2 pr-4 -mr-4 flex-1 overflow-y-auto">
             {playlist.map((song, index) => (
-              <motion.li key={song.youtubeId || song.audioUrl || index} onClick={() => selectTrack(index)} className={`relative flex items-center gap-4 p-3 rounded-lg border transition-all duration-300 ${(isAdmin || isCollaborative) ? 'cursor-pointer' : 'cursor-default'} ${currentTrackIndex === index ? 'bg-white/10 border-white/20' : 'bg-transparent border-transparent hover:bg-white/5'}`}>
+              <motion.li key={`${song.youtubeId || song.audioUrl || index}-${index}`} onClick={() => selectTrack(index)} className={`relative flex items-center gap-4 p-3 rounded-lg border transition-all duration-300 ${(isAdmin || isCollaborative) ? 'cursor-pointer' : 'cursor-default'} ${currentTrackIndex === index ? 'bg-white/10 border-white/20' : 'bg-transparent border-transparent hover:bg-white/5'}`}>
                 <AnimatePresence>{currentTrackIndex === index && (<motion.div layoutId="playing-indicator" className="absolute inset-0 rounded-lg border-2 border-cyan-400"/>)}</AnimatePresence>
                 <div className="relative h-12 w-12 rounded-md overflow-hidden bg-gray-800 flex-shrink-0">
-                  {song.albumArt ? <Image src={song.albumArt} alt={song.name} layout="fill" objectFit="cover" /> : <div className="flex items-center justify-center h-full text-gray-500">{song.isUpload ? '🎵' : '🎧'}</div>}
+                  {song.albumArt ? (
+                    <Image 
+                      src={song.albumArt} 
+                      alt={song.name} 
+                      fill 
+                      className="object-cover"
+                      unoptimized
+                      onError={(e) => {
+                        e.currentTarget.style.display = 'none';
+                        const parent = e.currentTarget.parentElement;
+                        if (parent) {
+                          parent.innerHTML = '<div class="flex items-center justify-center h-full text-gray-500 text-2xl">🎵</div>';
+                        }
+                      }}
+                    />
+                  ) : (
+                    <div className="flex items-center justify-center h-full text-gray-500 text-2xl">{song.isUpload ? '🎵' : '🎧'}</div>
+                  )}
                 </div>
                 <div className="relative flex-grow min-w-0">
                   <p className="font-semibold text-white truncate">{song.name}</p>
@@ -1471,7 +1511,7 @@ import { Play, Pause, SkipBack, SkipForward, Volume1, Volume2, VolumeX, SlidersH
 import BeatVisualizer from "./visualizer";
 import Equalizer from "./Equalizer";
 import Lyrics from "./Lyrics";
-import LatencyControl from "./LatencyControl"; // This import now works correctly
+import LatencyControl from "./LatencyControl";
 import { useRoomStore } from "@/lib/room-store";
 
 interface PlayerProps {
@@ -1524,7 +1564,7 @@ export default function Player({ albumArt, title, artist, isPlaying, volume, onP
     return () => {
         if(interval) clearInterval(interval)
     };
-  }, [isPlaying, player, audioElement, currentTrack, currentTrackIndex]);
+  }, [isPlaying, player, audioElement, currentTrack, currentTrackIndex, duration]);
 
   useEffect(() => {
     if (!isSeeking) {
@@ -1568,7 +1608,26 @@ export default function Player({ albumArt, title, artist, isPlaying, volume, onP
         <BeatVisualizer />
         <div className="relative z-10 grid grid-cols-[1fr_2fr_1fr] items-center gap-4 sm:gap-8 w-full">
           <div className="flex items-center gap-4 min-w-0">
-            <div className="relative h-14 w-14 sm:h-16 sm:w-16 flex-shrink-0 rounded-lg bg-gray-800 shadow-lg">{albumArt && <Image src={albumArt} alt={title} layout="fill" objectFit="cover" className="rounded-lg"/>}</div>
+            <div className="relative h-14 w-14 sm:h-16 sm:w-16 flex-shrink-0 rounded-lg bg-gray-800 shadow-lg overflow-hidden">
+              {albumArt ? (
+                <Image 
+                  src={albumArt} 
+                  alt={title} 
+                  fill 
+                  className="object-cover rounded-lg"
+                  unoptimized
+                  onError={(e) => {
+                    e.currentTarget.style.display = 'none';
+                    const parent = e.currentTarget.parentElement;
+                    if (parent) {
+                      parent.innerHTML = '<div class="flex items-center justify-center h-full text-gray-500 text-2xl">🎵</div>';
+                    }
+                  }}
+                />
+              ) : (
+                <div className="flex items-center justify-center h-full text-gray-500 text-2xl">🎵</div>
+              )}
+            </div>
             <div className="min-w-0 hidden sm:block"><p className="font-semibold text-lg text-white truncate">{title}</p><p className="font-light text-sm text-gray-400 truncate">{artist}</p></div>
           </div>
           
@@ -1903,11 +1962,11 @@ import { io, Socket } from 'socket.io-client';
 
 const API_URL = process.env.NEXT_PUBLIC_API_URL || 'http://localhost:5001';
 
-const HARD_SYNC_THRESHOLD = 0.35;
+const HARD_SYNC_THRESHOLD = 0.25;
 const ADAPTIVE_RATE_THRESHOLD = 0.05;
-const PLAYBACK_RATE_ADJUST = 0.02;
-const SYNC_HEARTBEAT_INTERVAL = 1000;
-const CLOCK_SYNC_INTERVAL = 5000;
+const PLAYBACK_RATE_ADJUST = 0.015;
+const SYNC_HEARTBEAT_INTERVAL = 500;
+const CLOCK_SYNC_INTERVAL = 10000;
 
 interface Song { name: string; artist: string; albumArt: string | null; youtubeId?: string; isUpload?: boolean; audioUrl?: string; }
 interface User { name: string; isAdmin: boolean; }
@@ -1923,6 +1982,7 @@ interface RoomState {
   isSeeking: boolean; manualLatencyOffset: number; serverClockOffset: number; isAudioGraphConnected: boolean;
   syncInterval: NodeJS.Timeout | null; clockSyncInterval: NodeJS.Timeout | null;
   roomCode: string; playlistTitle: string; users: User[]; volume: number; isCollaborative: boolean; isLoading: boolean; error: string | null; isAdmin: boolean; username: string; equalizer: EqualizerSettings; audioNodes: AudioNodes; currentTime: number; lyrics: { lines: LyricLine[]; isLoading: boolean; };
+  playerReady: boolean; contextUnlocked: boolean;
   connect: (roomCode: string, username: string) => void; disconnect: () => void; initializePlayer: (domId: string) => void;
   setPlaylistData: (title: string, playlist: Song[]) => void; playPause: () => void; nextTrack: () => void; prevTrack: () => void; selectTrack: (index: number) => void; setVolume: (volume: number) => void; setEqualizer: (settings: EqualizerSettings) => void; toggleCollaborative: () => void; setIsSeeking: (isSeeking: boolean) => void; setManualLatencyOffset: (offset: number) => void;
   _emitStateUpdate: (overrideState?: Partial<Omit<SyncState, 'serverTimestamp'>>) => void;
@@ -1931,7 +1991,6 @@ interface RoomState {
   setLoading: (loading: boolean) => void; setError: (error: string | null) => void;
 }
 
-// Global AudioContext - CRITICAL: Only create once, never duplicate
 let globalAudioContext: AudioContext | null = null;
 let globalAudioSource: MediaElementAudioSourceNode | null = null;
 
@@ -1941,6 +2000,7 @@ export const useRoomStore = create<RoomState>((set, get) => ({
   isSeeking: false, manualLatencyOffset: 0, serverClockOffset: 0, isAudioGraphConnected: false,
   syncInterval: null, clockSyncInterval: null,
   roomCode: '', playlistTitle: '', users: [], volume: 80, isCollaborative: false, isLoading: true, error: null, isAdmin: false, username: '', equalizer: { bass: 0, mids: 0, treble: 0 }, audioNodes: { context: null, source: null, bass: null, mids: null, treble: null }, currentTime: 0, lyrics: { lines: [], isLoading: false },
+  playerReady: false, contextUnlocked: false,
   
   setLoading: (loading) => set({ isLoading: loading }),
   setError: (error) => set({ error, isLoading: false }),
@@ -1949,20 +2009,43 @@ export const useRoomStore = create<RoomState>((set, get) => ({
 
   connect: (roomCode, username) => {
     if (get().socket) return;
-    const socket = io(API_URL, { transports: ['websocket'] });
+    const socket = io(API_URL, { transports: ['websocket'], reconnection: true, reconnectionAttempts: 5 });
     set({ socket, username, roomCode });
+    
     socket.on('connect', () => {
-      console.log('✅ Connected with Enterprise Sync Engine');
+      console.log('✅ Connected to server');
       socket.emit('join_room', { room_code: roomCode, username });
       get()._syncClock();
       const clockInterval = setInterval(() => get()._syncClock(), CLOCK_SYNC_INTERVAL);
       set({ clockSyncInterval: clockInterval });
+      
+      const syncInt = setInterval(() => {
+        if (get().isAdmin && get().playerReady) {
+          get()._emitStateUpdate();
+        }
+      }, SYNC_HEARTBEAT_INTERVAL);
+      set({ syncInterval: syncInt });
     });
-    socket.on('disconnect', () => get().disconnect());
+    
+    socket.on('disconnect', () => console.log('⚠️ Disconnected from server'));
     socket.on('error', (data) => get().setError(data.message));
-    socket.on('update_user_list', (users: User[]) => { const self = users.find(u => u.name === get().username); set({ users, isAdmin: self?.isAdmin || false }); });
-    socket.on('load_current_state', (state) => get().syncPlayerState(state));
-    socket.on('sync_player_state', (state) => get().syncPlayerState(state));
+    socket.on('update_user_list', (users: User[]) => { 
+      const self = users.find(u => u.name === get().username); 
+      const wasAdmin = get().isAdmin;
+      const isNowAdmin = self?.isAdmin || false;
+      set({ users, isAdmin: isNowAdmin }); 
+      
+      if (!wasAdmin && isNowAdmin) {
+        console.log('🎯 You are now admin');
+      }
+    });
+    socket.on('load_current_state', (state) => {
+      console.log('📥 Loading initial state:', state);
+      get().syncPlayerState(state);
+    });
+    socket.on('sync_player_state', (state) => {
+      get().syncPlayerState(state);
+    });
     socket.on('refresh_playlist', () => get().refreshPlaylist());
   },
   
@@ -1970,30 +2053,54 @@ export const useRoomStore = create<RoomState>((set, get) => ({
     const { socket, syncInterval, clockSyncInterval, player, audioElement } = get();
     if (syncInterval) clearInterval(syncInterval);
     if (clockSyncInterval) clearInterval(clockSyncInterval);
-    player?.destroy();
-    if (audioElement) audioElement.pause();
+    if (player?.destroy) player.destroy();
+    if (audioElement) { audioElement.pause(); audioElement.src = ''; }
     socket?.disconnect();
-    set({ socket: null, syncInterval: null, clockSyncInterval: null, player: null, isAudioGraphConnected: false });
+    set({ socket: null, syncInterval: null, clockSyncInterval: null, player: null, playerReady: false });
   },
 
   _emitStateUpdate: (overrideState) => {
-    const { socket, roomCode, isPlaying, currentTrackIndex, isAdmin, isCollaborative, playlist, audioElement, player } = get();
+    const { socket, roomCode, isPlaying, currentTrackIndex, isAdmin, isCollaborative, playlist, audioElement, player, playerReady } = get();
     if (!isAdmin && !isCollaborative) return;
+    if (!playerReady) return;
+    
     let currentTime = 0;
-    try { currentTime = playlist[currentTrackIndex]?.isUpload && audioElement ? audioElement.currentTime : player?.getCurrentTime() || 0; } catch(e) {}
-    const stateToSend = { isPlaying, trackIndex: currentTrackIndex, currentTime, timestamp: Date.now() / 1000, ...overrideState };
+    try { 
+      const track = playlist[currentTrackIndex];
+      if (track?.isUpload && audioElement) {
+        currentTime = audioElement.currentTime || 0;
+      } else if (player?.getCurrentTime) {
+        currentTime = player.getCurrentTime() || 0;
+      }
+    } catch(e) {}
+    
+    const stateToSend = { 
+      isPlaying, 
+      trackIndex: currentTrackIndex, 
+      currentTime, 
+      timestamp: Date.now() / 1000, 
+      ...overrideState 
+    };
     socket?.emit('update_player_state', { room_code: roomCode, state: stateToSend });
   },
   
   syncPlayerState: (state) => {
-    const { player, audioElement, playlist, currentTrackIndex, isPlaying, isSeeking, manualLatencyOffset, serverClockOffset } = get();
-    if (isSeeking) return;
+    const { player, audioElement, playlist, currentTrackIndex, isPlaying, isSeeking, manualLatencyOffset, serverClockOffset, playerReady, volume } = get();
+    if (isSeeking || !playerReady) return;
 
     if (state.trackIndex !== undefined && state.trackIndex !== currentTrackIndex) {
-        set({ currentTrackIndex: state.trackIndex, isPlaying: state.isPlaying });
+        set({ currentTrackIndex: state.trackIndex });
         const track = playlist[state.trackIndex];
-        if (track?.isUpload && track.audioUrl && audioElement) { audioElement.src = track.audioUrl; audioElement.load(); }
-        else if (track?.youtubeId && player) { player.cueVideoById(track.youtubeId); get().fetchLyrics(track.youtubeId); }
+        
+        if (track?.isUpload && track.audioUrl && audioElement) { 
+          audioElement.src = track.audioUrl;
+          audioElement.volume = volume / 100;
+          audioElement.load();
+        } else if (track?.youtubeId && player?.loadVideoById) { 
+          player.loadVideoById(track.youtubeId);
+          player.setVolume(volume);
+          get().fetchLyrics(track.youtubeId);
+        }
     }
     
     const targetTrack = playlist[get().currentTrackIndex];
@@ -2004,42 +2111,85 @@ export const useRoomStore = create<RoomState>((set, get) => ({
     if (state.currentTime !== undefined && state.serverTimestamp !== undefined) {
         const serverTimeNow = Date.now() / 1000 - serverClockOffset;
         const timeSinceUpdate = serverTimeNow - state.serverTimestamp;
-        if (timeSinceUpdate < 0 || timeSinceUpdate > 5) return;
+        if (timeSinceUpdate < 0 || timeSinceUpdate > 3) return;
 
         const projectedTime = state.currentTime + (state.isPlaying ? timeSinceUpdate : 0);
         let playerTime = 0;
         try {
-            const rawPlayerTime = isUpload && audioElement ? audioElement.currentTime : player?.getCurrentTime() || 0;
-            playerTime = rawPlayerTime - manualLatencyOffset;
+            if (isUpload && audioElement) {
+              playerTime = (audioElement.currentTime || 0) - manualLatencyOffset;
+            } else if (player?.getCurrentTime) {
+              playerTime = (player.getCurrentTime() || 0) - manualLatencyOffset;
+            }
         } catch(e) {}
+        
         const drift = projectedTime - playerTime;
 
-        if (player && typeof player.setPlaybackRate === 'function') {
+        if (player?.setPlaybackRate && !isUpload && state.isPlaying) {
             if (Math.abs(drift) > ADAPTIVE_RATE_THRESHOLD && Math.abs(drift) < HARD_SYNC_THRESHOLD) {
-                const newRate = 1.0 + (drift > 0 ? PLAYBACK_RATE_ADJUST : -PLAYBACK_RATE_ADJUST);
-                if (player.getPlaybackRate() !== newRate) player.setPlaybackRate(newRate);
-            } else {
-                if (player.getPlaybackRate() !== 1.0) player.setPlaybackRate(1.0);
+                const newRate = 1.0 + Math.min(Math.max(drift * 0.5, -PLAYBACK_RATE_ADJUST * 2), PLAYBACK_RATE_ADJUST * 2);
+                if (Math.abs(player.getPlaybackRate() - newRate) > 0.001) {
+                  player.setPlaybackRate(newRate);
+                }
+            } else if (Math.abs(drift) < ADAPTIVE_RATE_THRESHOLD) {
+                if (Math.abs(player.getPlaybackRate() - 1.0) > 0.001) {
+                  player.setPlaybackRate(1.0);
+                }
             }
         }
         
         if (Math.abs(drift) > HARD_SYNC_THRESHOLD) {
             const seekTime = projectedTime + manualLatencyOffset;
-            if (isFinite(seekTime)) {
-                if (isUpload) target.currentTime = seekTime;
-                else target.seekTo(seekTime, true);
+            if (isFinite(seekTime) && seekTime >= 0) {
+                console.log(`🔄 Hard sync: drift=${drift.toFixed(3)}s, seeking to ${seekTime.toFixed(2)}s`);
+                try {
+                  if (isUpload && audioElement) {
+                    audioElement.currentTime = seekTime;
+                  } else if (player?.seekTo) {
+                    player.seekTo(seekTime, true);
+                  }
+                } catch(e) { console.warn('Seek error:', e); }
             }
         }
     }
     
     if (state.isPlaying !== undefined && state.isPlaying !== isPlaying) {
-        if (isUpload && audioElement) { 
-          state.isPlaying ? audioElement.play().catch(e => console.warn("Play failed:", e)) : audioElement.pause(); 
-        }
-        else if (player) { 
-          state.isPlaying ? player.playVideo() : player.pauseVideo(); 
-        }
-        set({ isPlaying: state.isPlaying });
+        const newPlayState = state.isPlaying;
+        set({ isPlaying: newPlayState });
+        
+        try {
+          if (isUpload && audioElement) { 
+            if (newPlayState) {
+              audioElement.play().catch(e => console.warn("Play failed:", e));
+            } else {
+              audioElement.pause();
+            }
+          } else if (player) { 
+            if (newPlayState) {
+              player.playVideo();
+            } else {
+              player.pauseVideo();
+            }
+          }
+        } catch(e) { console.warn('Play/pause error:', e); }
+    }
+    
+    if (state.volume !== undefined && state.volume !== volume) {
+      set({ volume: state.volume });
+      if (audioElement) audioElement.volume = state.volume / 100;
+      if (player?.setVolume) player.setVolume(state.volume);
+    }
+    
+    if (state.equalizer) {
+      const { audioNodes } = get();
+      if (audioNodes.bass) audioNodes.bass.gain.value = state.equalizer.bass;
+      if (audioNodes.mids) audioNodes.mids.gain.value = state.equalizer.mids;
+      if (audioNodes.treble) audioNodes.treble.gain.value = state.equalizer.treble;
+      set({ equalizer: state.equalizer });
+    }
+    
+    if (state.isCollaborative !== undefined) {
+      set({ isCollaborative: state.isCollaborative });
     }
   },
 
@@ -2057,27 +2207,29 @@ export const useRoomStore = create<RoomState>((set, get) => ({
   },
 
   initializePlayer: (domId) => {
-    // Guard: Only initialize once
-    if (get().audioElement && get().isAudioGraphConnected) {
-      console.log("Player already initialized, skipping duplicate initialization");
+    if (get().isAudioGraphConnected) {
+      console.log("Player already initialized");
       return;
     }
 
     const audioEl = new Audio();
     audioEl.crossOrigin = 'anonymous';
     audioEl.addEventListener('timeupdate', () => { if (!get().isSeeking) set({ currentTime: audioEl.currentTime }); });
-    audioEl.addEventListener('play', () => { set({ isPlaying: true }); });
-    audioEl.addEventListener('pause', () => { set({ isPlaying: false }); });
+    audioEl.addEventListener('play', () => { 
+      if (get().isAdmin) set({ isPlaying: true }); 
+    });
+    audioEl.addEventListener('pause', () => { 
+      if (get().isAdmin) set({ isPlaying: false }); 
+    });
     audioEl.addEventListener('ended', () => { if (get().isAdmin) get().nextTrack(); });
+    audioEl.addEventListener('error', (e) => console.error('Audio error:', e));
     set({ audioElement: audioEl });
 
     try {
-        // CRITICAL FIX: Only create global context and source ONCE
         if (!globalAudioContext) {
             globalAudioContext = new (window.AudioContext || (window as any).webkitAudioContext)();
             globalAudioSource = globalAudioContext.createMediaElementSource(audioEl);
             
-            // Set up filter chain
             const bass = globalAudioContext.createBiquadFilter(); 
             bass.type = 'lowshelf';
             bass.frequency.value = 200;
@@ -2094,7 +2246,6 @@ export const useRoomStore = create<RoomState>((set, get) => ({
             treble.frequency.value = 5000;
             treble.gain.value = 0;
             
-            // Connect chain: source -> bass -> mids -> treble -> destination
             globalAudioSource.connect(bass);
             bass.connect(mids);
             mids.connect(treble);
@@ -2111,20 +2262,41 @@ export const useRoomStore = create<RoomState>((set, get) => ({
               isAudioGraphConnected: true 
             });
             
-            console.log("✅ AudioContext and filters initialized successfully");
+            console.log("✅ AudioContext initialized");
         }
     } catch (e) { 
-      console.error("Error setting up AudioContext:", e); 
+      console.error("AudioContext error:", e); 
     }
     
+    const onPlayerReady = (e: any) => {
+      console.log('✅ YouTube player ready');
+      set({ player: e.target, playerReady: true });
+      const vol = get().volume;
+      if (e.target?.setVolume) e.target.setVolume(vol);
+    };
+
     const onPlayerStateChange = (e: any) => {
-        const { isAdmin, isPlaying, nextTrack, _emitStateUpdate } = get();
+        const { isAdmin, nextTrack, _emitStateUpdate, playerReady } = get();
+        if (!playerReady) return;
+        
         const newIsPlaying = e.data === window.YT.PlayerState.PLAYING;
-        set({ isPlaying: newIsPlaying });
-        if (isAdmin) {
-            if (e.data === window.YT.PlayerState.ENDED) { nextTrack(); return; }
-            if (newIsPlaying !== isPlaying) { _emitStateUpdate({ isPlaying: newIsPlaying }); }
+        
+        if (e.data === window.YT.PlayerState.ENDED && isAdmin) { 
+          nextTrack(); 
+          return; 
         }
+        
+        if (isAdmin && get().isPlaying !== newIsPlaying) {
+          set({ isPlaying: newIsPlaying });
+          setTimeout(() => _emitStateUpdate({ isPlaying: newIsPlaying }), 100);
+        }
+    };
+
+    const onPlayerError = (e: any) => {
+      console.error('YouTube player error:', e.data);
+      if (get().isAdmin) {
+        setTimeout(() => get().nextTrack(), 1000);
+      }
     };
 
     window.onYouTubeIframeAPIReady = () => { 
@@ -2132,91 +2304,162 @@ export const useRoomStore = create<RoomState>((set, get) => ({
         height: '0', 
         width: '0', 
         playerVars: { 
-          origin: window.location.origin, 
           controls: 0, 
-          disablekb: 1 
+          disablekb: 1,
+          enablejsapi: 1,
+          playsinline: 1,
+          origin: window.location.origin
         }, 
         events: { 
-          onReady: (e: any) => set({ player: e.target }), 
-          onStateChange: onPlayerStateChange 
+          onReady: onPlayerReady, 
+          onStateChange: onPlayerStateChange,
+          onError: onPlayerError
         }, 
       }); 
     };
+    
     if (window.YT?.Player) window.onYouTubeIframeAPIReady();
   },
 
-  setPlaylistData: (title, playlist) => { set({ playlistTitle: title, playlist, isLoading: false, error: null }); if (playlist.length > 0 && playlist[0].youtubeId) get().fetchLyrics(playlist[0].youtubeId); },
+  setPlaylistData: (title, playlist) => { 
+    set({ playlistTitle: title, playlist, isLoading: false, error: null }); 
+    if (playlist.length > 0 && playlist[0].youtubeId) get().fetchLyrics(playlist[0].youtubeId); 
+  },
   
   playPause: () => {
-    const { isAdmin, isCollaborative, isPlaying, player, audioElement, playlist, currentTrackIndex } = get();
+    const { isAdmin, isCollaborative, isPlaying, player, audioElement, playlist, currentTrackIndex, playerReady, contextUnlocked, audioNodes } = get();
     if (!isAdmin && !isCollaborative) return;
-    const isUpload = playlist[currentTrackIndex]?.isUpload;
-    if (isUpload && audioElement) { 
-      !isPlaying ? audioElement.play().catch(e => console.warn("Play failed:", e)) : audioElement.pause(); 
+    if (!playerReady) return;
+    
+    // Unlock audio context on first interaction
+    if (!contextUnlocked && audioNodes.context) {
+      if (audioNodes.context.state === 'suspended') {
+        audioNodes.context.resume().then(() => {
+          console.log('✅ AudioContext unlocked');
+          set({ contextUnlocked: true });
+        });
+      } else {
+        set({ contextUnlocked: true });
+      }
     }
-    else if (player) { 
-      !isPlaying ? player.playVideo() : player.pauseVideo(); 
+    
+    const track = playlist[currentTrackIndex];
+    const isUpload = track?.isUpload;
+    
+    try {
+      if (isUpload && audioElement) { 
+        if (!isPlaying) {
+          audioElement.play().catch(e => {
+            console.warn("Play failed:", e);
+            // Try to unlock context again
+            if (audioNodes.context?.state === 'suspended') {
+              audioNodes.context.resume();
+            }
+          }); 
+        } else {
+          audioElement.pause();
+        }
+      } else if (player) { 
+        if (!isPlaying) {
+          player.playVideo();
+        } else {
+          player.pauseVideo();
+        }
+      }
+      
+      const newState = !isPlaying;
+      set({ isPlaying: newState });
+      get()._emitStateUpdate({ isPlaying: newState });
+    } catch(e) {
+      console.error('Play/pause error:', e);
     }
-    get()._emitStateUpdate({ isPlaying: !isPlaying });
   },
 
   nextTrack: () => {
     const { isAdmin, isCollaborative, currentTrackIndex, playlist, player, audioElement } = get();
     if (!isAdmin && !isCollaborative) return;
     const newIndex = (currentTrackIndex + 1) % playlist.length;
-    player?.stopVideo();
+    if (player?.stopVideo) player.stopVideo();
     if (audioElement) { audioElement.pause(); audioElement.src = ''; }
-    get()._emitStateUpdate({ trackIndex: newIndex, currentTime: 0 });
+    set({ isPlaying: false });
+    get()._emitStateUpdate({ trackIndex: newIndex, currentTime: 0, isPlaying: false });
   },
 
   prevTrack: () => {
     const { isAdmin, isCollaborative, currentTrackIndex, playlist, player, audioElement } = get();
     if (!isAdmin && !isCollaborative) return;
     const newIndex = (currentTrackIndex - 1 + playlist.length) % playlist.length;
-    player?.stopVideo();
+    if (player?.stopVideo) player.stopVideo();
     if (audioElement) { audioElement.pause(); audioElement.src = ''; }
-    get()._emitStateUpdate({ trackIndex: newIndex, currentTime: 0 });
+    set({ isPlaying: false });
+    get()._emitStateUpdate({ trackIndex: newIndex, currentTime: 0, isPlaying: false });
   },
 
   selectTrack: (index) => {
     const { isAdmin, isCollaborative, currentTrackIndex, player, audioElement } = get();
     if (!isAdmin && !isCollaborative) return;
     if (index !== currentTrackIndex) {
-        player?.stopVideo();
+        if (player?.stopVideo) player.stopVideo();
         if (audioElement) { audioElement.pause(); audioElement.src = ''; }
-        get()._emitStateUpdate({ trackIndex: index, currentTime: 0 });
+        set({ isPlaying: false });
+        get()._emitStateUpdate({ trackIndex: index, currentTime: 0, isPlaying: false });
     } else {
         get().playPause();
     }
   },
 
-  setVolume: (volume) => { const { player, audioElement, isAdmin } = get(); if (audioElement) audioElement.volume = volume / 100; if (player?.setVolume) player.setVolume(volume); set({ volume }); if (isAdmin) get()._emitStateUpdate({ volume }); },
+  setVolume: (volume) => { 
+    const { player, audioElement, isAdmin } = get(); 
+    if (audioElement) audioElement.volume = volume / 100; 
+    if (player?.setVolume) player.setVolume(volume); 
+    set({ volume }); 
+    if (isAdmin) get()._emitStateUpdate({ volume }); 
+  },
   
-  setEqualizer: (settings) => { const { audioNodes, isAdmin } = get(); if (audioNodes.bass) audioNodes.bass.gain.value = settings.bass; if (audioNodes.mids) audioNodes.mids.gain.value = settings.mids; if (audioNodes.treble) audioNodes.treble.gain.value = settings.treble; set({ equalizer: settings }); if (isAdmin) get()._emitStateUpdate({ equalizer: settings }); },
+  setEqualizer: (settings) => { 
+    const { audioNodes, isAdmin } = get(); 
+    if (audioNodes.bass) audioNodes.bass.gain.value = settings.bass; 
+    if (audioNodes.mids) audioNodes.mids.gain.value = settings.mids; 
+    if (audioNodes.treble) audioNodes.treble.gain.value = settings.treble; 
+    set({ equalizer: settings }); 
+    if (isAdmin) get()._emitStateUpdate({ equalizer: settings }); 
+  },
   
-  toggleCollaborative: () => { const { isAdmin, isCollaborative } = get(); if (isAdmin) { const newState = !isCollaborative; set({ isCollaborative: newState }); get()._emitStateUpdate({ isCollaborative: newState }); } },
-  
-  primePlayer: () => { 
-    const { player, audioElement, audioNodes } = get(); 
-    if (audioNodes.context?.state === 'suspended') audioNodes.context.resume().catch(() => {}); 
-    if (audioElement) { 
-      audioElement.volume = 0; 
-      audioElement.play().catch(e => console.warn("Priming failed:", e)).then(() => audioElement.pause()); 
-    } 
-    if (player?.playVideo) { 
-      player.mute(); 
-      player.playVideo(); 
-      setTimeout(() => { player.pauseVideo(); player.unMute(); }, 250); 
+  toggleCollaborative: () => { 
+    const { isAdmin, isCollaborative } = get(); 
+    if (isAdmin) { 
+      const newState = !isCollaborative; 
+      set({ isCollaborative: newState }); 
+      get()._emitStateUpdate({ isCollaborative: newState }); 
     } 
   },
   
+  primePlayer: () => { 
+    const { audioNodes } = get(); 
+    
+    // Only unlock AudioContext, don't touch players
+    if (audioNodes.context?.state === 'suspended') {
+      audioNodes.context.resume()
+        .then(() => {
+          console.log('✅ AudioContext primed');
+          set({ contextUnlocked: true });
+        })
+        .catch(e => console.warn('Context unlock failed:', e));
+    } else {
+      set({ contextUnlocked: true });
+    }
+  },
+  
   fetchLyrics: async (youtubeId) => { 
+    set({ lyrics: { lines: [], isLoading: true } });
     try { 
       const res = await fetch(`${API_URL}/api/lyrics/${youtubeId}`); 
       if(res.ok) { 
         const lines = await res.json(); 
         set({ lyrics: { lines, isLoading: false } }); 
-      } 
+      } else {
+        set({ lyrics: { lines: [], isLoading: false } });
+      }
     } catch (e) { 
       set({ lyrics: { lines: [], isLoading: false } }); 
     } 
@@ -2229,9 +2472,11 @@ export const useRoomStore = create<RoomState>((set, get) => ({
       const res = await fetch(`${API_URL}/api/room/${roomCode}`); 
       if (res.ok) { 
         const data = await res.json(); 
-        if (JSON.stringify(data.playlist) !== JSON.stringify(playlist)) set({ playlist: data.playlist }); 
+        if (JSON.stringify(data.playlist) !== JSON.stringify(playlist)) {
+          set({ playlist: data.playlist });
+        }
       } 
-    } catch (e) {} 
+    } catch (e) { console.warn('Refresh playlist error:', e); } 
   },
   
   uploadFile: async (file, title, artist) => { 

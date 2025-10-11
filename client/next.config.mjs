@@ -1,9 +1,6 @@
-// client/next.config.mjs
-
 /** @type {import('next').NextConfig} */
 const nextConfig = {
   reactStrictMode: true,
-  // THIS BLOCK IS THE FIX FOR THE ALBUM ART
   images: {
     remotePatterns: [
       {
@@ -13,6 +10,10 @@ const nextConfig = {
         pathname: '/image/**',
       },
     ],
+    unoptimized: true,
+    dangerouslyAllowSVG: true,
+    contentDispositionType: 'attachment',
+    contentSecurityPolicy: "default-src 'self'; script-src 'none'; sandbox;",
   },
 };
 

@@ -61,8 +61,8 @@ const RoomSidebar = ({ roomCode, users, isAdmin, isCollaborative, onToggleCollab
             <motion.div initial={{opacity: 0, x: 20}} animate={{opacity: 1, x: 0}} transition={{delay: 0.6}}>
                 <h2 className="text-sm font-light text-gray-400 mb-3">In The Room ({users.length})</h2>
                 <div className="space-y-2 max-h-64 overflow-y-auto pr-2">
-                    {users.map((user) => (
-                        <div key={user.name} className="flex items-center gap-3 p-2 rounded-md bg-white/5">
+                    {users.map((user, idx) => (
+                        <div key={`${user.name}-${idx}`} className="flex items-center gap-3 p-2 rounded-md bg-white/5">
                             <span className="text-sm text-white truncate">{user.name}</span>
                             {user.isAdmin && <Crown size={14} className="ml-auto text-amber-400 flex-shrink-0" aria-label="Room Admin" />}
                         </div>
@@ -110,7 +110,7 @@ export default function RoomPage() {
   const [showUploadModal, setShowUploadModal] = useState(false);
 
   const { playlistTitle, playlist, currentTrackIndex, isLoading, error, users, isAdmin, volume, isCollaborative, isPlaying } = useRoomStore();
-  const { initializePlayer, setPlaylistData, setLoading, setError, playPause, nextTrack, prevTrack, selectTrack, setVolume, connect, disconnect, toggleCollaborative, primePlayer } = useRoomStore.getState();
+  const { initializePlayer, setPlaylistData, setLoading, setError, playPause, nextTrack, prevTrack, selectTrack, setVolume, connect, disconnect, toggleCollaborative } = useRoomStore.getState();
   
   const currentTrack = playlist[currentTrackIndex];
 
@@ -134,7 +134,6 @@ export default function RoomPage() {
   }, [roomCode, showNameModal, setPlaylistData, setLoading, setError]);
 
   const handleNameSubmit = (name: string) => {
-    primePlayer(); 
     if (roomCode) {
       connect(roomCode, name);
       setShowNameModal(false);
@@ -150,8 +149,8 @@ export default function RoomPage() {
   return (
     <div className="min-h-screen bg-black text-white overflow-hidden">
       <Script src="https://www.youtube.com/iframe_api" strategy="afterInteractive" />
-      <div id="youtube-player-container" className="fixed -z-10 top-0 left-0"></div>
-      <div className="absolute inset-0 z-0 opacity-50"><AnimatePresence>{currentTrack?.albumArt && (<motion.div key={currentTrack.youtubeId || currentTrack.audioUrl} initial={{ opacity: 0, scale: 1.1 }} animate={{ opacity: 1, scale: 1 }} exit={{ opacity: 0, scale: 1.1 }} transition={{ duration: 1.5, ease: "easeInOut" }} className="absolute inset-0"><Image src={currentTrack.albumArt} alt="background" layout="fill" objectFit="cover" className="blur-3xl saturate-50" /></motion.div>)}</AnimatePresence><div className="absolute inset-0 bg-black/70" /></div>
+      <div id="youtube-player-container" className="fixed -z-10 top-0 left-0 w-0 h-0 opacity-0"></div>
+      <div className="absolute inset-0 z-0 opacity-50"><AnimatePresence>{currentTrack?.albumArt && (<motion.div key={currentTrack.youtubeId || currentTrack.audioUrl} initial={{ opacity: 0, scale: 1.1 }} animate={{ opacity: 1, scale: 1 }} exit={{ opacity: 0, scale: 1.1 }} transition={{ duration: 1.5, ease: "easeInOut" }} className="absolute inset-0"><Image src={currentTrack.albumArt} alt="background" fill className="blur-3xl saturate-50 object-cover" unoptimized onError={(e) => { e.currentTarget.style.display = 'none'; }} /></motion.div>)}</AnimatePresence><div className="absolute inset-0 bg-black/70" /></div>
       
       <main className="relative z-10 grid grid-cols-1 lg:grid-cols-[2fr_1fr] gap-8 xl:gap-16 max-w-7xl mx-auto p-4 sm:p-8 h-screen">
         <div className="flex flex-col h-full pt-8 pb-32">
@@ -160,26 +159,28 @@ export default function RoomPage() {
           </motion.div>
           <motion.ul initial="hidden" animate="visible" className="mt-8 space-y-2 pr-4 -mr-4 flex-1 overflow-y-auto">
             {playlist.map((song, index) => (
-              <motion.li key={song.youtubeId || song.audioUrl || index} onClick={() => selectTrack(index)} className={`relative flex items-center gap-4 p-3 rounded-lg border transition-all duration-300 ${(isAdmin || isCollaborative) ? 'cursor-pointer' : 'cursor-default'} ${currentTrackIndex === index ? 'bg-white/10 border-white/20' : 'bg-transparent border-transparent hover:bg-white/5'}`}>
+              <motion.li key={`${song.youtubeId || song.audioUrl || index}-${index}`} onClick={() => selectTrack(index)} className={`relative flex items-center gap-4 p-3 rounded-lg border transition-all duration-300 ${(isAdmin || isCollaborative) ? 'cursor-pointer' : 'cursor-default'} ${currentTrackIndex === index ? 'bg-white/10 border-white/20' : 'bg-transparent border-transparent hover:bg-white/5'}`}>
                 <AnimatePresence>{currentTrackIndex === index && (<motion.div layoutId="playing-indicator" className="absolute inset-0 rounded-lg border-2 border-cyan-400"/>)}</AnimatePresence>
                 <div className="relative h-12 w-12 rounded-md overflow-hidden bg-gray-800 flex-shrink-0">
-               {song.albumArt ? (
-  <Image 
-    src={song.albumArt} 
-    alt={song.name} 
-    layout="fill" 
-    objectFit="cover"
-    unoptimized
-    onError={(e) => {
-      const target = e.target as HTMLImageElement;
-      target.style.display = 'none';
-    }}
-  />
-) : (
-  <div className="flex items-center justify-center h-full text-gray-500">
-    {song.isUpload ? '🎵' : '🎧'}
-  </div>
-)} </div>
+                  {song.albumArt ? (
+                    <Image 
+                      src={song.albumArt} 
+                      alt={song.name} 
+                      fill 
+                      className="object-cover"
+                      unoptimized
+                      onError={(e) => {
+                        e.currentTarget.style.display = 'none';
+                        const parent = e.currentTarget.parentElement;
+                        if (parent) {
+                          parent.innerHTML = '<div class="flex items-center justify-center h-full text-gray-500 text-2xl">🎵</div>';
+                        }
+                      }}
+                    />
+                  ) : (
+                    <div className="flex items-center justify-center h-full text-gray-500 text-2xl">{song.isUpload ? '🎵' : '🎧'}</div>
+                  )}
+                </div>
                 <div className="relative flex-grow min-w-0">
                   <p className="font-semibold text-white truncate">{song.name}</p>
                   <p className="text-sm text-gray-400 truncate">{song.artist}</p>
