@@ -4,7 +4,7 @@ import { io, Socket } from 'socket.io-client';
 const API_URL = process.env.NEXT_PUBLIC_API_URL || 'http://localhost:5001';
 
 // --- INTERFACES ---
-interface Song { name: string; artist: string; albumArt: string | null; youtubeId: string | null; isUpload: boolean; audioUrl: string | null; }
+interface Song { name: string; artist: string; albumArt: string | null; isUpload: boolean; audioUrl: string | null; }
 interface User { name: string; isAdmin: boolean; }
 declare global { interface Window { webkitAudioContext: any; } }
 interface EqualizerSettings { bass: number; mids: number; treble: number; }
@@ -20,10 +20,10 @@ interface RoomState {
   currentTime: number; duration: number; isConnecting: boolean; isDisconnected: boolean;
   connect: (roomCode: string, username: string) => void; disconnect: () => void;
   primePlayer: () => void; _emitStateUpdate: (overrideState?: Partial<Omit<SyncState, 'serverTimestamp'>>) => void;
-  syncPlayerState: (state: SyncState) => void; setPlaylistData: (title: string, playlist: Song[]) => void;
+  syncPlayerState: (state: SyncState) => void;
+  setRoomData: (data: { playlist_title: string; playlist: Song[] }) => void;
   selectTrack: (index: number) => void; playPause: () => void; nextTrack: () => void; prevTrack: () => void;
   setVolume: (volume: number) => void; setEqualizer: (settings: EqualizerSettings) => void;
-  toggleCollaborative: () => void;
   uploadFile: (file: File, title?: string, artist?: string) => Promise<any>;
   setLoading: (loading: boolean) => void; setError: (error: string | null) => void;
   setIsSeeking: (seeking: boolean) => void;
@@ -49,13 +49,12 @@ export const useRoomStore = create<RoomState>()((set, get) => ({
   setIsSeeking: (seeking) => set({ isSeeking: seeking }),
 
   connect: (roomCode, username) => {
-    if (get().socket || get().isConnecting) return;
+    if (get().socket) return;
     set({ isConnecting: true, isDisconnected: false, username });
     const socket = io(API_URL, { transports: ['websocket'] });
     set({ socket, roomCode });
 
     socket.on('connect', () => {
-      console.log('✅ Connected to server.');
       set({ isConnecting: false });
       socket.emit('join_room', { room_code: roomCode, username: get().username });
     });
@@ -65,21 +64,13 @@ export const useRoomStore = create<RoomState>()((set, get) => ({
     socket.on('update_user_list', (users: User[]) => set({ users, isAdmin: !!users.find((u: User) => u.name === get().username)?.isAdmin }));
     socket.on('load_current_state', (state) => get().syncPlayerState(state));
     socket.on('sync_player_state', (state) => get().syncPlayerState(state));
-    socket.on('refresh_playlist', async () => {
-      try {
-        const res = await fetch(`${API_URL}/api/room/${get().roomCode}`);
-        if(res.ok) {
-            const data = await res.json();
-            get().setPlaylistData(data.playlist_title, data.playlist);
-        }
-      } catch (e) { console.error("Refresh failed", e) }
-    });
+    socket.on('refresh_playlist', (data) => get().setRoomData(data));
   },
 
   disconnect: () => {
     get().audioElement?.pause();
     get().socket?.disconnect();
-    set({ socket: null, isAudioGraphConnected: false });
+    set({ socket: null, isAudioGraphConnected: false, playlist: [], currentTrackIndex: 0, isPlaying: false });
   },
 
   primePlayer: () => {
@@ -90,13 +81,11 @@ export const useRoomStore = create<RoomState>()((set, get) => ({
       const AudioContext = window.AudioContext || window.webkitAudioContext;
       const context = new AudioContext();
       if (context.state === 'suspended') context.resume();
-      
       const source = context.createMediaElementSource(audioEl);
       const bass = context.createBiquadFilter(); bass.type = "lowshelf"; bass.frequency.value = 250;
       const mids = context.createBiquadFilter(); mids.type = "peaking"; mids.frequency.value = 1000; mids.Q.value = 0.8;
       const treble = context.createBiquadFilter(); treble.type = "highshelf"; treble.frequency.value = 3000;
       source.connect(bass).connect(mids).connect(treble).connect(context.destination);
-      
       set({ audioNodes: { context, source, bass, mids, treble }, isAudioGraphConnected: true });
       audioEl.ontimeupdate = () => { if (!get().isSeeking) set({ currentTime: audioEl.currentTime }); };
       audioEl.onloadedmetadata = () => set({ duration: audioEl.duration });
@@ -108,10 +97,9 @@ export const useRoomStore = create<RoomState>()((set, get) => ({
   },
 
   _emitStateUpdate: (overrideState) => {
-    const state = get(); // Get the whole state object
-    if (!state.socket || (!state.isAdmin && !state.isCollaborative)) return;
-
-    const liveState = {
+    const state = get();
+    if (!state.socket || !state.isAdmin) return;
+    const liveState: SyncState = {
       isPlaying: state.isPlaying, trackIndex: state.currentTrackIndex,
       currentTime: state.audioElement?.currentTime ?? 0, volume: state.volume,
       equalizer: state.equalizer, isCollaborative: state.isCollaborative,
@@ -129,18 +117,16 @@ export const useRoomStore = create<RoomState>()((set, get) => ({
 
     if (state.trackIndex !== undefined && state.trackIndex !== currentTrackIndex) {
         const track = playlist[state.trackIndex];
-        if (track?.audioUrl) {
-            audioElement.src = track.audioUrl;
-            audioElement.load();
-        }
+        if (track?.audioUrl) { audioElement.src = track.audioUrl; audioElement.load(); }
         set({ currentTrackIndex: state.trackIndex });
     }
     
-    const timeDrift = Math.abs((state.currentTime ?? 0) - audioElement.currentTime);
-    if (timeDrift > 1.5) { audioElement.currentTime = state.currentTime ?? 0; }
+    if(state.currentTime !== undefined && Math.abs(state.currentTime - audioElement.currentTime) > 1.5) {
+        audioElement.currentTime = state.currentTime;
+    }
     
     if (state.isPlaying !== undefined && state.isPlaying !== isPlaying) {
-        state.isPlaying ? audioElement.play().catch(e => console.warn("Autoplay was blocked by browser", e)) : audioElement.pause();
+        state.isPlaying ? audioElement.play().catch(e => console.warn("Autoplay blocked", e)) : audioElement.pause();
         set({ isPlaying: state.isPlaying });
     }
     
@@ -148,30 +134,20 @@ export const useRoomStore = create<RoomState>()((set, get) => ({
       set({ volume: state.volume });
       audioElement.volume = state.volume / 100;
     }
-    if (state.equalizer) { 
-        set({ equalizer: state.equalizer });
-        const { bass, mids, treble } = get().audioNodes;
-        if(bass && mids && treble) {
-          bass.gain.value = state.equalizer.bass;
-          mids.gain.value = state.equalizer.mids;
-          treble.gain.value = state.equalizer.treble;
-        }
-    }
-    if (state.isCollaborative !== undefined) set({ isCollaborative: state.isCollaborative });
   },
 
-  setPlaylistData: (title, playlist) => set({ playlistTitle: title, playlist, isLoading: false, error: null }),
+  setRoomData: (data) => set({ playlistTitle: data.playlist_title, playlist: data.playlist, isLoading: false, error: null }),
   selectTrack: (index) => {
       const { playlist, currentTrackIndex } = get();
-      if(index === currentTrackIndex) { get().playPause(); return; }
+      if (index === currentTrackIndex) return get().playPause();
       if (playlist[index]?.audioUrl) get()._emitStateUpdate({ trackIndex: index, currentTime: 0, isPlaying: true });
+      else console.log("Cannot select track without audioUrl");
   },
   playPause: () => get()._emitStateUpdate({ isPlaying: !get().isPlaying }),
   nextTrack: () => { const newIndex = (get().currentTrackIndex + 1) % get().playlist.length; get().selectTrack(newIndex); },
   prevTrack: () => { const newIndex = (get().currentTrackIndex - 1 + get().playlist.length) % get().playlist.length; get().selectTrack(newIndex); },
-  setVolume: (volume) => { get()._emitStateUpdate({ volume }); },
-  setEqualizer: (settings) => { get()._emitStateUpdate({ equalizer: settings }); },
-  toggleCollaborative: () => get()._emitStateUpdate({ isCollaborative: !get().isCollaborative }),
+  setVolume: (volume) => get()._emitStateUpdate({ volume }),
+  setEqualizer: (settings) => get()._emitStateUpdate({ equalizer: settings }),
   
   uploadFile: async (file, title, artist) => {
     const { roomCode } = get();
@@ -179,11 +155,10 @@ export const useRoomStore = create<RoomState>()((set, get) => ({
     formData.append('file', file);
     const res = await fetch(`${API_URL}/api/upload`, { method: 'POST', body: formData });
     if (!res.ok) throw new Error('Upload failed');
-    const data = await res.json();
+    const { audioUrl } = await res.json();
     await fetch(`${API_URL}/api/room/${roomCode}/add-upload`, {
         method: 'POST', headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ title: title || file.name.replace(/\.[^/.]+$/, ''), artist: artist || 'Unknown Artist', audioUrl: data.audioUrl })
+        body: JSON.stringify({ title: title || file.name.replace(/\.[^/.]+$/, ''), artist: artist || 'Unknown Artist', audioUrl })
     });
-    return data;
   },
 }));
