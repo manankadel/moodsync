@@ -135,7 +135,7 @@ export default function RoomPage() {
 
   const handleNameSubmit = (name: string) => {
     if (roomCode) {
-      primePlayer(); // FIX: Proactively unlock AudioContext on user interaction
+      primePlayer();
       connect(roomCode, name);
       setShowNameModal(false);
     }
@@ -151,7 +151,7 @@ export default function RoomPage() {
     <div className="min-h-screen bg-black text-white overflow-hidden">
       <Script src="https://www.youtube.com/iframe_api" strategy="afterInteractive" />
       <div id="youtube-player-container" className="fixed -z-10 top-0 left-0 w-0 h-0 opacity-0"></div>
-      <div className="absolute inset-0 z-0 opacity-50"><AnimatePresence>{currentTrack?.albumArt && (<motion.div key={currentTrack.youtubeId || currentTrack.audioUrl} initial={{ opacity: 0, scale: 1.1 }} animate={{ opacity: 1, scale: 1 }} exit={{ opacity: 0, scale: 1.1 }} transition={{ duration: 1.5, ease: "easeInOut" }} className="absolute inset-0"><Image src={currentTrack.albumArt} alt="background" fill className="blur-3xl saturate-50 object-cover" unoptimized onError={(e) => { e.currentTarget.style.display = 'none'; }} /></motion.div>)}</AnimatePresence><div className="absolute inset-0 bg-black/70" /></div>
+      <div className="absolute inset-0 z-0 opacity-50"><AnimatePresence>{currentTrack?.albumArt && (<motion.div key={currentTrack.youtubeId || currentTrack.audioUrl} initial={{ opacity: 0, scale: 1.1 }} animate={{ opacity: 1, scale: 1 }} exit={{ opacity: 0, scale: 1.1 }} transition={{ duration: 1.5, ease: "easeInOut" }} className="absolute inset-0"><Image src={currentTrack.albumArt} alt="background" fill className="blur-3xl saturate-50 object-cover" unoptimized /></motion.div>)}</AnimatePresence><div className="absolute inset-0 bg-black/70" /></div>
       
       <main className="relative z-10 grid grid-cols-1 lg:grid-cols-[2fr_1fr] gap-8 xl:gap-16 max-w-7xl mx-auto p-4 sm:p-8 h-screen">
         <div className="flex flex-col h-full pt-8 pb-32">
@@ -170,13 +170,6 @@ export default function RoomPage() {
                       fill 
                       className="object-cover"
                       unoptimized
-                      onError={(e) => {
-                        e.currentTarget.style.display = 'none';
-                        const parent = e.currentTarget.parentElement;
-                        if (parent) {
-                          parent.innerHTML = '<div class="flex items-center justify-center h-full text-gray-500 text-2xl">🎵</div>';
-                        }
-                      }}
                     />
                   ) : (
                     <div className="flex items-center justify-center h-full text-gray-500 text-2xl">{song.isUpload ? '🎵' : '🎧'}</div>
