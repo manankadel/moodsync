@@ -103,8 +103,24 @@ export default function Player({ albumArt, title, artist, isPlaying, volume, onP
         <BeatVisualizer />
         <div className="relative z-10 grid grid-cols-[1fr_2fr_1fr] items-center gap-4 sm:gap-8 w-full">
           <div className="flex items-center gap-4 min-w-0">
-            <div className="relative h-14 w-14 sm:h-16 sm:w-16 flex-shrink-0 rounded-lg bg-gray-800 shadow-lg">{albumArt && <Image src={albumArt} alt={title} layout="fill" objectFit="cover" className="rounded-lg"/>}</div>
-            <div className="min-w-0 hidden sm:block"><p className="font-semibold text-lg text-white truncate">{title}</p><p className="font-light text-sm text-gray-400 truncate">{artist}</p></div>
+          <div className="relative h-12 w-12 rounded-md overflow-hidden bg-gray-800 flex-shrink-0">
+  {albumArt ? (
+    <Image 
+      src={albumArt} 
+      alt={title} 
+      layout="fill" 
+      objectFit="cover"
+      unoptimized
+      onError={(e) => {
+        const target = e.target as HTMLImageElement;
+        target.style.display = 'none';
+      }}
+    />
+  ) : (
+    <div className="flex items-center justify-center h-full text-gray-500">🎵</div>
+  )}
+</div>
+  <div className="min-w-0 hidden sm:block"><p className="font-semibold text-lg text-white truncate">{title}</p><p className="font-light text-sm text-gray-400 truncate">{artist}</p></div>
           </div>
           
           <div className="flex flex-col items-center gap-2 w-full">

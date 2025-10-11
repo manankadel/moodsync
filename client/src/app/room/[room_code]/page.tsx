@@ -163,8 +163,23 @@ export default function RoomPage() {
               <motion.li key={song.youtubeId || song.audioUrl || index} onClick={() => selectTrack(index)} className={`relative flex items-center gap-4 p-3 rounded-lg border transition-all duration-300 ${(isAdmin || isCollaborative) ? 'cursor-pointer' : 'cursor-default'} ${currentTrackIndex === index ? 'bg-white/10 border-white/20' : 'bg-transparent border-transparent hover:bg-white/5'}`}>
                 <AnimatePresence>{currentTrackIndex === index && (<motion.div layoutId="playing-indicator" className="absolute inset-0 rounded-lg border-2 border-cyan-400"/>)}</AnimatePresence>
                 <div className="relative h-12 w-12 rounded-md overflow-hidden bg-gray-800 flex-shrink-0">
-                  {song.albumArt ? <Image src={song.albumArt} alt={song.name} layout="fill" objectFit="cover" /> : <div className="flex items-center justify-center h-full text-gray-500">{song.isUpload ? '🎵' : '🎧'}</div>}
-                </div>
+               {song.albumArt ? (
+  <Image 
+    src={song.albumArt} 
+    alt={song.name} 
+    layout="fill" 
+    objectFit="cover"
+    unoptimized
+    onError={(e) => {
+      const target = e.target as HTMLImageElement;
+      target.style.display = 'none';
+    }}
+  />
+) : (
+  <div className="flex items-center justify-center h-full text-gray-500">
+    {song.isUpload ? '🎵' : '🎧'}
+  </div>
+)} </div>
                 <div className="relative flex-grow min-w-0">
                   <p className="font-semibold text-white truncate">{song.name}</p>
                   <p className="text-sm text-gray-400 truncate">{song.artist}</p>
