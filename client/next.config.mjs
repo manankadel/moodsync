@@ -10,10 +10,6 @@ const nextConfig = {
         pathname: '/image/**',
       },
     ],
-    unoptimized: true,
-    dangerouslyAllowSVG: true,
-    contentDispositionType: 'attachment',
-    contentSecurityPolicy: "default-src 'self'; script-src 'none'; sandbox;",
   },
 };
 

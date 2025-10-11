@@ -14,11 +14,12 @@ load_dotenv()
 app = Flask(__name__)
 app.wsgi_app = ProxyFix(app.wsgi_app, x_for=1, x_proto=1, x_host=1, x_prefix=1)
 
-# --- ROBUST CORS CONFIGURATION ---
+# --- BULLETPROOF CORS CONFIGURATION ---
 frontend_url = os.getenv("FRONTEND_URL")
 allowed_origins = ["http://localhost:3000"]
 if frontend_url:
     allowed_origins.append(frontend_url)
+    # Handle both www and non-www versions for production robustness
     if "www." in frontend_url:
         allowed_origins.append(frontend_url.replace("www.", ""))
     elif "https://" in frontend_url:
