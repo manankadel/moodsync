@@ -24,7 +24,9 @@ interface RoomState {
   primePlayer: () => void;
   _emitStateUpdate: (overrideState?: Partial<SyncState>) => void;
   syncPlayerState: (state: SyncState) => void;
-  setRoomData: (data: { playlistTitle: string; playlist: Song[] }) => void;
+  setRoomData: (data: {
+    title: string | undefined; playlistTitle: string; playlist: Song[] 
+}) => void;
   selectTrack: (index: number) => void;
   playPause: () => void;
   nextTrack: () => void;
@@ -53,7 +55,6 @@ export const useRoomStore = create<RoomState>()((set, get) => ({
   currentTime: 0, duration: 0, isConnecting: false, isDisconnected: false,
 
   setLoading: (loading) => set({ isLoading: loading }),
-  // THIS IS THE FINAL FIX: Removed the duplicate 'isLoading' key.
   setError: (error) => set({ error, isLoading: false }),
   setIsSeeking: (seeking) => set({ isSeeking: seeking }),
 
@@ -94,12 +95,11 @@ export const useRoomStore = create<RoomState>()((set, get) => ({
         const treble = context.createBiquadFilter(); treble.type = "highshelf"; treble.frequency.value = 3000;
         source.connect(bass).connect(mids).connect(treble).connect(context.destination);
         set({ audioNodes: { context, source, bass, mids, treble }, isAudioGraphConnected: true });
-
         audio.ontimeupdate = () => set({ currentTime: audio.currentTime });
         audio.onloadedmetadata = () => set({ duration: audio.duration });
         audio.onended = () => { if(get().isAdmin) get().nextTrack(); };
-        audio.onplaying = () => { if(!get().isPlaying) set({ isPlaying: true }); };
-        audio.onpause = () => { if(get().isPlaying) set({ isPlaying: false }); };
+        audio.onplaying = () => set({ isPlaying: true });
+        audio.onpause = () => set({ isPlaying: false });
     } catch (e) { console.error("Could not prime audio player.", e); }
   },
   
@@ -127,12 +127,12 @@ export const useRoomStore = create<RoomState>()((set, get) => ({
     }
   },
 
-  setRoomData: (data) => set({ playlistTitle: data.playlistTitle, playlist: data.playlist, isLoading: false, error: null }),
+  setRoomData: (data) => set({ playlistTitle: data.title, playlist: data.playlist, isLoading: false, error: null }),
 
   playPause: () => {
     if (!get().isAdmin) return;
     const { audioElement, isPlaying } = get();
-    set({ isPlaying: !isPlaying }); // Instantly update UI
+    set({ isPlaying: !isPlaying });
     isPlaying ? audioElement?.pause() : audioElement?.play();
     get()._emitStateUpdate({ isPlaying: !isPlaying, currentTime: audioElement?.currentTime });
   },

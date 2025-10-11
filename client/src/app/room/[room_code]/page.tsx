@@ -15,7 +15,7 @@ const API_URL = process.env.NEXT_PUBLIC_API_URL || 'http://localhost:5001';
 
 const MemoizedPlayer = memo(Player);
 
-const UsernameModal = ( { onSubmit }: { onSubmit: (name: string) => void }) => {
+const UsernameModal = ({ onSubmit }: { onSubmit: (name: string) => void }) => {
     const [name, setName] = useState('');
     return (
         <motion.div initial={{ opacity: 0 }} animate={{ opacity: 1 }} className="fixed inset-0 z-50 bg-black/80 flex items-center justify-center p-4">
@@ -87,7 +87,7 @@ export default function RoomPage() {
   const [showUploadModal, setShowUploadModal] = useState(false);
 
   // State selectors
-  const { connect, disconnect, primePlayer, setRoomData, setLoading, setError } = useRoomStore.getState();
+  const { setRoomData, setLoading, setError, connect, disconnect, primePlayer } = useRoomStore.getState();
   const state = useRoomStore(s => ({
     isLoading: s.isLoading, error: s.error,
     playlist: s.playlist, currentTrackIndex: s.currentTrackIndex, playlistTitle: s.playlistTitle,
@@ -104,11 +104,9 @@ export default function RoomPage() {
 
   // Connection Management Effect
   useEffect(() => {
-    // Only auto-connect if user has entered their name
-    if (!showNameModal && roomCode) {
-      connect(roomCode, "Guest"); // Default username if needed
+    if (!showNameModal) {
+      connect(roomCode, "Guest");
     }
-    // Cleanup on component unmount
     return () => disconnect();
   }, [roomCode, showNameModal, connect, disconnect]);
   
@@ -125,13 +123,12 @@ export default function RoomPage() {
 
   const handleNameSubmit = (name: string) => {
     setShowNameModal(false);
-    // primePlayer MUST be called from a direct user interaction
     primePlayer(); 
     connect(roomCode, name);
   };
   
   if (state.isLoading) return <main className="flex min-h-screen items-center justify-center bg-black"><p>Loading Room...</p></main>;
-  if (state.error) return <main className="flex min-h-screen flex-col gap-4 items-center justify-center bg-black p-4 text-center"><h1 className='text-2xl text-red-500 font-bold'>Connection Error</h1><p className="text-gray-300">{state.error}</p><Link href="/" className="mt-4 p-2 bg-cyan-600 rounded-md">Go Home</Link></main>;
+  if (state.error) return <main className="flex min-h-screen flex-col gap-4 items-center justify-center bg-black p-4 text-center"><h1 className='text-2xl text-red-500 font-bold'>Error</h1><p className="text-gray-300">{state.error}</p><Link href="/" className="mt-4 p-2 bg-cyan-600 rounded-md">Go Home</Link></main>;
   if (showNameModal) return <UsernameModal onSubmit={handleNameSubmit} />;
 
   return (
