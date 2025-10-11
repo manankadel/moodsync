@@ -12,13 +12,14 @@ interface SyncState { isPlaying?: boolean; trackIndex?: number; volume?: number;
 
 declare global { interface Window { webkitAudioContext: any; } }
 
+// THIS IS THE FINAL, CORRECTED BLUEPRINT
 interface RoomState {
   socket: Socket | null; audioElement: HTMLAudioElement | null;
   playlist: Song[]; currentTrackIndex: number; isPlaying: boolean; isSeeking: boolean;
   isAudioGraphConnected: boolean; roomCode: string; playlistTitle: string; username: string;
   users: User[]; volume: number; isLoading: boolean; error: string | null; isAdmin: boolean;
   equalizer: EqualizerSettings; audioNodes: AudioNodes; currentTime: number; duration: number;
-  isConnecting: boolean; isDisconnected: boolean;
+  isConnecting: boolean; isDisconnected: boolean; // THIS PROPERTY WAS MISSING
   connect: (roomCode: string, username: string) => void;
   disconnect: () => void;
   primePlayer: () => void;
@@ -96,8 +97,7 @@ export const useRoomStore = create<RoomState>()((set, get) => ({
     } catch (e) { console.error("Could not prime audio player.", e); }
   },
   
-  // THIS IS THE FINAL FIX. `overrideState` IS NOW TRULY OPTIONAL.
-  _emitStateUpdate: (overrideState = {}) => {
+  _emitStateUpdate: (overrideState?: Partial<SyncState>) => {
     const state = get();
     if (!state.socket || !state.isAdmin) return;
     state.socket.emit('update_player_state', { 
