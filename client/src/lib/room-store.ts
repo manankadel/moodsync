@@ -3,7 +3,6 @@ import { io, Socket } from 'socket.io-client';
 
 const API_URL = process.env.NEXT_PUBLIC_API_URL || 'http://localhost:5001';
 
-// --- Synchronization Constants ---
 const HARD_SYNC_THRESHOLD = 0.25; 
 const ADAPTIVE_RATE_THRESHOLD = 0.05; 
 const PLAYBACK_RATE_ADJUST = 0.015; 
@@ -108,11 +107,8 @@ export const useRoomStore = create<RoomState>((set, get) => ({
     socket?.emit('update_player_state', { 
       room_code: roomCode, 
       state: { 
-        isPlaying, 
-        trackIndex: currentTrackIndex, 
-        currentTime, 
-        timestamp: Date.now() / 1000, 
-        ...overrideState 
+        isPlaying, trackIndex: currentTrackIndex, currentTime, 
+        timestamp: Date.now() / 1000, ...overrideState 
       }
     });
   },
@@ -121,7 +117,6 @@ export const useRoomStore = create<RoomState>((set, get) => ({
     const { player, audioElement, playlist, currentTrackIndex, isPlaying, isSeeking, manualLatencyOffset, serverClockOffset, playerReady, volume, isAdmin, nextTrack } = get();
     if (isSeeking || !playerReady) return;
 
-    // --- TRACK CHANGE LOGIC ---
     if (state.trackIndex !== undefined && state.trackIndex !== currentTrackIndex) {
         set({ currentTrackIndex: state.trackIndex });
         const track = playlist[state.trackIndex];
@@ -132,25 +127,19 @@ export const useRoomStore = create<RoomState>((set, get) => ({
             return;
         }
 
-        // **DEFINITIVE FIX: EXPLICIT PLAYER SWITCHING**
         if (track.isUpload) {
-            // It's an upload: Stop YouTube, prepare Audio element
             if (player?.stopVideo) player.stopVideo();
             if (audioElement && track.audioUrl) {
-                console.log(`Loading audio source: ${track.audioUrl}`);
                 audioElement.src = track.audioUrl;
                 audioElement.volume = volume / 100;
                 audioElement.load();
             }
         } else {
-            // It's YouTube: Stop Audio element, prepare YouTube player
             if (audioElement) {
                 audioElement.pause();
                 audioElement.src = '';
-                try { audioElement.load(); } catch (e) { /* ignore */ } // Reset the element
             }
             if (player && track.youtubeId) {
-                console.log(`Loading YouTube video: ${track.youtubeId}`);
                 player.loadVideoById(track.youtubeId);
                 player.setVolume(volume);
                 get().fetchLyrics(track.youtubeId);
@@ -161,7 +150,6 @@ export const useRoomStore = create<RoomState>((set, get) => ({
     const targetTrack = playlist[get().currentTrackIndex];
     if (!targetTrack) return;
 
-    // --- TIME SYNC LOGIC ---
     if (state.currentTime !== undefined && state.serverTimestamp !== undefined) {
         const serverTimeNow = Date.now() / 1000 - serverClockOffset;
         const timeSinceUpdate = serverTimeNow - state.serverTimestamp;
@@ -176,7 +164,6 @@ export const useRoomStore = create<RoomState>((set, get) => ({
             
             const drift = projectedTime - playerTime;
             
-            // Adaptive rate for YouTube videos
             if (!targetTrack.isUpload && player?.setPlaybackRate && state.isPlaying) {
                 if (Math.abs(drift) > ADAPTIVE_RATE_THRESHOLD && Math.abs(drift) < HARD_SYNC_THRESHOLD) {
                     const newRate = 1.0 + Math.min(Math.max(drift * 0.5, -PLAYBACK_RATE_ADJUST * 2), PLAYBACK_RATE_ADJUST * 2);
@@ -186,7 +173,6 @@ export const useRoomStore = create<RoomState>((set, get) => ({
                 }
             }
             
-            // Hard sync for large drift
             if (Math.abs(drift) > HARD_SYNC_THRESHOLD) {
                 const seekTime = projectedTime + manualLatencyOffset;
                 if (isFinite(seekTime) && seekTime >= 0) {
@@ -200,7 +186,6 @@ export const useRoomStore = create<RoomState>((set, get) => ({
         }
     }
     
-    // --- PLAY/PAUSE SYNC LOGIC ---
     if (state.isPlaying !== undefined && state.isPlaying !== isPlaying) {
         set({ isPlaying: state.isPlaying });
         try {
@@ -230,11 +215,10 @@ export const useRoomStore = create<RoomState>((set, get) => ({
   _syncClock: async () => {
     try {
         const res = await fetch(`${API_URL}/ping`);
-        if (!res.ok) throw new Error(`Ping failed with status ${res.status}`);
+        if (!res.ok) throw new Error(`Ping failed: ${res.status}`);
         const clientReceiveTime = Date.now() / 1000;
         const data = await res.json();
         const serverTime = data.serverTime;
-        // Simplified RTT/offset calculation, assuming negligible client-send time for this sync
         const offset = clientReceiveTime - serverTime;
         set({ serverClockOffset: offset });
     } catch (e) { console.warn("Clock sync failed:", e); }
@@ -308,7 +292,7 @@ export const useRoomStore = create<RoomState>((set, get) => ({
 
   setPlaylistData: (title, playlist) => { 
     set({ playlistTitle: title, playlist, isLoading: false, error: null }); 
-    if (playlist.length > 0 && playlist[0].youtubeId) get().fetchLyrics(playlist[0].youtubeId); 
+    if (playlist.length > 0 && playlist[0]?.youtubeId) get().fetchLyrics(playlist[0].youtubeId); 
   },
   
   playPause: () => {
@@ -324,7 +308,6 @@ export const useRoomStore = create<RoomState>((set, get) => ({
     if (!track) return;
     
     try {
-      // **DEFINITIVE FIX: Use explicit if/else based on track type**
       if (track.isUpload) {
           if (audioElement) isPlaying ? audioElement.pause() : audioElement.play().catch(e => console.error("Audio play failed", e));
       } else {

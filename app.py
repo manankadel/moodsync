@@ -14,6 +14,7 @@ load_dotenv()
 app = Flask(__name__)
 app.wsgi_app = ProxyFix(app.wsgi_app, x_for=1, x_proto=1, x_host=1, x_prefix=1)
 
+# --- ROBUST CORS CONFIGURATION ---
 frontend_url = os.getenv("FRONTEND_URL")
 allowed_origins = ["http://localhost:3000"]
 if frontend_url:
@@ -22,6 +23,7 @@ if frontend_url:
         allowed_origins.append(frontend_url.replace("www.", ""))
     elif "https://" in frontend_url:
         allowed_origins.append(frontend_url.replace("https://", "https://www."))
+# --- END OF CORS CONFIGURATION ---
 
 CORS(app, origins=allowed_origins, supports_credentials=True)
 socketio = SocketIO(app, cors_allowed_origins=allowed_origins, ping_timeout=60, ping_interval=25)
@@ -71,7 +73,6 @@ GENRE_CONFIGS = {
     'deep-house-mix': {'search_query': 'deep house mix'}, 'default': {'seeds': ['music', 'pop']}
 }
 
-# FINAL FIX: Corrected the broken fallback image URL
 FALLBACK_PLAYLIST = [
     {'name': 'Blinding Lights', 'artist': 'The Weeknd', 'albumArt': 'https://i.scdn.co/image/ab67616d0000b2738863bc11d2aa12b54f5aeb36', 'youtubeId': '4NRXx6U8ABQ'},
     {'name': 'As It Was', 'artist': 'Harry Styles', 'albumArt': 'https://i.scdn.co/image/ab67616d0000b27346f74097652c7f3a3a08237', 'youtubeId': 'H5v3kku4y6Q'},
@@ -195,15 +196,11 @@ def generate_route():
     
     title = genre.replace('-', ' ').title() if genre != 'default' else "Curated Vibes"
     room_data = {
-        'playlist': playlist, 
-        'title': title, 
-        'users': {}, 
-        'admin_sid': None,
+        'playlist': playlist, 'title': title, 'users': {}, 'admin_sid': None,
         'current_state': {
             'isPlaying': False, 'trackIndex': 0, 'currentTime': 0, 'volume': 80, 
             'timestamp': time.time(), 'serverTimestamp': time.time(), 
-            'equalizer': {'bass': 0, 'mids': 0, 'treble': 0},
-            'isCollaborative': False
+            'equalizer': {'bass': 0, 'mids': 0, 'treble': 0}, 'isCollaborative': False
         },
         'created_at': time.time()
     }
