@@ -14,10 +14,19 @@ load_dotenv()
 app = Flask(__name__)
 app.wsgi_app = ProxyFix(app.wsgi_app, x_for=1, x_proto=1, x_host=1, x_prefix=1)
 
-frontend_url = os.getenv("FRONTEND_URL") or os.getenv("CORS_ALLOWED_ORIGIN")
-allowed_origins = ["http://localhost:3000"]
+# --- ROBUST CORS CONFIGURATION ---
+# This new setup handles multiple frontend URLs gracefully.
+frontend_url = os.getenv("FRONTEND_URL")
+allowed_origins = ["http://localhost:3000"] # Always allow local development
 if frontend_url:
     allowed_origins.append(frontend_url)
+    # Automatically add both www and non-www versions if applicable
+    if "www." in frontend_url:
+        allowed_origins.append(frontend_url.replace("www.", ""))
+    elif "https://" in frontend_url:
+        allowed_origins.append(frontend_url.replace("https://", "https://www."))
+# --- END OF CORS CONFIGURATION ---
+
 
 CORS(app, origins=allowed_origins, supports_credentials=True)
 socketio = SocketIO(app, cors_allowed_origins=allowed_origins, ping_timeout=60, ping_interval=25)
@@ -68,8 +77,8 @@ GENRE_CONFIGS = {
 }
 
 FALLBACK_PLAYLIST = [
-    {'name': 'Blinding Lights', 'artist': 'The Weeknd', 'albumArt': 'https://i.scdn.co/image/ab67616d00001e028863bc11d2aa12b54f5aeb36', 'youtubeId': '4NRXx6U8ABQ'},
-    {'name': 'As It Was', 'artist': 'Harry Styles', 'albumArt': 'https://i.scdn.co/image/ab67616d00001e02b46f74097652c7f3a3a08237', 'youtubeId': 'H5v3kku4y6Q'},
+    {'name': 'Blinding Lights', 'artist': 'The Weeknd', 'albumArt': 'https://i.scdn.co/image/ab67616d0000b2738863bc11d2aa12b54f5aeb36', 'youtubeId': '4NRXx6U8ABQ'},
+    {'name': 'As It Was', 'artist': 'Harry Styles', 'albumArt': 'https://i.scdn.co/image/ab67616d0000b273b46f74097652c7f3a3a08237', 'youtubeId': 'H5v3kku4y6Q'},
 ]
 
 @lru_cache(maxsize=1)
@@ -88,10 +97,7 @@ def get_spotify_token():
     try:
         auth_str = base64.b64encode(f"{client_id}:{client_secret}".encode()).decode()
         response = requests.post("https://accounts.spotify.com/api/token", headers={"Authorization": f"Basic {auth_str}", "Content-Type": "application/x-www-form-urlencoded"}, data={"grant_type": "client_credentials"}, timeout=10)
-        if response.status_code != 200: 
-            token_failure_count += 1
-            last_token_failure = time.time()
-            return None
+        response.raise_for_status()
         data = response.json()
         if 'access_token' not in data: 
             token_failure_count += 1
@@ -166,7 +172,6 @@ def generate_playlist(genre):
                 video_id = get_youtube_video_id(song_name, artist_name)
                 if video_id:
                     album_images = track.get('album', {}).get('images', [])
-                    # FIX: Safely get the first available image URL to prevent 404s
                     album_art = album_images[0]['url'] if album_images else None
                     playlist.append({'name': song_name, 'artist': artist_name, 'albumArt': album_art, 'youtubeId': video_id})
         if not playlist: 
