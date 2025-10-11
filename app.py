@@ -166,7 +166,8 @@ def generate_playlist(genre):
                 video_id = get_youtube_video_id(song_name, artist_name)
                 if video_id:
                     album_images = track.get('album', {}).get('images', [])
-                    album_art = album_images[1]['url'] if len(album_images) > 1 else (album_images[0]['url'] if album_images else None)
+                    # FIX: Safely get the first available image URL to prevent 404s
+                    album_art = album_images[0]['url'] if album_images else None
                     playlist.append({'name': song_name, 'artist': artist_name, 'albumArt': album_art, 'youtubeId': video_id})
         if not playlist: 
             raise Exception("No valid tracks after YouTube processing.")

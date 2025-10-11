@@ -110,7 +110,7 @@ export default function RoomPage() {
   const [showUploadModal, setShowUploadModal] = useState(false);
 
   const { playlistTitle, playlist, currentTrackIndex, isLoading, error, users, isAdmin, volume, isCollaborative, isPlaying } = useRoomStore();
-  const { initializePlayer, setPlaylistData, setLoading, setError, playPause, nextTrack, prevTrack, selectTrack, setVolume, connect, disconnect, toggleCollaborative } = useRoomStore.getState();
+  const { initializePlayer, setPlaylistData, setLoading, setError, playPause, nextTrack, prevTrack, selectTrack, setVolume, connect, disconnect, toggleCollaborative, primePlayer } = useRoomStore.getState();
   
   const currentTrack = playlist[currentTrackIndex];
 
@@ -135,6 +135,7 @@ export default function RoomPage() {
 
   const handleNameSubmit = (name: string) => {
     if (roomCode) {
+      primePlayer(); // FIX: Proactively unlock AudioContext on user interaction
       connect(roomCode, name);
       setShowNameModal(false);
     }

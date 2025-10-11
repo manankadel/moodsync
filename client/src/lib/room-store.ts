@@ -3,10 +3,16 @@ import { io, Socket } from 'socket.io-client';
 
 const API_URL = process.env.NEXT_PUBLIC_API_URL || 'http://localhost:5001';
 
-const HARD_SYNC_THRESHOLD = 0.25;
-const ADAPTIVE_RATE_THRESHOLD = 0.05;
-const PLAYBACK_RATE_ADJUST = 0.015;
+// --- Synchronization Constants ---
+// If a client's audio drift exceeds this value (in seconds), perform a hard seek to catch up.
+const HARD_SYNC_THRESHOLD = 0.25; 
+// If drift is smaller than the hard threshold but larger than this, adjust playback rate.
+const ADAPTIVE_RATE_THRESHOLD = 0.05; 
+// The maximum rate adjustment to apply (e.g., 1.5% faster or slower).
+const PLAYBACK_RATE_ADJUST = 0.015; 
+// How often the admin sends out state updates (in milliseconds).
 const SYNC_HEARTBEAT_INTERVAL = 500;
+// How often to resynchronize the local clock with the server's clock (in milliseconds).
 const CLOCK_SYNC_INTERVAL = 10000;
 
 interface Song { name: string; artist: string; albumArt: string | null; youtubeId?: string; isUpload?: boolean; audioUrl?: string; }
@@ -349,6 +355,7 @@ export const useRoomStore = create<RoomState>((set, get) => ({
           disablekb: 1,
           enablejsapi: 1,
           playsinline: 1,
+          // CRITICAL: This origin must match your frontend URL in production
           origin: window.location.origin
         }, 
         events: { 

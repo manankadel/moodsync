@@ -1,3 +1,4 @@
+
 import { motion } from "framer-motion";
 import { useRoomStore } from "@/lib/room-store";
 
@@ -45,5 +46,4 @@ const LatencyControl = () => {
   );
 };
 
-// FIX: Added the missing default export statement
 export default LatencyControl;

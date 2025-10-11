@@ -1,11 +1,10 @@
 import type { Metadata } from "next";
-import { Sora } from "next/font/google"; // Import Sora
+import { Sora } from "next/font/google";
 import "./globals.css";
 
-// Configure the font with the weights we need
 const sora = Sora({
   subsets: ["latin"],
-  weight: ["300", "400", "600"], // Light, Regular, Semi-bold
+  weight: ["300", "400", "600"],
 });
 
 export const metadata: Metadata = {
@@ -20,7 +19,6 @@ export default function RootLayout({
 }>) {
   return (
     <html lang="en">
-      {/* Apply the font's class name to the body */}
       <body className={sora.className}>{children}</body>
     </html>
   );
