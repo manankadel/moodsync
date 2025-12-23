@@ -132,16 +132,15 @@ def add_upload_to_room(room_code):
         
     return jsonify({'message': 'Track added'}), 200
 
-# === YOUTUBE ROUTES ===
-@app.route('/api/yt-search', methods=['POST'])
+# === YOUTUBE ROUTES ===@app.route('/api/yt-search', methods=['POST'])
 def search_yt():
     query = request.json.get('query')
     if not query: return jsonify({'error': 'No query'}), 400
     
-    # Method 1: API
+    # 1. API Method
     if youtube_client:
         try:
-            req = youtube_client.search().list(q=query, part="snippet", maxResults=10, type="video")
+            req = youtube_client.search().list(q=query, part="snippet", maxResults=5, type="video")
             res = req.execute()
             return jsonify({'results': [{
                 'id': i['id']['videoId'],
@@ -150,13 +149,15 @@ def search_yt():
                 'thumbnail': i['snippet']['thumbnails']['high']['url']
             } for i in res['items']]})
         except Exception as e:
-            logger.error(f"API Error: {e}")
+            logger.error(f"API Error: {e}") # Log but continue
 
-    # Method 2: Fallback
+    # 2. Scraping Method (Fallback)
     try:
         ydl_opts = {'format': 'bestaudio', 'noplaylist': True, 'quiet': True, 'default_search': 'ytsearch5'}
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
             info = ydl.extract_info(query, download=False)
+            # Handle case where search returns no entries
+            if 'entries' not in info: raise Exception("No entries found")
             return jsonify({'results': [{
                 'id': e['id'], 
                 'title': e['title'], 
@@ -164,7 +165,9 @@ def search_yt():
                 'thumbnail': e.get('thumbnail')
             } for e in info['entries']]})
     except Exception as e:
-        return jsonify({'error': str(e)}), 500
+        logger.error(f"Scraping Error: {e}")
+        # RETURN 200 with empty list or error message so frontend doesn't crash
+        return jsonify({'results': [], 'message': 'YouTube search is currently unavailable. Please use "Upload File".'}), 200
 
 @app.route('/api/room/<room_code>/add-yt', methods=['POST'])
 def add_yt_track(room_code):

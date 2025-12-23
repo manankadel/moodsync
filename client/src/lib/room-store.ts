@@ -4,22 +4,21 @@ import { io, Socket } from 'socket.io-client';
 const API_URL = process.env.NEXT_PUBLIC_API_URL || 'http://localhost:5001';
 
 // --- INTERFACES ---
-// --- INTERFACES ---
 export interface Song { 
     name: string; 
     artist: string; 
     isUpload: boolean; 
     audioUrl: string | null; 
     albumArt: string | null; 
-    lyrics?: string | null; // <--- NEW: Added Lyrics support
+    lyrics?: string | null;
 }
 interface User { name: string; isAdmin: boolean; }
 interface EqualizerSettings { bass: number; mids: number; treble: number; }
 interface AudioNodes { context: AudioContext | null; source: MediaElementAudioSourceNode | null; bass: BiquadFilterNode | null; mids: BiquadFilterNode | null; treble: BiquadFilterNode | null; }
 interface SyncState { isPlaying?: boolean; trackIndex?: number; volume?: number; equalizer?: EqualizerSettings; currentTime?: number; serverTimestamp?: number; }
+
 declare global { 
     interface Window { webkitAudioContext: any; } 
-    // Removed conflicting Navigator definition. TypeScript lib.dom knows mediaSession exists.
 }
 
 interface RoomState {
@@ -52,9 +51,7 @@ let audioEl: HTMLAudioElement | null = null;
 if (typeof window !== 'undefined') {
   audioEl = new Audio();
   audioEl.crossOrigin = 'anonymous';
-  // CRITICAL for iOS Background Audio
   audioEl.preload = "auto";
-  // Removed invalid 'playsInline' property
 }
 
 export const useRoomStore = create<RoomState>()((set, get) => ({
@@ -72,18 +69,13 @@ export const useRoomStore = create<RoomState>()((set, get) => ({
 
   connect: (code, name) => {
     if (get().socket) return;
-    
-    // CHANGE: Do NOT set isLoading: true here. 
-    // We let the HTTP fetch in page.tsx handle the loading state.
-    // This prevents the app from getting stuck if the socket is slow.
     set({ username: name, roomCode: code });
     
-   const socket = io(API_URL, { 
-        // CHANGE THIS LINE: Allow polling fallback
+    // Allow polling to fix Render connection issues
+    const socket = io(API_URL, { 
         transports: ['polling', 'websocket'], 
         reconnection: true,
-        reconnectionAttempts: Infinity,
-        timeout: 10000,
+        timeout: 20000,
     });
     set({ socket });
 
@@ -101,11 +93,6 @@ export const useRoomStore = create<RoomState>()((set, get) => ({
         get().updateMediaSession();
     });
     socket.on('disconnect', () => set({ isDisconnected: true }));
-    socket.on('connect_error', (err) => {
-        console.warn("Socket connection warning:", err);
-        // We do NOT set an error state here, because the HTTP fallback 
-        // allows the user to still see the playlist/lyrics while reconnecting.
-    });
   },
 
   disconnect: () => {
@@ -121,8 +108,6 @@ export const useRoomStore = create<RoomState>()((set, get) => ({
     try {
         const AudioContext = window.AudioContext || window.webkitAudioContext;
         const context = new AudioContext();
-        
-        // Mobile browsers require resume() on user interaction
         if (context.state === 'suspended') context.resume();
         
         const source = context.createMediaElementSource(audio);
@@ -131,71 +116,46 @@ export const useRoomStore = create<RoomState>()((set, get) => ({
         const treble = context.createBiquadFilter(); treble.type = "highshelf"; treble.frequency.value = 3000;
         
         source.connect(bass).connect(mids).connect(treble).connect(context.destination);
-        
         set({ audioNodes: { context, source, bass, mids, treble }, isAudioGraphConnected: true });
+        console.log("✅ Audio Graph Primed");
 
-        // CRITICAL: request Wake Lock if available
         if ('wakeLock' in navigator) {
-            // @ts-ignore: wakeLock types might be missing in some setups
-            navigator.wakeLock.request('screen').catch((err) => console.log(err));
+            // @ts-ignore
+            navigator.wakeLock.request('screen').catch(() => {});
         }
 
-        audio.ontimeupdate = () => {
-            set({ currentTime: audio.currentTime });
-        };
-        
+        audio.ontimeupdate = () => set({ currentTime: audio.currentTime });
         audio.onloadedmetadata = () => {
             set({ duration: audio.duration });
             get().updateMediaSession();
         };
-        
         audio.onended = () => { if(get().isAdmin) get().nextTrack(); };
-        audio.onplaying = () => {
-            set({ isPlaying: true });
-            get().updateMediaSession();
-        };
-        audio.onpause = () => {
-            set({ isPlaying: false });
-            get().updateMediaSession();
-        };
+        // Sync state when audio actually starts playing/pausing to avoid loops
+        audio.onplay = () => set({ isPlaying: true });
+        audio.onpause = () => set({ isPlaying: false });
 
-    } catch (e) { console.error("Could not prime audio player.", e); }
+    } catch (e) { console.error("Audio Prime Failed:", e); }
   },
 
   updateMediaSession: () => {
-    // Check if mediaSession exists on navigator (Typescript safe)
     if (!('mediaSession' in navigator)) return;
-    
     const { playlist, currentTrackIndex, isPlaying } = get();
     const track = playlist[currentTrackIndex];
     if (!track) return;
 
     try {
         navigator.mediaSession.metadata = new MediaMetadata({
-        title: track.name,
-        artist: track.artist,
-        artwork: [
-            { src: '/favicon.ico', sizes: '96x96', type: 'image/png' },
-        ]
-        });
-
-        // Set handlers to allow Lock Screen control
-        navigator.mediaSession.setActionHandler('play', () => {
-            if(get().isAdmin) get().playPause();
-        });
-        navigator.mediaSession.setActionHandler('pause', () => {
-            if(get().isAdmin) get().playPause();
-        });
-        navigator.mediaSession.setActionHandler('nexttrack', () => {
-            if(get().isAdmin) get().nextTrack();
-        });
-        navigator.mediaSession.setActionHandler('previoustrack', () => {
-            if(get().isAdmin) get().prevTrack();
+            title: track.name,
+            artist: track.artist,
+            artwork: [{ src: '/favicon.ico', sizes: '96x96', type: 'image/png' }]
         });
         navigator.mediaSession.playbackState = isPlaying ? "playing" : "paused";
-    } catch (e) {
-        console.warn("Media Session API error:", e);
-    }
+        
+        navigator.mediaSession.setActionHandler('play', () => get().isAdmin && get().playPause());
+        navigator.mediaSession.setActionHandler('pause', () => get().isAdmin && get().playPause());
+        navigator.mediaSession.setActionHandler('nexttrack', () => get().isAdmin && get().nextTrack());
+        navigator.mediaSession.setActionHandler('previoustrack', () => get().isAdmin && get().prevTrack());
+    } catch(e) {}
   },
   
   _emitStateUpdate: (overrideState?: Partial<SyncState>) => {
@@ -224,9 +184,7 @@ export const useRoomStore = create<RoomState>()((set, get) => ({
         const track = playlist[state.trackIndex];
         if (track?.audioUrl) { 
             audioElement.src = track.audioUrl; 
-            audioElement.load(); 
-            // On mobile, we must call play() immediately if we were already playing
-            if(state.isPlaying) audioElement.play().catch(e => console.log("Autoplay prevented:", e));
+            // Important: Don't call play() here. Wait for isPlaying check.
         }
         set({ currentTrackIndex: state.trackIndex });
         get().updateMediaSession();
@@ -235,24 +193,22 @@ export const useRoomStore = create<RoomState>()((set, get) => ({
     // 2. Sync Time (Drift Correction)
     if (state.currentTime !== undefined) {
         const drift = Math.abs(state.currentTime - audioElement.currentTime);
-        // Hard Sync if drift is huge (> 2 seconds)
-        if (drift > 2.0) { 
-            audioElement.currentTime = state.currentTime; 
-        }
-        // Soft Sync (Playback Rate) if drift is small (> 0.2s)
-        else if (drift > 0.2) {
-             // If we are behind, speed up slightly. If ahead, slow down slightly.
-             const isBehind = audioElement.currentTime < state.currentTime;
-             audioElement.playbackRate = isBehind ? 1.05 : 0.95;
-             // Reset to normal speed after 1 second
-             setTimeout(() => { audioElement.playbackRate = 1.0; }, 1000);
-        }
+        if (drift > 2.0) audioElement.currentTime = state.currentTime; 
     }
 
-    // 3. Sync Play/Pause
+    // 3. Sync Play/Pause (SAFE PLAY)
     if (state.isPlaying !== undefined && state.isPlaying !== isPlaying) {
         set({ isPlaying: state.isPlaying });
-        state.isPlaying ? audioElement.play().catch(()=>{}) : audioElement.pause();
+        if (state.isPlaying) {
+            const playPromise = audioElement.play();
+            if (playPromise !== undefined) {
+                playPromise.catch(error => {
+                    console.log("Autoplay prevented or interrupted:", error);
+                });
+            }
+        } else {
+            audioElement.pause();
+        }
         get().updateMediaSession();
     }
   },
@@ -262,21 +218,26 @@ export const useRoomStore = create<RoomState>()((set, get) => ({
   playPause: () => {
     if (!get().isAdmin) return;
     const { audioElement, isPlaying } = get();
+    // Optimistic UI update
     set({ isPlaying: !isPlaying });
-    isPlaying ? audioElement?.pause() : audioElement?.play();
+    
+    if (!isPlaying) {
+        audioElement?.play().catch(console.error);
+    } else {
+        audioElement?.pause();
+    }
+    
     get()._emitStateUpdate({ isPlaying: !isPlaying, currentTime: audioElement?.currentTime });
     get().updateMediaSession();
   },
   
   selectTrack: (index) => {
     if (!get().isAdmin) return;
-    const { playlist, audioElement, currentTrackIndex } = get();
-    if (index === currentTrackIndex) return get().playPause();
+    const { playlist, audioElement } = get();
     const track = playlist[index];
     if (track?.audioUrl && audioElement) {
       audioElement.src = track.audioUrl;
-      audioElement.load();
-      audioElement.play();
+      audioElement.play().catch(console.error);
       set({ currentTrackIndex: index, isPlaying: true });
       get()._emitStateUpdate({ trackIndex: index, currentTime: 0, isPlaying: true });
       get().updateMediaSession();
