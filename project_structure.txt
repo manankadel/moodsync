@@ -22,8 +22,6 @@ client/
     components/
       Equalizer.tsx
       FileUploadModal.tsx
-      LatencyControl.tsx
-      Lyrics.tsx
       cta.tsx
       features.tsx
       hero-scene.tsx
@@ -39,21 +37,15 @@ client/
   tailwind.config.ts
   tsconfig.json
 debug_lrc.py
+dump.rdb
 dump_project.py
 generate_structure.py
 requirements.txt
 spotify_test.py
-static/
-  mood-interactions.js
-  mood-visualizer.js
-  player.js
-  playlist-visualizer.js
-  style.css
-templates/
-  error.html
-  index.html
-  result.html
 test_different_songs.py
 test_parse_lyrics.py
+uploads/
+  4f7ad100c56a4e9e_sunset_deep_house_mix_-_vascoprod_youtube_2.mp3 [EXCLUDED]
+  d14f937b80484fcf_sunset_deep_house_mix_-_vascoprod_youtube_2.mp3 [EXCLUDED]
 venv/ [EXCLUDED]
 weather_test.py

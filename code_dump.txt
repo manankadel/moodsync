@@ -29,14 +29,11 @@ yarn-error.log*
 
 ### ./app.py ###
 
-import os, base64, random, string, logging, time, requests, json
-from functools import lru_cache
+import os, random, string, logging, time, json
 from flask import Flask, jsonify, request, send_from_directory, url_for
 from flask_socketio import SocketIO, join_room, emit
 from flask_cors import CORS
 from dotenv import load_dotenv
-from googleapiclient.discovery import build
-from googleapiclient import errors
 import redis
 from werkzeug.utils import secure_filename
 from werkzeug.middleware.proxy_fix import ProxyFix
@@ -45,22 +42,10 @@ load_dotenv()
 app = Flask(__name__)
 app.wsgi_app = ProxyFix(app.wsgi_app, x_for=1, x_proto=1, x_host=1, x_prefix=1)
 
-# --- BULLETPROOF CORS CONFIGURATION ---
-frontend_url = os.getenv("FRONTEND_URL")
-allowed_origins = ["http://localhost:3000"]
-if frontend_url:
-    allowed_origins.append(frontend_url)
-    # Handle both www and non-www versions for production robustness
-    if "www." in frontend_url:
-        allowed_origins.append(frontend_url.replace("www.", ""))
-    elif "https://" in frontend_url:
-        allowed_origins.append(frontend_url.replace("https://", "https://www."))
-# --- END OF CORS CONFIGURATION ---
+# --- CONFIGURATION ---
+CORS(app, origins=os.getenv("FRONTEND_URL", "http://localhost:3000"), supports_credentials=True)
+socketio = SocketIO(app, cors_allowed_origins=os.getenv("FRONTEND_URL", "http://localhost:3000"), async_mode='gevent')
 
-CORS(app, origins=allowed_origins, supports_credentials=True)
-socketio = SocketIO(app, cors_allowed_origins=allowed_origins, ping_timeout=60, ping_interval=25)
-
-app.secret_key = os.urandom(24)
 UPLOAD_FOLDER = 'uploads'
 os.makedirs(UPLOAD_FOLDER, exist_ok=True)
 app.config['UPLOAD_FOLDER'] = UPLOAD_FOLDER
@@ -71,312 +56,134 @@ def allowed_file(filename):
 
 try:
     redis_url = os.getenv('REDIS_URL')
-    if not redis_url: raise ValueError("REDIS_URL environment variable not set.")
+    if not redis_url: raise ValueError("REDIS_URL env var not set.")
     r = redis.from_url(redis_url, decode_responses=True)
     r.ping()
-    app.logger.info(f"Successfully connected to Redis at {redis_url.split('@')[-1]}")
-except (redis.exceptions.ConnectionError, ValueError) as e:
-    app.logger.error(f"FATAL: Could not connect to Redis. Error: {e}")
-    exit(1)
+    app.logger.info("Redis connection successful.")
+except Exception as e:
+    app.logger.error(f"FATAL: Redis connection failed: {e}"); exit(1)
 
-lrc_kit_available = False
-try:
-    from lrc_kit.lrc import parse_lyrics
-    lrc_kit_available = True
-except ImportError:
-    app.logger.warning("lrc_kit not found. Lyrics functionality will be disabled.")
+def safe_get(key): return r.get(key)
+def safe_set(key, value, ex): r.set(key, value, ex=ex)
+def safe_delete(key): r.delete(key)
 
 @app.route('/ping', methods=['GET'])
 def ping_pong():
     return jsonify({'serverTime': time.time()})
 
-spotify_token_cache = {'token': None, 'expires': 0}
-token_failure_count, last_token_failure = 0, 0
-
-GENRE_CONFIGS = {
-    'deep-house': {'seeds': ['deep-house', 'minimal-techno']}, 'house': {'seeds': ['house', 'dance']},
-    'progressive-house': {'seeds': ['progressive-house', 'edm']}, 'tech-house': {'seeds': ['tech-house', 'techno']},
-    'techno': {'seeds': ['techno', 'hardstyle', 'industrial']}, 'minimal-techno': {'seeds': ['minimal-techno', 'ambient', 'electronic']},
-    'detroit-techno': {'seeds': ['detroit-techno', 'techno']}, 'electronica': {'seeds': ['electronica', 'idm']},
-    'edm': {'seeds': ['edm', 'electro', 'dance']}, 'electro': {'seeds': ['electro', 'chicago-house']},
-    'dubstep': {'seeds': ['dubstep', 'bass-music']}, 'indie': {'seeds': ['indie', 'indie-pop', 'alternative']},
-    'indie-pop': {'seeds': ['indie-pop', 'pop']}, 'alternative': {'seeds': ['alternative', 'rock']},
-    'boiler-room': {'search_query': 'Boiler Room set'}, 'live-techno-set': {'search_query': 'live techno set'},
-    'deep-house-mix': {'search_query': 'deep house mix'}, 'default': {'seeds': ['music', 'pop']}
-}
-
-FALLBACK_PLAYLIST = [
-    {'name': 'Blinding Lights', 'artist': 'The Weeknd', 'albumArt': 'https://i.scdn.co/image/ab67616d0000b2738863bc11d2aa12b54f5aeb36', 'youtubeId': '4NRXx6U8ABQ'},
-    {'name': 'As It Was', 'artist': 'Harry Styles', 'albumArt': 'https://i.scdn.co/image/ab67616d0000b27346f74097652c7f3a3a08237', 'youtubeId': 'H5v3kku4y6Q'},
-]
-
-@lru_cache(maxsize=1)
-def get_spotify_credentials(): 
-    return os.getenv('SPOTIFY_CLIENT_ID'), os.getenv('SPOTIFY_CLIENT_SECRET')
-
-def get_spotify_token():
-    global token_failure_count, last_token_failure
-    if token_failure_count >= 3 and time.time() - last_token_failure < 300: 
-        return None
-    if time.time() < spotify_token_cache['expires'] and spotify_token_cache['token']: 
-        return spotify_token_cache['token']
-    client_id, client_secret = get_spotify_credentials()
-    if not client_id or not client_secret: 
-        return None
-    try:
-        auth_str = base64.b64encode(f"{client_id}:{client_secret}".encode()).decode()
-        response = requests.post("https://accounts.spotify.com/api/token", headers={"Authorization": f"Basic {auth_str}", "Content-Type": "application/x-www-form-urlencoded"}, data={"grant_type": "client_credentials"}, timeout=10)
-        response.raise_for_status()
-        data = response.json()
-        if 'access_token' not in data: 
-            token_failure_count += 1
-            last_token_failure = time.time()
-            return None
-        spotify_token_cache['token'] = data['access_token']
-        spotify_token_cache['expires'] = time.time() + data.get('expires_in', 3600) - 60
-        token_failure_count = 0
-        return data['access_token']
-    except Exception as e:
-        app.logger.error(f"Spotify token error: {e}")
-        token_failure_count += 1
-        last_token_failure = time.time()
-        return None
-
-def get_youtube_video_id(song_name, artist_name):
-    cache_key = f"youtube:v2:{song_name}_{artist_name}".lower().replace(' ', '_')
-    try:
-        cached_id = r.get(cache_key)
-        if cached_id: 
-            return None if cached_id == "none" else cached_id
-    except redis.exceptions.ConnectionError: 
-        pass
-    youtube_api_key = os.getenv('YOUTUBE_API_KEY')
-    query = f"{song_name} {artist_name} official audio"
-    video_id = None
-    if youtube_api_key:
-        try:
-            youtube = build('youtube', 'v3', developerKey=youtube_api_key)
-            req = youtube.search().list(q=query, part='snippet', maxResults=1, type='video', videoCategoryId='10')
-            res = req.execute()
-            video_id = res['items'][0]['id']['videoId'] if res.get('items') else None
-        except Exception as e: 
-            app.logger.error(f"YouTube API Error: {e}")
-    if not video_id:
-        try:
-            res = requests.get(f"https://invidious.io.gg/api/v1/search?q={query}", timeout=10).json()
-            video_id = res[0].get('videoId') if res and isinstance(res, list) else None
-        except Exception as e: 
-            app.logger.error(f"Invidious fallback failed: {e}")
-    try: 
-        r.set(cache_key, video_id if video_id else "none", ex=86400 * 7)
-    except redis.exceptions.ConnectionError: 
-        pass
-    return video_id
-
-def generate_playlist(genre):
-    try:
-        config = GENRE_CONFIGS.get(genre, GENRE_CONFIGS['default'])
-        token = get_spotify_token()
-        if not token: 
-            app.logger.warning("No Spotify token, using fallback")
-            return FALLBACK_PLAYLIST
-        if 'search_query' in config:
-            params = {'q': config['search_query'], 'type': 'track', 'limit': 30, 'market': 'US'}
-            response = requests.get("https://api.spotify.com/v1/search", headers={"Authorization": f"Bearer {token}"}, params=params, timeout=10)
-        else:
-            seeds = random.sample(config['seeds'], min(2, len(config['seeds'])))
-            params = {'seed_genres': ','.join(seeds), 'limit': 30, 'market': 'US'}
-            response = requests.get("https://api.spotify.com/v1/recommendations", headers={"Authorization": f"Bearer {token}"}, params=params, timeout=10)
-        response.raise_for_status()
-        tracks = response.json().get('tracks', {}).get('items', []) or response.json().get('tracks', [])
-        if not tracks: 
-            raise Exception(f"No tracks for genre: {genre}")
-        playlist = []
-        for track in sorted(tracks, key=lambda x: x.get('popularity', 0), reverse=True):
-            if len(playlist) >= 15: 
-                break
-            song_name = track.get('name')
-            artist_name = track.get('artists', [{}])[0].get('name')
-            if song_name and artist_name:
-                video_id = get_youtube_video_id(song_name, artist_name)
-                if video_id:
-                    album_images = track.get('album', {}).get('images', [])
-                    album_art = album_images[0]['url'] if album_images else None
-                    playlist.append({'name': song_name, 'artist': artist_name, 'albumArt': album_art, 'youtubeId': video_id})
-        if not playlist: 
-            raise Exception("No valid tracks after YouTube processing.")
-        return playlist
-    except Exception as e:
-        app.logger.warning(f"Playlist generation for '{genre}' failed: {e}. Using fallback.")
-        return FALLBACK_PLAYLIST
-
-@app.route('/generate', methods=['POST', 'OPTIONS'])
+@app.route('/generate', methods=['POST'])
 def generate_route():
-    if request.method == 'OPTIONS': 
-        return '', 204
-    data = request.get_json()
-    genre = data.get('mood', 'default').lower()
-    
-    app.logger.info(f"Generating playlist for genre: {genre}")
-    playlist = generate_playlist(genre)
-    app.logger.info(f"Generated {len(playlist)} tracks")
-    
     while True:
         room_code = ''.join(random.choices(string.ascii_uppercase + string.digits, k=6))
-        if not r.exists(f"room:{room_code}"): 
-            break
-    
-    title = genre.replace('-', ' ').title() if genre != 'default' else "Curated Vibes"
+        if not r.exists(f"room:{room_code}"): break
+
+    # THIS IS THE CRITICAL FIX: The placeholder now has the same "shape" as a real song object.
+    placeholder_playlist = [{'name': "Your Playlist is Empty", 'artist': "Upload a track to begin!", 'isUpload': False, 'audioUrl': None, 'albumArt': None}]
     room_data = {
-        'playlist': playlist, 'title': title, 'users': {}, 'admin_sid': None,
-        'current_state': {
-            'isPlaying': False, 'trackIndex': 0, 'currentTime': 0, 'volume': 80, 
-            'timestamp': time.time(), 'serverTimestamp': time.time(), 
-            'equalizer': {'bass': 0, 'mids': 0, 'treble': 0}, 'isCollaborative': False
-        },
-        'created_at': time.time()
+        'playlist': placeholder_playlist, 
+        'title': "Shared Sonic Space", 
+        'users': {}, 
+        'admin_sid': None, 
+        'current_state': {'isPlaying': False, 'trackIndex': 0, 'currentTime': 0, 'volume': 80, 'equalizer': {'bass': 0, 'mids': 0, 'treble': 0}, 'isCollaborative': True, 'serverTimestamp': time.time()}
     }
-    
-    r.set(f"room:{room_code}", json.dumps(room_data), ex=86400)
-    app.logger.info(f"Room {room_code} created with {len(playlist)} tracks")
-    
-    return jsonify({'room_code': room_code}), 200
+    safe_set(f"room:{room_code}", json.dumps(room_data), ex=86400)
+    return jsonify({'room_code': room_code})
 
 @app.route('/api/room/<string:room_code>')
 def get_room_data(room_code):
-    room_code = room_code.upper()
-    room_data_json = r.get(f"room:{room_code}")
-    if not room_data_json: 
-        return jsonify({'error': 'Room not found'}), 404
-    room_data = json.loads(room_data_json)
-    return jsonify({'playlist_title': room_data['title'], 'playlist': room_data['playlist']}), 200
+    room_data_json = safe_get(f"room:{room_code.upper()}")
+    if not room_data_json: return jsonify({'error': 'Room not found'}), 404
+    return jsonify(json.loads(room_data_json))
 
-@app.route('/uploads/<filename>')
-def uploaded_file(filename):
-    return send_from_directory(UPLOAD_FOLDER, secure_filename(filename))
+@app.route('/uploads/<path:filename>')
+def serve_uploaded_file(filename):
+    return send_from_directory(os.path.abspath(UPLOAD_FOLDER), secure_filename(filename))
 
-@app.route('/api/upload', methods=['POST'])
-def upload_file_route():
-    if 'file' not in request.files: return jsonify({'error': 'No file part'}), 400
+@app.route('/api/upload-local', methods=['POST'])
+def upload_file_local():
+    if 'file' not in request.files or not allowed_file(request.files['file'].filename): return jsonify({'error': 'Invalid file'}), 400
     file = request.files['file']
-    if file.filename == '': return jsonify({'error': 'No selected file'}), 400
-    if file and allowed_file(file.filename):
-        filename = f"{os.urandom(8).hex()}_{secure_filename(file.filename)}"
-        file_path = os.path.join(app.config['UPLOAD_FOLDER'], filename)
-        try:
-            file.save(file_path)
-            audio_url = url_for('uploaded_file', filename=filename, _external=True)
-            return jsonify({'filename': filename, 'audioUrl': audio_url}), 200
-        except Exception as e:
-            app.logger.error(f"File save error: {e}")
-            return jsonify({'error': 'Failed to save file'}), 500
-    return jsonify({'error': 'File type not allowed'}), 400
+    filename = f"{os.urandom(8).hex()}_{secure_filename(file.filename)}"
+    try:
+        file.save(os.path.join(UPLOAD_FOLDER, filename))
+        audio_url = url_for('serve_uploaded_file', filename=filename, _external=True, _scheme=request.scheme)
+        return jsonify({'audioUrl': audio_url}), 200
+    except Exception as e:
+        app.logger.error(f"Local file save error: {e}")
+        return jsonify({'error': 'Failed to save file'}), 500
 
 @app.route('/api/room/<string:room_code>/add-upload', methods=['POST'])
 def add_upload_to_playlist(room_code):
-    room_code = room_code.upper()
-    data = request.get_json()
-    room_data_json = r.get(f"room:{room_code}")
-    if not room_data_json: return jsonify({'error': 'Room not found'}), 404
-    room_data = json.loads(room_data_json)
-    new_track = {'name': data.get('title'), 'artist': data.get('artist'), 'albumArt': None, 'youtubeId': None, 'isUpload': True, 'audioUrl': data.get('audioUrl')}
-    room_data['playlist'].append(new_track)
-    r.set(f"room:{room_code}", json.dumps(room_data), ex=86400)
-    socketio.emit('refresh_playlist', to=room_code)
-    return jsonify({'message': 'Track added', 'track': new_track}), 200
-
-@app.route('/api/lyrics/<string:video_id>')
-def get_lyrics(video_id):
-    cache_key = f"lyrics:v2:{video_id}"
-    try:
-        cached_lyrics = r.get(cache_key)
-        if cached_lyrics: return jsonify(json.loads(cached_lyrics))
-    except redis.exceptions.ConnectionError: pass
-    lyrics_json = []
-    if lrc_kit_available:
-        try:
-            result = parse_lyrics(f"https://www.youtube.com/watch?v={video_id}")
-            if isinstance(result, tuple) and len(result) >= 2 and result[0]:
-                for line in result[0]:
-                    if hasattr(line, 'time') and hasattr(line, 'text') and line.text.strip():
-                        lyrics_json.append({'time': line.time, 'text': line.text})
-        except Exception as e: app.logger.error(f"lrc_kit error: {e}")
-    try: 
-        r.set(cache_key, json.dumps(lyrics_json), ex=86400)
-    except redis.exceptions.ConnectionError: pass
-    return jsonify(lyrics_json)
+    room_key, data = f"room:{room_code.upper()}", request.get_json()
+    with r.lock(f"lock:{room_key}", timeout=5):
+        room_data = json.loads(safe_get(room_key) or '{}')
+        if not room_data: return jsonify({'error': 'Room not found'}), 404
+        new_track = {'name': data.get('title'), 'artist': data.get('artist'), 'isUpload': True, 'audioUrl': data.get('audioUrl'), 'albumArt': None}
+        is_first = not any(t.get('audioUrl') for t in room_data['playlist'])
+        if is_first:
+            room_data['playlist'] = [new_track]
+            room_data['current_state'].update({'trackIndex': 0, 'currentTime': 0, 'isPlaying': True})
+        else:
+            room_data['playlist'].append(new_track)
+        safe_set(room_key, json.dumps(room_data), ex=86400)
+        socketio.emit('refresh_playlist', room_data, to=room_code.upper())
+        if is_first: socketio.emit('sync_player_state', room_data['current_state'], to=room_code.upper())
+    return jsonify({'message': 'Track added'}), 200
 
 @socketio.on('join_room')
 def handle_join_room(data):
-    room_code = data['room_code'].upper()
-    username = data.get('username', 'Guest')
-    sid = request.sid
-    room_data_json = r.get(f"room:{room_code}")
-    if not room_data_json: 
-        emit('error', {'message': 'Room not found'})
-        return
-    room_data = json.loads(room_data_json)
-    join_room(room_code)
-    is_admin = not room_data.get('users') or not room_data.get('admin_sid')
-    if is_admin: room_data['admin_sid'] = sid
-    room_data['users'][sid] = {'name': username, 'isAdmin': is_admin}
-    r.set(f"room:{room_code}", json.dumps(room_data), ex=86400)
-    emit('load_current_state', room_data['current_state'], to=sid)
-    emit('update_user_list', list(room_data['users'].values()), to=room_code)
-    app.logger.info(f"User {username} joined room {room_code} (admin: {is_admin})")
+    room_code, username, sid = data['room_code'].upper(), data.get('username', 'Guest'), request.sid
+    room_key = f"room:{room_code}"
+    with r.lock(f"lock:{room_key}", timeout=5):
+        room_data_json = safe_get(room_key)
+        if not room_data_json: return emit('error', {'message': 'Room not found'})
+        room_data = json.loads(room_data_json)
+        join_room(room_code)
+        is_admin = not room_data.get('admin_sid')
+        if is_admin: room_data['admin_sid'] = sid
+        room_data['users'][sid] = {'name': username, 'isAdmin': is_admin}
+        if safe_set(room_key, json.dumps(room_data), ex=86400):
+            r.set(f"sid_to_room:{sid}", room_code, ex=86400)
+            emit('load_current_state', room_data['current_state'], to=sid)
+            emit('update_user_list', list(room_data['users'].values()), to=room_code)
 
 @socketio.on('update_player_state')
 def handle_player_state_update(data):
-    room_code = data['room_code'].upper()
-    sid = request.sid
-    room_data_json = r.get(f"room:{room_code}")
-    if not room_data_json: return
-    room_data = json.loads(room_data_json)
-    if room_data.get('admin_sid') != sid and not room_data['current_state'].get('isCollaborative', False): 
-        return
-    client_state = data['state']
-    room_data['current_state'].update(client_state)
-    client_timestamp = client_state.get('timestamp', 0)
-    server_receive_time = time.time()
-    if client_timestamp > 0 and client_state.get('isPlaying', False):
-        latency = server_receive_time - client_timestamp
-        if 0 < latency < 2.0: room_data['current_state']['currentTime'] += latency
-    room_data['current_state']['serverTimestamp'] = server_receive_time
-    r.set(f"room:{room_code}", json.dumps(room_data), ex=86400)
-    emit('sync_player_state', room_data['current_state'], to=room_code, include_self=False)
+    room_code, sid = data['room_code'].upper(), request.sid
+    room_key = f"room:{room_code}"
+    with r.lock(f"lock:{room_key}", timeout=2):
+        room_data_json = safe_get(room_key)
+        if not room_data_json: return
+        room_data = json.loads(room_data_json)
+        if not room_data['current_state'].get('isCollaborative', False) and room_data.get('admin_sid') != sid: return
+        room_data['current_state'].update(data['state'])
+        if safe_set(room_key, json.dumps(room_data), ex=86400):
+            emit('sync_player_state', room_data['current_state'], to=room_code, include_self=False)
 
 @socketio.on('disconnect')
 def handle_disconnect():
     sid = request.sid
-    for key in r.scan_iter("room:*"):
-        try:
-            room_data_str = r.get(key)
-            if not room_data_str: continue
-            room_data = json.loads(room_data_str)
-            if sid in room_data.get('users', {}):
-                room_code = key.split(":")[1]
-                del room_data['users'][sid]
-                if room_data.get('admin_sid') == sid:
-                    if room_data['users']:
-                        new_admin_sid = next(iter(room_data['users']))
-                        room_data['admin_sid'] = new_admin_sid
-                        room_data['users'][new_admin_sid]['isAdmin'] = True
-                    else: 
-                        room_data['admin_sid'] = None
-                if room_data['users']:
-                    r.set(key, json.dumps(room_data), ex=86400)
-                    emit('update_user_list', list(room_data['users'].values()), to=room_code)
-                else:
-                    r.delete(key)
-                break
-        except (json.JSONDecodeError, TypeError): 
-            continue
+    room_code = safe_get(f"sid_to_room:{sid}")
+    if not room_code: return
+    room_key = f"room:{room_code}"
+    safe_delete(f"sid_to_room:{sid}")
+    with r.lock(f"lock:{room_key}", timeout=5):
+        room_data_json = safe_get(room_key)
+        if not room_data_json: return
+        room_data = json.loads(room_data_json)
+        if sid in room_data.get('users', {}):
+            del room_data['users'][sid]
+            if not room_data['users']: return safe_delete(room_key)
+            if room_data.get('admin_sid') == sid:
+                new_admin_sid = next(iter(room_data['users']))
+                room_data['admin_sid'] = new_admin_sid
+                room_data['users'][new_admin_sid]['isAdmin'] = True
+            safe_set(room_key, json.dumps(room_data), ex=86400)
+            emit('update_user_list', list(room_data['users'].values()), to=room_code)
 
 if __name__ == '__main__':
-    logging.basicConfig(level=logging.INFO, format='%(asctime)s %(levelname)s: %(message)s')
-    app.logger.info("=== Starting MoodSync API Server ===")
-    app.logger.info(f"CORS allowed for: {allowed_origins}")
-    socketio.run(app, debug=False, use_reloader=False, host='0.0.0.0', port=5001)
+    logging.basicConfig(level=logging.INFO, format='%(asctime)s %(levelname)s:%(message)s')
+    socketio.run(app, debug=True, host='0.0.0.0', port=5001)
 
 ### ./client/next-env.d.ts ###
 
@@ -516,106 +323,83 @@ export default function LandingPage() {
 
 import { useParams } from 'next/navigation';
 import Link from 'next/link';
-import { useEffect, useState } from 'react';
+import { useEffect, useState, memo } from 'react';
 import { motion, AnimatePresence } from 'framer-motion';
-import Image from 'next/image';
-import Script from 'next/script';
 import Player from '@/components/player';
 import { useRoomStore } from '@/lib/room-store';
-import { Users, Crown, Copy, Link as LinkIcon, Share2, Upload } from 'lucide-react';
-import WaveButton from '@/components/ui/WaveButton';
+import { shallow } from 'zustand/shallow';
+import { Crown, Copy, Link as LinkIcon, Upload, WifiOff } from 'lucide-react';
 import FileUploadModal from '@/components/FileUploadModal';
+import WaveButton from '@/components/ui/WaveButton';
 
 const API_URL = process.env.NEXT_PUBLIC_API_URL || 'http://localhost:5001';
 
+const MemoizedPlayer = memo(Player);
+
 const UsernameModal = ({ onSubmit }: { onSubmit: (name: string) => void }) => {
-  const [name, setName] = useState('');
-  return (
-    <motion.div initial={{ opacity: 0 }} animate={{ opacity: 1 }} exit={{ opacity: 0 }} className="fixed inset-0 z-50 bg-black/80 backdrop-blur-sm flex items-center justify-center p-4">
-      <motion.div initial={{ scale: 0.9, opacity: 0 }} animate={{ scale: 1, opacity: 1 }} transition={{ delay: 0.2, ease: "circOut" }} className="bg-black/50 border border-white/10 rounded-xl p-8 shadow-2xl w-full max-w-sm">
-        <h2 className="text-2xl font-semibold text-white mb-6 text-center">Enter Your Name</h2>
-        <form className="flex flex-col gap-4" onSubmit={(e) => { e.preventDefault(); if (name.trim()) onSubmit(name.trim()); }}>
-          <input type="text" value={name} onChange={(e) => setName(e.target.value)} placeholder="Your display name..." className="w-full rounded-md border border-white/10 bg-white/5 px-4 py-3 text-white text-center outline-none focus:border-cyan-400/50 focus:ring-2 focus:ring-cyan-400/30 transition-all" autoFocus />
-          <WaveButton text="Enter Sonic Space" type="submit" disabled={!name.trim()} />
-        </form>
-      </motion.div>
-    </motion.div>
-  );
+    const [name, setName] = useState('');
+    return (
+        <motion.div initial={{ opacity: 0 }} animate={{ opacity: 1 }} className="fixed inset-0 z-50 bg-black/80 flex items-center justify-center p-4">
+          <motion.div initial={{ scale: 0.9 }} animate={{ scale: 1 }} className="bg-black/50 border border-white/10 rounded-xl p-8 w-full max-w-sm">
+            <h2 className="text-2xl font-semibold mb-6 text-center">Enter Your Name</h2>
+            <form onSubmit={(e) => { e.preventDefault(); if (name.trim()) onSubmit(name.trim()); }} className="flex flex-col gap-4">
+              <input type="text" value={name} onChange={(e) => setName(e.target.value)} placeholder="Your display name..." className="w-full rounded-md border-white/10 bg-white/5 p-3 text-center" autoFocus />
+              <WaveButton text="Enter Sonic Space" type="submit" disabled={!name.trim()} />
+            </form>
+          </motion.div>
+        </motion.div>
+    );
 };
 
-const RoomSidebar = ({ roomCode, users, isAdmin, isCollaborative, onToggleCollaborative, onOpenUpload }: { 
-  roomCode: string, 
-  users: {name: string, isAdmin: boolean}[], 
-  isAdmin: boolean, 
-  isCollaborative: boolean, 
-  onToggleCollaborative: () => void,
-  onOpenUpload: () => void
-}) => {
+const DisconnectedOverlay = () => {
+    return (
+        <motion.div initial={{ opacity: 0 }} animate={{ opacity: 1 }} exit={{ opacity: 0 }} className="fixed bottom-28 z-20 w-full flex items-center justify-center gap-2 bg-yellow-900/80 text-yellow-200 py-2 border-t border-b border-yellow-400/30 backdrop-blur-sm">
+            <WifiOff size={16} /><span className="font-medium text-sm">Connection lost. Reconnecting...</span>
+        </motion.div>
+    );
+};
+
+const RoomSidebar = memo(function RoomSidebar({ roomCode, onOpenUpload }: { roomCode: string, onOpenUpload: () => void }) {
+    const { users, isAdmin } = useRoomStore(state => ({ users: state.users, isAdmin: state.isAdmin }), shallow);
     const [copied, setCopied] = useState(false);
     const copyToClipboard = () => {
-        navigator.clipboard.writeText(window.location.href);
+        navigator.clipboard.writeText(`${window.location.protocol}//${window.location.host}/room/${roomCode}`);
         setCopied(true);
         setTimeout(() => setCopied(false), 2000);
     };
 
     return (
         <aside className="hidden lg:flex flex-col gap-8 sticky top-8">
-            <motion.div initial={{opacity: 0, x: 20}} animate={{opacity: 1, x: 0}} transition={{delay: 0.5}}>
+            <motion.div initial={{opacity: 0, x: 20}} animate={{opacity: 1, x: 0}}>
                 <h2 className="text-sm font-light text-gray-400 mb-2">Share This Space</h2>
                 <div className="flex items-center gap-2 p-3 rounded-lg bg-white/5 border border-white/10">
-                    <LinkIcon size={16} className="text-gray-500 flex-shrink-0" />
-                    <span className="font-mono text-sm font-semibold tracking-wide text-gray-400 truncate">{`www.moodsync.fun/${roomCode}`}</span>
-                    <button onClick={copyToClipboard} className="ml-auto p-2 rounded-md hover:bg-white/10 transition-colors" title="Copy link">
-                        <Copy size={16} className={copied ? "text-cyan-400" : "text-gray-400"} />
-                    </button>
+                    <LinkIcon size={16} className="text-gray-500" />
+                    <span className="font-mono text-sm font-semibold text-gray-400 truncate">{`${window.location.host}/room/${roomCode}`}</span>
+                    <button onClick={copyToClipboard} className="ml-auto p-2 rounded-md hover:bg-white/10" title="Copy link"><Copy size={16} className={copied ? "text-cyan-400" : "text-gray-400"} /></button>
                 </div>
                 {copied && <p className="text-xs text-cyan-400 mt-2 animate-pulse">Link copied!</p>}
             </motion.div>
-            
-            <motion.div initial={{opacity: 0, x: 20}} animate={{opacity: 1, x: 0}} transition={{delay: 0.6}}>
+            <motion.div initial={{opacity: 0, x: 20}} animate={{opacity: 1, x: 0}}>
                 <h2 className="text-sm font-light text-gray-400 mb-3">In The Room ({users.length})</h2>
                 <div className="space-y-2 max-h-64 overflow-y-auto pr-2">
                     {users.map((user, idx) => (
-                        <div key={`${user.name}-${idx}`} className="flex items-center gap-3 p-2 rounded-md bg-white/5">
-                            <span className="text-sm text-white truncate">{user.name}</span>
-                            {user.isAdmin && <Crown size={14} className="ml-auto text-amber-400 flex-shrink-0" aria-label="Room Admin" />}
+                        <div key={idx} className="flex items-center gap-3 p-2 rounded-md bg-white/5">
+                            <span className="text-sm truncate">{user.name}</span>
+                            {user.isAdmin && <Crown size={14} className="ml-auto text-amber-400 flex-shrink-0" />}
                         </div>
                     ))}
                 </div>
             </motion.div>
-            
             {isAdmin && (
-                <motion.div initial={{opacity: 0, x: 20}} animate={{opacity: 1, x: 0}} transition={{delay: 0.7}}>
+                <motion.div initial={{opacity: 0, x: 20}} animate={{opacity: 1, x: 0}}>
                     <h2 className="text-sm font-light text-gray-400 mb-3">Admin Controls</h2>
-                    <div className="space-y-3">
-                        <div className="p-4 rounded-lg bg-white/5 border border-white/10">
-                            <label htmlFor="collaborative-toggle" className="flex items-center justify-between cursor-pointer">
-                                <div className="flex items-center gap-3">
-                                    <Share2 size={16} className="text-cyan-400"/>
-                                    <span className="text-white font-medium">Collaborative</span>
-                                </div>
-                                <div className="relative">
-                                    <input id="collaborative-toggle" type="checkbox" className="sr-only" checked={isCollaborative} onChange={onToggleCollaborative} />
-                                    <div className="block bg-gray-600 w-10 h-6 rounded-full"></div>
-                                    <div className={`dot absolute left-1 top-1 bg-white w-4 h-4 rounded-full transition-transform ${isCollaborative ? 'translate-x-4 bg-cyan-400' : ''}`}></div>
-                                </div>
-                            </label>
-                            <p className="text-xs text-gray-500 mt-2">Allow anyone to control playback.</p>
-                        </div>
-                        
-                        <button
-                            onClick={onOpenUpload}
-                            className="w-full p-4 rounded-lg bg-gradient-to-r from-purple-500/20 to-pink-500/20 border border-purple-400/30 hover:border-purple-400/50 transition-all flex items-center justify-center gap-2 text-white font-medium"
-                        >
-                            <Upload size={18} />
-                            Upload Music
-                        </button>
-                    </div>
+                    <button onClick={onOpenUpload} className="w-full p-4 rounded-lg bg-gradient-to-r from-purple-500/20 to-pink-500/20 border border-purple-400/30 hover:border-purple-400/50 flex items-center justify-center gap-2 text-white font-medium"><Upload size={18} />Upload Music</button>
                 </motion.div>
             )}
         </aside>
     );
-};
+});
+
 
 export default function RoomPage() {
   const params = useParams();
@@ -623,103 +407,87 @@ export default function RoomPage() {
   const [showNameModal, setShowNameModal] = useState(true);
   const [showUploadModal, setShowUploadModal] = useState(false);
 
-  const { playlistTitle, playlist, currentTrackIndex, isLoading, error, users, isAdmin, volume, isCollaborative, isPlaying } = useRoomStore();
-  const { initializePlayer, setPlaylistData, setLoading, setError, playPause, nextTrack, prevTrack, selectTrack, setVolume, connect, disconnect, toggleCollaborative, primePlayer } = useRoomStore.getState();
+  // State selectors
+  const { setRoomData, setLoading, setError, connect, disconnect, primePlayer } = useRoomStore.getState();
+  const state = useRoomStore(s => ({
+    isLoading: s.isLoading, error: s.error,
+    playlist: s.playlist, currentTrackIndex: s.currentTrackIndex, playlistTitle: s.playlistTitle,
+    isAdmin: s.isAdmin, isDisconnected: s.isDisconnected,
+  }), shallow);
+  const playerControls = useRoomStore(s => ({
+      playPause: s.playPause, nextTrack: s.nextTrack, prevTrack: s.prevTrack, setVolume: s.setVolume, selectTrack: s.selectTrack 
+  }), shallow);
+  const playerState = useRoomStore(s => ({ 
+      isPlaying: s.isPlaying, volume: s.volume, duration: s.duration 
+  }), shallow);
+
+  const currentTrack = state.playlist[state.currentTrackIndex];
+
+  // Connection Management Effect
+  useEffect(() => {
+    if (!showNameModal) {
+      connect(roomCode, "Guest");
+    }
+    return () => disconnect();
+  }, [roomCode, showNameModal, connect, disconnect]);
   
-  const currentTrack = playlist[currentTrackIndex];
-
+  // Initial Room Data Fetching Effect
   useEffect(() => {
-    initializePlayer('youtube-player-container');
-    return () => { disconnect(); }
-  }, [initializePlayer, disconnect]);
-
-  useEffect(() => {
-    if (!roomCode || showNameModal) return;
-    const fetchRoomData = async () => {
-      setLoading(true);
-      try {
-        const response = await fetch(`${API_URL}/api/room/${roomCode}`);
-        if (!response.ok) throw new Error('Room not found or an error occurred.');
-        const data = await response.json();
-        setPlaylistData(data.playlist_title, data.playlist);
-      } catch (err) { setError(err instanceof Error ? err.message : 'An unknown error occurred.'); }
-    };
-    fetchRoomData();
-  }, [roomCode, showNameModal, setPlaylistData, setLoading, setError]);
+    if (showNameModal || !roomCode) return;
+    setLoading(true);
+    fetch(`${API_URL}/api/room/${roomCode}`)
+      .then(res => res.ok ? res.json() : Promise.reject(new Error('Room not found or server is busy.')))
+      .then(data => setRoomData(data))
+      .catch(err => setError(err.message || 'An unknown error occurred.'))
+      .finally(() => setLoading(false));
+  }, [roomCode, showNameModal, setRoomData, setLoading, setError]);
 
   const handleNameSubmit = (name: string) => {
-    if (roomCode) {
-      primePlayer();
-      connect(roomCode, name);
-      setShowNameModal(false);
-    }
+    setShowNameModal(false);
+    primePlayer(); 
+    connect(roomCode, name);
   };
-
-  if (showNameModal) {
-    return <AnimatePresence>{showNameModal && <UsernameModal onSubmit={handleNameSubmit} />}</AnimatePresence>;
-  }
-  if (isLoading) return <main className="flex min-h-screen items-center justify-center bg-black"><p className="text-gray-400">Crafting Sonic Space...</p></main>;
-  if (error) return <main className="flex min-h-screen flex-col items-center justify-center bg-black p-8 text-center"><h1 className="text-3xl font-semibold text-red-500">Error</h1><p className="mt-2 text-gray-400">{error}</p><Link href="/" className="mt-8 text-cyan-400 hover:text-cyan-300">&larr; Go back home</Link></main>;
+  
+  if (state.isLoading) return <main className="flex min-h-screen items-center justify-center bg-black"><p>Loading Room...</p></main>;
+  if (state.error) return <main className="flex min-h-screen flex-col gap-4 items-center justify-center bg-black p-4 text-center"><h1 className='text-2xl text-red-500 font-bold'>Error</h1><p className="text-gray-300">{state.error}</p><Link href="/" className="mt-4 p-2 bg-cyan-600 rounded-md">Go Home</Link></main>;
+  if (showNameModal) return <UsernameModal onSubmit={handleNameSubmit} />;
 
   return (
-    <div className="min-h-screen bg-black text-white overflow-hidden">
-      <Script src="https://www.youtube.com/iframe_api" strategy="afterInteractive" />
-      <div id="youtube-player-container" className="fixed -z-10 top-0 left-0 w-0 h-0 opacity-0"></div>
-      <div className="absolute inset-0 z-0 opacity-50"><AnimatePresence>{currentTrack?.albumArt && (<motion.div key={currentTrack.youtubeId || currentTrack.audioUrl} initial={{ opacity: 0, scale: 1.1 }} animate={{ opacity: 1, scale: 1 }} exit={{ opacity: 0, scale: 1.1 }} transition={{ duration: 1.5, ease: "easeInOut" }} className="absolute inset-0"><Image src={currentTrack.albumArt} alt="background" fill className="blur-3xl saturate-50 object-cover" unoptimized /></motion.div>)}</AnimatePresence><div className="absolute inset-0 bg-black/70" /></div>
-      
-      <main className="relative z-10 grid grid-cols-1 lg:grid-cols-[2fr_1fr] gap-8 xl:gap-16 max-w-7xl mx-auto p-4 sm:p-8 h-screen">
-        <div className="flex flex-col h-full pt-8 pb-32">
-          <motion.div initial={{ opacity: 0 }} animate={{ opacity: 1 }} transition={{ delay: 0.2 }}>
-            <h1 className="text-3xl sm:text-4xl font-bold tracking-tight text-white">{playlistTitle}</h1>
+    <div className="min-h-screen bg-black text-white">
+      <div className="absolute inset-0 bg-gradient-to-b from-gray-900 via-black to-black z-[-1]" />
+      <main className="grid grid-cols-1 lg:grid-cols-[1fr_350px] gap-4 md:gap-8 max-w-7xl mx-auto p-4 sm:p-8 min-h-screen">
+        <div className="flex flex-col pt-4 md:pt-8 lg:pb-32 pb-48">
+          <motion.div initial={{ opacity: 0, y: -20 }} animate={{ opacity: 1, y: 0 }} className="mb-4 md:mb-8">
+            <h1 className="text-2xl sm:text-3xl md:text-4xl font-bold truncate">{state.playlistTitle}</h1>
+            {state.isAdmin && (
+                <div className='lg:hidden mt-4'>
+                    <button onClick={() => setShowUploadModal(true)} className="p-2 bg-purple-600/50 border border-purple-500/50 rounded-lg text-sm flex items-center gap-2 hover:bg-purple-600/80"><Upload size={16} /> Upload Music</button>
+                </div>
+            )}
           </motion.div>
-          <motion.ul initial="hidden" animate="visible" className="mt-8 space-y-2 pr-4 -mr-4 flex-1 overflow-y-auto">
-            {playlist.map((song, index) => (
-              <motion.li key={`${song.youtubeId || song.audioUrl || index}-${index}`} onClick={() => selectTrack(index)} className={`relative flex items-center gap-4 p-3 rounded-lg border transition-all duration-300 ${(isAdmin || isCollaborative) ? 'cursor-pointer' : 'cursor-default'} ${currentTrackIndex === index ? 'bg-white/10 border-white/20' : 'bg-transparent border-transparent hover:bg-white/5'}`}>
-                <AnimatePresence>{currentTrackIndex === index && (<motion.div layoutId="playing-indicator" className="absolute inset-0 rounded-lg border-2 border-cyan-400"/>)}</AnimatePresence>
-                <div className="relative h-12 w-12 rounded-md overflow-hidden bg-gray-800 flex-shrink-0">
-                  {song.albumArt ? (
-                    <Image 
-                      src={song.albumArt} 
-                      alt={song.name} 
-                      fill 
-                      className="object-cover"
-                      unoptimized
-                    />
-                  ) : (
-                    <div className="flex items-center justify-center h-full text-gray-500 text-2xl">{song.isUpload ? '🎵' : '🎧'}</div>
-                  )}
-                </div>
-                <div className="relative flex-grow min-w-0">
-                  <p className="font-semibold text-white truncate">{song.name}</p>
-                  <p className="text-sm text-gray-400 truncate">{song.artist}</p>
-                </div>
-                {song.isUpload && (
-                  <span className="px-2 py-1 text-xs bg-purple-500/20 text-purple-300 rounded-full border border-purple-400/30">
-                    Uploaded
-                  </span>
-                )}
+          <motion.ul initial="hidden" animate="visible" variants={{visible: { transition: {staggerChildren: 0.05} }}} className="space-y-2 overflow-y-auto -mr-4 pr-4">
+            {state.playlist.map((song, index) => (
+              <motion.li variants={{hidden: {opacity: 0, x: -20}, visible: {opacity: 1, x: 0}}} key={index} onClick={() => playerControls.selectTrack(index)} className={`flex items-center gap-4 p-3 rounded-lg border transition-colors ${state.currentTrackIndex === index ? 'bg-white/10 border-cyan-500' : 'border-transparent hover:bg-white/5'} ${state.isAdmin ? 'cursor-pointer' : ''}`}>
+                <div className="h-12 w-12 bg-gray-800 rounded-md flex-shrink-0 flex items-center justify-center text-2xl">🎵</div>
+                <div><p className="font-semibold truncate text-sm md:text-base">{song.name}</p><p className="text-xs md:text-sm text-gray-400 truncate">{song.artist}</p></div>
               </motion.li>
             ))}
           </motion.ul>
         </div>
-        <div className="h-full flex flex-col justify-start pt-8">
-            <RoomSidebar 
-              roomCode={roomCode} 
-              users={users} 
-              isAdmin={isAdmin} 
-              isCollaborative={isCollaborative} 
-              onToggleCollaborative={toggleCollaborative}
-              onOpenUpload={() => setShowUploadModal(true)}
-            />
-        </div>
+        <div className="h-full hidden lg:flex flex-col justify-start pt-8"><RoomSidebar roomCode={roomCode} onOpenUpload={() => setShowUploadModal(true)} /></div>
       </main>
       
-      <AnimatePresence>{currentTrack && (<Player albumArt={currentTrack.albumArt} title={currentTrack.name} artist={currentTrack.artist} isPlaying={isPlaying} onPlayPause={playPause} onNext={nextTrack} onPrev={prevTrack} volume={volume} onVolumeChange={setVolume} />)}</AnimatePresence>
-      
-      <FileUploadModal 
-        isOpen={showUploadModal} 
-        onClose={() => setShowUploadModal(false)} 
-      />
+      <AnimatePresence>
+        {currentTrack && (
+            <MemoizedPlayer 
+                title={currentTrack.name} artist={currentTrack.artist} 
+                isPlaying={playerState.isPlaying} volume={playerState.volume} duration={playerState.duration}
+                onPlayPause={playerControls.playPause} onNext={playerControls.nextTrack} onPrev={playerControls.prevTrack} onVolumeChange={playerControls.setVolume}
+            />
+        )}
+      </AnimatePresence>
+      <AnimatePresence>{state.isDisconnected && <DisconnectedOverlay />}</AnimatePresence>
+      <FileUploadModal isOpen={showUploadModal} onClose={() => setShowUploadModal(false)} />
     </div>
   );
 }
@@ -730,16 +498,17 @@ import { motion } from "framer-motion";
 import { useRoomStore } from "@/lib/room-store";
 
 const Equalizer = () => {
-  const { equalizer, setEqualizer, isAdmin, isCollaborative } = useRoomStore(
+  // SURGICAL FIX: We are no longer pulling 'isCollaborative' because it doesn't exist.
+  const { equalizer, setEqualizer, isAdmin } = useRoomStore(
     (state) => ({
       equalizer: state.equalizer,
       setEqualizer: state.setEqualizer,
       isAdmin: state.isAdmin,
-      isCollaborative: state.isCollaborative,
     })
   );
 
-  const canControl = isAdmin || isCollaborative;
+  // SURGICAL FIX: The logic is now simplified. Only the admin can control the equalizer.
+  const canControl = isAdmin;
 
   const handleChange = (band: "bass" | "mids" | "treble", value: string) => {
     const numericValue = Number(value);
@@ -1074,138 +843,6 @@ export default function FileUploadModal({ isOpen, onClose }: { isOpen: boolean; 
   );
 }
 
-### ./client/src/components/LatencyControl.tsx ###
-
-
-import { motion } from "framer-motion";
-import { useRoomStore } from "@/lib/room-store";
-
-const LatencyControl = () => {
-  const { manualLatencyOffset, setManualLatencyOffset } = useRoomStore(
-    (state) => ({
-      manualLatencyOffset: state.manualLatencyOffset,
-      setManualLatencyOffset: state.setManualLatencyOffset,
-    })
-  );
-
-  const handleChange = (value: string) => {
-    const numericValue = Number(value);
-    setManualLatencyOffset(numericValue);
-  };
-  
-  const offsetMs = Math.round(manualLatencyOffset * 1000);
-
-  return (
-    <motion.div
-      initial={{ opacity: 0, y: 10 }}
-      animate={{ opacity: 1, y: 0 }}
-      exit={{ opacity: 0, y: 10, transition: { duration: 0.2 } }}
-      className="absolute bottom-24 right-0 flex flex-col items-center gap-3 bg-black/50 border border-white/10 backdrop-blur-md rounded-lg p-4 shadow-2xl w-64"
-    >
-      <div className="text-xs font-bold text-white tracking-widest">
-        LATENCY OFFSET
-      </div>
-      <input
-        id="latency-slider"
-        type="range"
-        min="-0.25"
-        max="0.25"
-        step="0.01"
-        value={manualLatencyOffset}
-        onChange={(e) => handleChange(e.target.value)}
-        className="w-full h-1 bg-gray-700 rounded-full appearance-none cursor-pointer accent-purple-400"
-        title={`Latency Offset: ${offsetMs} ms`}
-      />
-      <div className="text-sm font-mono text-purple-300 w-20 text-center border border-purple-400/30 bg-purple-500/10 rounded px-2 py-1">
-        {offsetMs > 0 ? `+${offsetMs}`: offsetMs} ms
-      </div>
-       <p className="text-xs text-gray-500 text-center mt-1">Adjust if your audio is ahead or behind others.</p>
-    </motion.div>
-  );
-};
-
-export default LatencyControl;
-
-### ./client/src/components/Lyrics.tsx ###
-
-"use client";
-
-import { useRoomStore } from "@/lib/room-store";
-import { AnimatePresence, motion } from "framer-motion";
-import { useEffect, useRef } from "react";
-
-const Lyrics = () => {
-  const { lines, isLoading } = useRoomStore((state) => state.lyrics);
-  const currentTime = useRoomStore((state) => state.currentTime);
-  const scrollContainerRef = useRef<HTMLDivElement>(null);
-
-  // Find the index of the currently active lyric line
-  const activeLineIndex = lines.findIndex((line, index) => {
-    const nextLine = lines[index + 1];
-    return currentTime >= line.time && (!nextLine || currentTime < nextLine.time);
-  });
-
-  // Automatically scroll the active line into view
-  useEffect(() => {
-    const container = scrollContainerRef.current;
-    if (container && activeLineIndex >= 0) {
-      const activeElement = container.children[activeLineIndex] as HTMLElement;
-      if (activeElement) {
-        const containerHeight = container.offsetHeight;
-        const elementTop = activeElement.offsetTop;
-        const elementHeight = activeElement.offsetHeight;
-        
-        container.scrollTo({
-          top: elementTop - containerHeight / 2 + elementHeight / 2,
-          behavior: "smooth",
-        });
-      }
-    }
-  }, [activeLineIndex]);
-
-  const renderContent = () => {
-    if (isLoading) {
-      return <div className="text-gray-400">Loading Lyrics...</div>;
-    }
-    if (lines.length === 0) {
-      return <div className="text-gray-400">Synchronized lyrics not available for this track.</div>;
-    }
-    return lines.map((line, index) => (
-      <motion.p
-        key={`${line.time}-${index}`}
-        animate={{
-          opacity: index === activeLineIndex ? 1 : 0.4,
-          scale: index === activeLineIndex ? 1.05 : 1,
-          x: index === activeLineIndex ? 5 : 0,
-        }}
-        transition={{ duration: 0.5, ease: "circOut" }}
-        className="font-semibold text-2xl text-white transition-colors duration-300"
-      >
-        {line.text}
-      </motion.p>
-    ));
-  };
-  
-  return (
-    <motion.div
-      initial={{ opacity: 0, y: 50 }}
-      animate={{ opacity: 1, y: 0 }}
-      exit={{ opacity: 0, y: 50 }}
-      transition={{ duration: 0.5, ease: "circOut" }}
-      className="absolute inset-x-0 bottom-full mb-4 h-[50vh] bg-black/60 backdrop-blur-xl border-t border-b border-white/10 rounded-t-2xl shadow-2xl"
-    >
-      <div
-        ref={scrollContainerRef}
-        className="h-full flex flex-col gap-8 justify-center items-start p-12 overflow-y-auto text-left"
-      >
-        {renderContent()}
-      </div>
-    </motion.div>
-  );
-};
-
-export default Lyrics;
-
 ### ./client/src/components/cta.tsx ###
 
 "use client";
@@ -1479,164 +1116,65 @@ export default function Navigation() {
 "use client";
 import { useState, useEffect } from "react";
 import { motion, AnimatePresence } from "framer-motion";
-import Image from "next/image";
-import { Play, Pause, SkipBack, SkipForward, Volume1, Volume2, VolumeX, SlidersHorizontal, Mic, Timer } from "lucide-react";
+import { Play, Pause, SkipBack, SkipForward, Volume1, Volume2, VolumeX, SlidersHorizontal } from "lucide-react";
 import BeatVisualizer from "./visualizer";
 import Equalizer from "./Equalizer";
-import Lyrics from "./Lyrics";
-import LatencyControl from "./LatencyControl";
 import { useRoomStore } from "@/lib/room-store";
 
 interface PlayerProps {
-  albumArt: string | null;
-  title: string;
-  artist: string;
-  isPlaying: boolean;
-  volume: number;
-  onPlayPause: () => void;
-  onNext: () => void;
-  onPrev: () => void;
-  onVolumeChange: (volume: number) => void;
+  title: string; artist: string; isPlaying: boolean;
+  volume: number; duration: number;
+  onPlayPause: () => void; onNext: () => void; onPrev: () => void; onVolumeChange: (v: number) => void;
 }
 
-export default function Player({ albumArt, title, artist, isPlaying, volume, onPlayPause, onNext, onPrev, onVolumeChange }: PlayerProps) {
+export default function Player({ title, artist, isPlaying, volume, duration, onPlayPause, onNext, onPrev, onVolumeChange }: PlayerProps) {
   const VolumeIcon = volume === 0 ? VolumeX : volume < 50 ? Volume1 : Volume2;
   const [showEqualizer, setShowEqualizer] = useState(false);
-  const [showLyrics, setShowLyrics] = useState(false);
-  const [showLatencyControl, setShowLatencyControl] = useState(false);
-
-  const { player, audioElement, playlist, currentTrackIndex, currentTime, isAdmin, isCollaborative, isSeeking, setIsSeeking } = useRoomStore();
-  const [duration, setDuration] = useState(0);
+  const { currentTime, isAdmin, isSeeking, setIsSeeking, _emitStateUpdate, audioElement } = useRoomStore();
   const [seekValue, setSeekValue] = useState(0);
 
-  const currentTrack = playlist[currentTrackIndex];
-  const canControl = isAdmin || isCollaborative;
-
-  useEffect(() => {
-    let interval: NodeJS.Timeout | undefined;
-    const updateDuration = () => {
-      try {
-        let d = 0;
-        if (currentTrack?.isUpload && audioElement) {
-          d = audioElement.duration;
-        } else if (player && typeof player.getDuration === 'function') {
-          d = player.getDuration();
-        }
-        if (!isNaN(d) && d > 0) {
-          setDuration(d);
-          if (interval) clearInterval(interval);
-        }
-      } catch (e) { /* Player might not be ready */ }
-    };
-    
-    updateDuration();
-    if(duration === 0) {
-        interval = setInterval(updateDuration, 1000);
-    }
-
-    return () => {
-        if(interval) clearInterval(interval)
-    };
-  }, [isPlaying, player, audioElement, currentTrack, currentTrackIndex, duration]);
-
-  useEffect(() => {
-    if (!isSeeking) {
-      setSeekValue(duration > 0 ? (currentTime / duration) * 100 : 0);
-    }
-  }, [currentTime, duration, isSeeking]);
-
-  const handleSeekChange = (e: React.ChangeEvent<HTMLInputElement>) => {
-    if (!canControl) return;
-    setSeekValue(Number(e.target.value));
-  };
+  useEffect(() => { if (!isSeeking) setSeekValue(duration > 0 ? (currentTime / duration) * 100 : 0) }, [currentTime, duration, isSeeking]);
 
   const handleSeekEnd = (e: React.MouseEvent<HTMLInputElement>) => {
-    if (!canControl) return;
-    const newSeekValue = Number((e.target as HTMLInputElement).value);
-    const seekTime = (newSeekValue / 100) * duration;
-    
-    if (currentTrack?.isUpload && audioElement) {
-      audioElement.currentTime = seekTime;
-    } else if (player) {
-      player.seekTo(seekTime, true);
-    }
-    
-    setTimeout(() => {
-      useRoomStore.getState()._emitStateUpdate({ currentTime: seekTime });
-      setIsSeeking(false);
-    }, 150);
+    if (!isAdmin || !audioElement) return;
+    const seekTime = (Number(e.currentTarget.value) / 100) * duration;
+    audioElement.currentTime = seekTime;
+    setIsSeeking(false);
+    setTimeout(() => _emitStateUpdate({ currentTime: seekTime }), 150);
   };
-
-  const formatTime = (seconds: number) => {
-    if (isNaN(seconds) || seconds < 0) return '0:00';
-    const min = Math.floor(seconds / 60);
-    const sec = Math.floor(seconds % 60).toString().padStart(2, '0');
-    return `${min}:${sec}`;
-  };
+  
+  const formatTime = (s: number) => isNaN(s) || s < 0 ? '0:00' : `${Math.floor(s/60)}:${Math.floor(s%60).toString().padStart(2,'0')}`;
 
   return (
-    <motion.footer initial={{ opacity: 0 }} animate={{ opacity: 1 }} transition={{ duration: 1, ease: "easeOut", delay: 0.5 }} className="fixed bottom-0 left-0 right-0 z-50 h-28 bg-gradient-to-t from-black via-black/80 to-transparent">
-      <div className="mx-auto max-w-screen-lg h-full px-4 sm:px-8 flex items-center justify-center relative">
-        <AnimatePresence>{showLyrics && <Lyrics />}</AnimatePresence>
+    <motion.footer initial={{ y: 100 }} animate={{ y: 0 }} className="fixed bottom-0 left-0 right-0 z-50 h-auto sm:h-28 bg-black/70 backdrop-blur-xl border-t border-white/10 p-2">
+      <div className="mx-auto max-w-screen-lg h-full flex flex-col sm:flex-row items-center justify-center relative">
         <BeatVisualizer />
-        <div className="relative z-10 grid grid-cols-[1fr_2fr_1fr] items-center gap-4 sm:gap-8 w-full">
-          <div className="flex items-center gap-4 min-w-0">
-            <div className="relative h-14 w-14 sm:h-16 sm:w-16 flex-shrink-0 rounded-lg bg-gray-800 shadow-lg overflow-hidden">
-              {albumArt ? (
-                <Image 
-                  src={albumArt} 
-                  alt={title} 
-                  fill 
-                  className="object-cover rounded-lg"
-                  unoptimized
-                  onError={(e) => {
-                    e.currentTarget.style.display = 'none';
-                    const parent = e.currentTarget.parentElement;
-                    if (parent) {
-                      parent.innerHTML = '<div class="flex items-center justify-center h-full text-gray-500 text-2xl">🎵</div>';
-                    }
-                  }}
-                />
-              ) : (
-                <div className="flex items-center justify-center h-full text-gray-500 text-2xl">🎵</div>
-              )}
-            </div>
-            <div className="min-w-0 hidden sm:block"><p className="font-semibold text-lg text-white truncate">{title}</p><p className="font-light text-sm text-gray-400 truncate">{artist}</p></div>
+        <div className="grid grid-cols-[1fr_auto_1fr] sm:grid-cols-[1fr_2fr_1fr] items-center gap-2 sm:gap-4 w-full">
+          <div className="flex items-center gap-2 sm:gap-4 min-w-0">
+            <div className="h-12 w-12 sm:h-14 sm:w-14 rounded-lg bg-gray-800 flex-shrink-0 flex items-center justify-center text-xl sm:text-2xl">🎵</div>
+            <div className="min-w-0"><p className="font-semibold truncate text-sm sm:text-base">{title}</p><p className="font-light text-xs sm:text-sm text-gray-400 truncate">{artist}</p></div>
           </div>
           
-          <div className="flex flex-col items-center gap-2 w-full">
-            <div className="flex items-center gap-4 sm:gap-6">
-              <button onClick={onPrev} disabled={!canControl} className="text-gray-400 hover:text-white transition-colors disabled:opacity-50 disabled:cursor-not-allowed"><SkipBack className="w-6 h-6 sm:w-7 sm:h-7" /></button>
-              <button onClick={onPlayPause} disabled={!canControl} className="flex h-14 w-14 sm:h-16 sm:w-16 items-center justify-center rounded-full bg-white text-black transition-transform hover:scale-105 shadow-2xl disabled:opacity-50 disabled:cursor-not-allowed disabled:scale-100">{isPlaying ? <Pause className="w-7 h-7 sm:w-8 sm:h-8" /> : <Play className="w-7 h-7 sm:w-8 sm:h-8 translate-x-0.5"/>}</button>
-              <button onClick={onNext} disabled={!canControl} className="text-gray-400 hover:text-white transition-colors disabled:opacity-50 disabled:cursor-not-allowed"><SkipForward className="w-6 h-6 sm:w-7 sm:h-7" /></button>
+          <div className="flex flex-col items-center gap-2">
+            <div className="flex items-center gap-2 sm:gap-4">
+              <button onClick={onPrev} disabled={!isAdmin} className="disabled:opacity-50 text-gray-300 hover:text-white p-2"><SkipBack /></button>
+              <button onClick={onPlayPause} disabled={!isAdmin} className="h-12 w-12 sm:h-14 sm:w-14 flex items-center justify-center rounded-full bg-white text-black disabled:opacity-50">{isPlaying ? <Pause /> : <Play className="translate-x-0.5"/>}</button>
+              <button onClick={onNext} disabled={!isAdmin} className="disabled:opacity-50 text-gray-300 hover:text-white p-2"><SkipForward /></button>
             </div>
-            <div className="w-full flex items-center gap-2 text-xs text-gray-400">
-                <span>{formatTime(currentTime)}</span>
-                <input
-                    type="range"
-                    min="0"
-                    max="100"
-                    value={seekValue}
-                    disabled={!canControl || duration === 0}
-                    onMouseDown={() => canControl && setIsSeeking(true)}
-                    onMouseUp={handleSeekEnd}
-                    onChange={handleSeekChange}
-                    className="w-full h-1 bg-gray-700 rounded-full appearance-none cursor-pointer accent-cyan-400 disabled:opacity-50"
-                />
-                <span>{formatTime(duration)}</span>
+            <div className="w-full flex items-center gap-2 text-xs text-gray-400 max-w-xs sm:max-w-sm lg:max-w-md">
+              <span className='hidden sm:inline'>{formatTime(currentTime)}</span>
+              <input type="range" min="0" max="100" value={seekValue} disabled={!isAdmin || duration === 0} onMouseDown={() => isAdmin && setIsSeeking(true)} onMouseUp={handleSeekEnd} onChange={e=>setSeekValue(Number(e.target.value))} className="w-full h-1 bg-gray-700 rounded-full appearance-none cursor-pointer accent-cyan-400"/>
+              <span className='hidden sm:inline'>{formatTime(duration)}</span>
             </div>
           </div>
 
-          <div className="relative flex items-center justify-end gap-2 sm:gap-3">
+          <div className="relative flex items-center justify-end gap-1">
             <AnimatePresence>{showEqualizer && <Equalizer />}</AnimatePresence>
-            <AnimatePresence>{showLatencyControl && <LatencyControl />}</AnimatePresence>
-            
-            <button onClick={() => setShowLyrics(!showLyrics)} className={`p-2 rounded-full transition-colors ${showLyrics ? 'bg-purple-400/20 text-purple-300' : 'text-gray-400 hover:text-white'}`}><Mic size={20} /></button>
-            <button onClick={() => setShowEqualizer(!showEqualizer)} className={`p-2 rounded-full transition-colors ${showEqualizer ? 'bg-cyan-400/20 text-cyan-300' : 'text-gray-400 hover:text-white'}`}><SlidersHorizontal size={20} /></button>
-            <button onClick={() => setShowLatencyControl(!showLatencyControl)} className={`p-2 rounded-full transition-colors ${showLatencyControl ? 'bg-purple-400/20 text-purple-300' : 'text-gray-400 hover:text-white'}`}><Timer size={20} /></button>
-            
-            <VolumeIcon size={20} className="text-gray-400" />
-            <input type="range" min="0" max="100" value={volume} onChange={(e) => onVolumeChange(Number(e.target.value))} className="w-20 sm:w-24 h-1 bg-gray-700 rounded-full appearance-none cursor-pointer accent-cyan-400" />
+            <button onClick={() => setShowEqualizer(!showEqualizer)} className={`p-2 rounded-full ${showEqualizer ? 'text-cyan-300' : 'text-gray-400'}`}><SlidersHorizontal size={18} /></button>
+            <div className="items-center gap-2 hidden sm:flex">
+              <VolumeIcon size={20} />
+              <input type="range" min="0" max="100" value={volume} onChange={(e) => onVolumeChange(Number(e.target.value))} className="w-24 h-1 bg-gray-700 rounded-full appearance-none accent-cyan-400" />
+            </div>
           </div>
         </div>
       </div>
@@ -1713,57 +1251,30 @@ import { motion, AnimatePresence } from "framer-motion";
 import { useRouter } from 'next/navigation';
 import { useState } from 'react';
 import WaveButton from "./ui/WaveButton";
-import { ArrowLeft, Check } from "lucide-react";
+import { ArrowLeft } from "lucide-react";
 
-// DEFINE THE API URL AT THE TOP
 const API_URL = process.env.NEXT_PUBLIC_API_URL || 'http://localhost:5001';
-
-const genres = {
-  'House': ['deep-house', 'house', 'progressive-house', 'tech-house'],
-  'Techno': ['techno', 'minimal-techno', 'detroit-techno'],
-  'Electronic': ['electronica', 'edm', 'electro', 'dubstep'],
-  'Sets': ['boiler-room', 'live-techno-set', 'deep-house-mix'],
-  'Indie': ['indie', 'indie-pop', 'alternative'],
-};
-type GenreCategory = keyof typeof genres;
-
-const CategoryButton = ({ text, onClick, isSelected }: { text: string; onClick: () => void; isSelected: boolean; }) => (
-  <button onClick={onClick} className={`p-4 rounded-lg transition-all duration-300 text-center text-white w-full ${isSelected ? 'bg-cyan-400/20 border border-cyan-400' : 'bg-white/5 border border-transparent hover:bg-white/10'}`}>
-    {text}
-  </button>
-);
-
-const GenreTag = ({ text, onClick, isSelected }: { text: string; onClick: () => void; isSelected: boolean; }) => (
-  <button onClick={onClick} className={`px-4 py-2 text-sm rounded-full flex items-center gap-2 transition-all duration-300 ${isSelected ? 'bg-cyan-400 text-black font-semibold' : 'bg-white/10 text-gray-300 hover:bg-white/20'}`}>
-    {isSelected && <Check size={16} />}
-    {text.replace(/-/g, ' ')}
-  </button>
-);
 
 export default function UIPanel() {
   const router = useRouter();
   const [isLoading, setIsLoading] = useState(false);
   const [step, setStep] = useState<number>(0);
-  const [selectedCategory, setSelectedCategory] = useState<GenreCategory | null>(null);
-  const [selectedGenre, setSelectedGenre] = useState<string | null>(null);
   const [joinCode, setJoinCode] = useState('');
 
   const handleCreateRoom = async () => {
-    if (!selectedGenre) return;
     setIsLoading(true);
     try {
-      // USE THE API_URL VARIABLE HERE
       const response = await fetch(`${API_URL}/generate`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ mood: selectedGenre }),
+        body: JSON.stringify({}), // No mood needed anymore
       });
       if (!response.ok) throw new Error('Failed to create room');
       const data = await response.json();
       router.push(`/room/${data.room_code}`);
     } catch (error) {
       console.error("Error creating room:", error);
-      alert("Could not create a room.");
+      alert("Could not create a room. Please try again.");
       setIsLoading(false);
     }
   };
@@ -1773,45 +1284,16 @@ export default function UIPanel() {
     if (joinCode.trim()) router.push(`/room/${joinCode.trim().toUpperCase()}`);
   };
   
-  const resetState = () => {
-      setStep(0);
-      setSelectedCategory(null);
-      setSelectedGenre(null);
-  };
+  const resetState = () => setStep(0);
 
-  // ... (rest of the file is the same) ...
   return (
     <motion.div layout transition={{ duration: 0.5, type: "spring", bounce: 0.2 }} className="w-full max-w-md">
       <div className="relative rounded-2xl bg-black/40 p-8 shadow-2xl backdrop-blur-xl border border-white/10">
         <AnimatePresence mode="wait">
           {step === 0 && (
             <motion.div key="step0" initial={{ opacity: 0 }} animate={{ opacity: 1 }} exit={{ opacity: 0 }} className="flex flex-col gap-4">
-                <WaveButton text="Create a Sonic Space" onClick={() => setStep(1)} />
+                <WaveButton text={isLoading ? "Architecting..." : "Create a Sonic Space"} onClick={handleCreateRoom} disabled={isLoading} />
                 <button onClick={() => setStep(2)} className="w-full px-8 py-4 text-lg font-bold text-gray-400 hover:text-white transition-colors">Join a Space</button>
-            </motion.div>
-          )}
-          {step === 1 && (
-            <motion.div key="step1" initial={{ opacity: 0 }} animate={{ opacity: 1 }} exit={{ opacity: 0 }}>
-              <button onClick={resetState} className="absolute top-4 left-4 flex items-center gap-2 text-gray-400 hover:text-white transition-colors text-sm"><ArrowLeft size={16}/> Back</button>
-              <h2 className="text-2xl font-semibold text-center text-white mb-6 pt-4">Select a Category</h2>
-              <div className="grid grid-cols-2 sm:grid-cols-3 gap-3 mb-6">
-                {(Object.keys(genres) as GenreCategory[]).map((cat) => (
-                  <CategoryButton key={cat} text={cat} onClick={() => setSelectedCategory(cat)} isSelected={selectedCategory === cat} />
-                ))}
-              </div>
-              <AnimatePresence>
-                {selectedCategory && (
-                  <motion.div initial={{ height: 0, opacity: 0 }} animate={{ height: 'auto', opacity: 1 }} className="overflow-hidden">
-                    <h3 className="text-lg font-medium text-center text-gray-300 my-4">Specify the Vibe</h3>
-                    <div className="flex flex-wrap justify-center gap-2 mb-6">
-                      {genres[selectedCategory].map(genre => (
-                        <GenreTag key={genre} text={genre} onClick={() => setSelectedGenre(genre)} isSelected={selectedGenre === genre} />
-                      ))}
-                    </div>
-                  </motion.div>
-                )}
-              </AnimatePresence>
-              <WaveButton text={isLoading ? "Architecting..." : "Launch Space"} onClick={handleCreateRoom} disabled={!selectedGenre || isLoading} />
             </motion.div>
           )}
           {step === 2 && (
@@ -1935,261 +1417,189 @@ import { io, Socket } from 'socket.io-client';
 
 const API_URL = process.env.NEXT_PUBLIC_API_URL || 'http://localhost:5001';
 
-// --- ENTERPRISE SYNC CONSTANTS ---
-const HARD_SYNC_THRESHOLD = 0.35;
-const ADAPTIVE_RATE_THRESHOLD = 0.05;
-const PLAYBACK_RATE_ADJUST = 0.02;
-const SYNC_HEARTBEAT_INTERVAL = 1000;
-const CLOCK_SYNC_INTERVAL = 5000;
-
 // --- INTERFACES ---
-interface Song { name: string; artist: string; albumArt: string | null; youtubeId?: string; isUpload?: boolean; audioUrl?: string; }
+interface Song { name: string; artist: string; isUpload: boolean; audioUrl: string | null; albumArt: string | null; }
 interface User { name: string; isAdmin: boolean; }
-declare global { interface Window { onYouTubeIframeAPIReady: () => void; YT: any; } }
 interface EqualizerSettings { bass: number; mids: number; treble: number; }
-interface SyncState { isPlaying?: boolean; trackIndex?: number; volume?: number; isCollaborative?: boolean; equalizer?: EqualizerSettings; currentTime?: number; serverTimestamp?: number; }
 interface AudioNodes { context: AudioContext | null; source: MediaElementAudioSourceNode | null; bass: BiquadFilterNode | null; mids: BiquadFilterNode | null; treble: BiquadFilterNode | null; }
-interface LyricLine { time: number; text: string; }
+interface SyncState { isPlaying?: boolean; trackIndex?: number; volume?: number; equalizer?: EqualizerSettings; currentTime?: number; serverTimestamp?: number; }
+
+declare global { interface Window { webkitAudioContext: any; } }
 
 interface RoomState {
-  socket: Socket | null; player: any; audioElement: HTMLAudioElement | null;
-  playlist: Song[]; currentTrackIndex: number; isPlaying: boolean;
-  isSeeking: boolean; manualLatencyOffset: number; serverClockOffset: number; isAudioGraphConnected: boolean;
-  syncInterval: NodeJS.Timeout | null; clockSyncInterval: NodeJS.Timeout | null;
-  roomCode: string; playlistTitle: string; users: User[]; volume: number; isCollaborative: boolean; isLoading: boolean; error: string | null; isAdmin: boolean; username: string; equalizer: EqualizerSettings; audioNodes: AudioNodes; currentTime: number; lyrics: { lines: LyricLine[]; isLoading: boolean; };
-  playerReady: boolean; contextUnlocked: boolean;
-  connect: (roomCode: string, username: string) => void; disconnect: () => void; initializePlayer: (domId: string) => void;
-  setPlaylistData: (title: string, playlist: Song[]) => void; playPause: () => void; nextTrack: () => void; prevTrack: () => void; selectTrack: (index: number) => void; setVolume: (volume: number) => void; setEqualizer: (settings: EqualizerSettings) => void; toggleCollaborative: () => void; setIsSeeking: (isSeeking: boolean) => void; setManualLatencyOffset: (offset: number) => void;
-  _emitStateUpdate: (overrideState?: Partial<Omit<SyncState, 'serverTimestamp'>>) => void;
-  syncPlayerState: (state: SyncState) => void; _syncClock: () => Promise<void>; primePlayer: () => void; fetchLyrics: (youtubeId: string) => void; refreshPlaylist: () => void;
+  socket: Socket | null; audioElement: HTMLAudioElement | null;
+  playlist: Song[]; currentTrackIndex: number; isPlaying: boolean; isSeeking: boolean;
+  isAudioGraphConnected: boolean; roomCode: string; playlistTitle: string; username: string;
+  users: User[]; volume: number; isLoading: boolean; error: string | null; isAdmin: boolean;
+  equalizer: EqualizerSettings; audioNodes: AudioNodes; currentTime: number; duration: number;
+  isConnecting: boolean; isDisconnected: boolean;
+  connect: (roomCode: string, username: string) => void;
+  disconnect: () => void;
+  primePlayer: () => void;
+  _emitStateUpdate: (overrideState?: Partial<SyncState>) => void;
+  syncPlayerState: (state: SyncState) => void;
+  setRoomData: (data: {
+    title: string | undefined; playlistTitle: string; playlist: Song[] 
+}) => void;
+  selectTrack: (index: number) => void;
+  playPause: () => void;
+  nextTrack: () => void;
+  prevTrack: () => void;
+  setVolume: (volume: number) => void;
+  setEqualizer: (settings: EqualizerSettings) => void;
   uploadFile: (file: File, title?: string, artist?: string) => Promise<any>;
-  setLoading: (loading: boolean) => void; setError: (error: string | null) => void;
+  setLoading: (loading: boolean) => void;
+  setError: (error: string | null) => void;
+  setIsSeeking: (seeking: boolean) => void;
 }
 
-// --- SINGLETON AUDIO ENGINE ---
-let singletonAudioElement: HTMLAudioElement | null = null;
-let singletonAudioNodes: AudioNodes = { context: null, source: null, bass: null, mids: null, treble: null };
-let isAudioEngineInitialized = false;
-
+let audioEl: HTMLAudioElement | null = null;
 if (typeof window !== 'undefined') {
-  singletonAudioElement = new Audio();
-  singletonAudioElement.crossOrigin = 'anonymous';
+  audioEl = new Audio();
+  audioEl.crossOrigin = 'anonymous';
 }
 
-export const useRoomStore = create<RoomState>((set, get) => ({
-  socket: null, player: null, 
-  audioElement: singletonAudioElement,
-  audioNodes: singletonAudioNodes,
-  playlist: [], currentTrackIndex: 0, isPlaying: false,
-  isSeeking: false, manualLatencyOffset: 0, serverClockOffset: 0, isAudioGraphConnected: false,
-  syncInterval: null, clockSyncInterval: null,
-  roomCode: '', playlistTitle: '', users: [], volume: 80, isCollaborative: false, isLoading: true, error: null, isAdmin: false, username: '', equalizer: { bass: 0, mids: 0, treble: 0 }, currentTime: 0, lyrics: { lines: [], isLoading: false },
-  playerReady: false, contextUnlocked: false,
-  
+export const useRoomStore = create<RoomState>()((set, get) => ({
+  socket: null, audioElement: audioEl,
+  playlist: [], currentTrackIndex: 0, isPlaying: false, isSeeking: false,
+  isAudioGraphConnected: false, roomCode: '', playlistTitle: '', users: [], username: '',
+  volume: 80, isLoading: true, error: null, isAdmin: false,
+  equalizer: { bass: 0, mids: 0, treble: 0 },
+  audioNodes: { context: null, source: null, bass: null, mids: null, treble: null },
+  currentTime: 0, duration: 0, isConnecting: false, isDisconnected: false,
+
   setLoading: (loading) => set({ isLoading: loading }),
   setError: (error) => set({ error, isLoading: false }),
-  setIsSeeking: (isSeeking) => set({ isSeeking }),
-  setManualLatencyOffset: (offset) => set({ manualLatencyOffset: offset }),
+  setIsSeeking: (seeking) => set({ isSeeking: seeking }),
 
-  connect: (roomCode, username) => {
+  connect: (code, name) => {
     if (get().socket) return;
+    set({ username: name, roomCode: code, isLoading: true });
     const socket = io(API_URL, { transports: ['websocket'] });
-    set({ socket, username, roomCode });
+    set({ socket });
+
     socket.on('connect', () => {
-      console.log('✅ Connected with Enterprise Sync Engine');
-      socket.emit('join_room', { room_code: roomCode, username });
-      get()._syncClock();
-      const clockInterval = setInterval(() => get()._syncClock(), CLOCK_SYNC_INTERVAL);
-      set({ clockSyncInterval: clockInterval });
+        console.log("✅ Socket connected. Emitting join_room.");
+        socket.emit('join_room', { room_code: code, username: name });
     });
-    socket.on('disconnect', () => get().disconnect());
-    socket.on('error', (data) => get().setError(data.message));
-    socket.on('update_user_list', (users: User[]) => { const self = users.find(u => u.name === get().username); set({ users, isAdmin: self?.isAdmin || false }); if (self?.isAdmin) console.log('🎯 You are now admin'); });
+    socket.on('update_user_list', (users) => set({ users, isAdmin: users.find((u: User) => u.name === get().username)?.isAdmin ?? false }));
     socket.on('load_current_state', (state) => get().syncPlayerState(state));
     socket.on('sync_player_state', (state) => get().syncPlayerState(state));
-    socket.on('refresh_playlist', () => get().refreshPlaylist());
+    socket.on('refresh_playlist', (data) => get().setRoomData(data));
+    socket.on('disconnect', () => set({ isDisconnected: true }));
+    socket.on('connect_error', () => get().setError("Connection failed. The server might be offline or misconfigured."));
   },
-  
+
   disconnect: () => {
-    const { socket, syncInterval, clockSyncInterval, player, audioElement } = get();
-    if (syncInterval) clearInterval(syncInterval);
-    if (clockSyncInterval) clearInterval(clockSyncInterval);
-    player?.destroy();
-    audioElement?.pause();
-    socket?.disconnect();
-    set({ socket: null, syncInterval: null, clockSyncInterval: null, player: null, isAudioGraphConnected: false });
-    isAudioEngineInitialized = false; // Allow re-initialization on next connect
+    get().socket?.disconnect();
+    get().audioElement?.pause();
+    set({ socket: null });
   },
 
-  _emitStateUpdate: (overrideState) => {
-    const { socket, roomCode, isPlaying, currentTrackIndex, isAdmin, isCollaborative, playlist, audioElement, player, playerReady } = get();
-    if ((!isAdmin && !isCollaborative) || !playerReady) return;
-    let currentTime = 0;
-    try { currentTime = playlist[currentTrackIndex]?.isUpload && audioElement ? audioElement.currentTime : player?.getCurrentTime() || 0; } catch(e) {}
-    const stateToSend = { isPlaying, trackIndex: currentTrackIndex, currentTime, timestamp: Date.now() / 1000, ...overrideState };
-    socket?.emit('update_player_state', { room_code: roomCode, state: stateToSend });
+  primePlayer: () => {
+    const audio = get().audioElement;
+    if (!audio || get().isAudioGraphConnected) return;
+    try {
+        const AudioContext = window.AudioContext || window.webkitAudioContext;
+        const context = new AudioContext();
+        if (context.state === 'suspended') context.resume();
+        const source = context.createMediaElementSource(audio);
+        const bass = context.createBiquadFilter(); bass.type = "lowshelf"; bass.frequency.value = 250;
+        const mids = context.createBiquadFilter(); mids.type = "peaking"; mids.frequency.value = 1000; mids.Q.value = 0.8;
+        const treble = context.createBiquadFilter(); treble.type = "highshelf"; treble.frequency.value = 3000;
+        source.connect(bass).connect(mids).connect(treble).connect(context.destination);
+        set({ audioNodes: { context, source, bass, mids, treble }, isAudioGraphConnected: true });
+        audio.ontimeupdate = () => set({ currentTime: audio.currentTime });
+        audio.onloadedmetadata = () => set({ duration: audio.duration });
+        audio.onended = () => { if(get().isAdmin) get().nextTrack(); };
+        audio.onplaying = () => set({ isPlaying: true });
+        audio.onpause = () => set({ isPlaying: false });
+    } catch (e) { console.error("Could not prime audio player.", e); }
   },
   
+  _emitStateUpdate: (overrideState?: Partial<SyncState>) => {
+    const state = get();
+    if (!state.socket || !state.isAdmin) return;
+    state.socket.emit('update_player_state', { 
+        room_code: state.roomCode, 
+        state: { isPlaying: state.isPlaying, trackIndex: state.currentTrackIndex, currentTime: state.audioElement?.currentTime ?? 0, volume: state.volume, equalizer: state.equalizer, serverTimestamp: Date.now() / 1000, ...overrideState } 
+    });
+  },
+
   syncPlayerState: (state) => {
-    const { player, audioElement, playlist, currentTrackIndex, isPlaying, isSeeking, manualLatencyOffset, serverClockOffset, playerReady, volume, isAdmin, nextTrack } = get();
-    if (isSeeking || !playerReady) return;
-
+    const { audioElement, currentTrackIndex, isPlaying, isAdmin, playlist } = get();
+    if (!audioElement || isAdmin) return;
     if (state.trackIndex !== undefined && state.trackIndex !== currentTrackIndex) {
-        set({ currentTrackIndex: state.trackIndex, isPlaying: state.isPlaying ?? isPlaying });
         const track = playlist[state.trackIndex];
-        if (!track || (!track.youtubeId && !track.audioUrl)) { if (isAdmin) setTimeout(() => nextTrack(), 500); return; }
-        if (track.isUpload) {
-            if (player?.stopVideo) player.stopVideo();
-            if (audioElement && track.audioUrl) { audioElement.src = track.audioUrl; audioElement.volume = volume / 100; audioElement.load(); }
-        } else {
-            if (audioElement) { audioElement.pause(); audioElement.src = ''; }
-            if (player && track.youtubeId) { player.loadVideoById({ videoId: track.youtubeId }); player.setVolume(volume); get().fetchLyrics(track.youtubeId); }
-        }
+        if (track?.audioUrl) { audioElement.src = track.audioUrl; audioElement.load(); }
+        set({ currentTrackIndex: state.trackIndex });
     }
-    
-    const targetTrack = playlist[get().currentTrackIndex];
-    if (!targetTrack) return;
-
-    if (state.currentTime !== undefined && state.serverTimestamp !== undefined) {
-        const serverTimeNow = Date.now() / 1000 - serverClockOffset;
-        const timeSinceUpdate = serverTimeNow - state.serverTimestamp;
-        if (timeSinceUpdate < 0 || timeSinceUpdate > 5) return;
-
-        const projectedTime = state.currentTime + (state.isPlaying ? timeSinceUpdate : 0);
-        let playerTime = 0;
-        try {
-            const rawPlayerTime = targetTrack.isUpload && audioElement ? audioElement.currentTime : player?.getCurrentTime() || 0;
-            playerTime = rawPlayerTime - manualLatencyOffset;
-        } catch(e) {}
-        
-        const drift = projectedTime - playerTime;
-        
-        if (!targetTrack.isUpload && player?.setPlaybackRate && state.isPlaying) {
-            if (Math.abs(drift) > ADAPTIVE_RATE_THRESHOLD && Math.abs(drift) < HARD_SYNC_THRESHOLD) {
-                const newRate = 1.0 + Math.min(Math.max(drift * 0.1, -PLAYBACK_RATE_ADJUST), PLAYBACK_RATE_ADJUST);
-                if (Math.abs(player.getPlaybackRate() - newRate) > 0.001) player.setPlaybackRate(newRate);
-            } else {
-                if (Math.abs(player.getPlaybackRate() - 1.0) > 0.001) player.setPlaybackRate(1.0);
-            }
-        }
-        
-        if (Math.abs(drift) > HARD_SYNC_THRESHOLD) {
-            const seekTime = projectedTime + manualLatencyOffset;
-            if (isFinite(seekTime) && seekTime >= 0) {
-                try {
-                  if (targetTrack.isUpload && audioElement) audioElement.currentTime = seekTime;
-                  else if (player?.seekTo) player.seekTo(seekTime, true);
-                } catch(e) {}
-            }
-        }
-    }
-    
+    if (state.currentTime !== undefined && Math.abs(state.currentTime - audioElement.currentTime) > 2.0) { audioElement.currentTime = state.currentTime; }
     if (state.isPlaying !== undefined && state.isPlaying !== isPlaying) {
         set({ isPlaying: state.isPlaying });
-        try {
-          if (targetTrack.isUpload && audioElement) { state.isPlaying ? audioElement.play().catch(()=>{}) : audioElement.pause(); }
-          else if (player) { state.isPlaying ? player.playVideo() : player.pauseVideo(); }
-        } catch(e) {}
+        state.isPlaying ? audioElement.play().catch(()=>{}) : audioElement.pause();
     }
-    if (state.volume !== undefined && state.volume !== volume) { set({ volume: state.volume }); if (audioElement) audioElement.volume = state.volume / 100; if (player?.setVolume) player.setVolume(state.volume); }
-    if (state.equalizer) { const { audioNodes } = get(); if (audioNodes.bass) audioNodes.bass.gain.value = state.equalizer.bass; if (audioNodes.mids) audioNodes.mids.gain.value = state.equalizer.mids; if (audioNodes.treble) audioNodes.treble.gain.value = state.equalizer.treble; set({ equalizer: state.equalizer }); }
-    if (state.isCollaborative !== undefined) set({ isCollaborative: state.isCollaborative });
   },
 
-  _syncClock: async () => {
-    try {
-        const res = await fetch(`${API_URL}/ping`); if (!res.ok) throw new Error(`Ping failed: ${res.status}`);
-        const data = await res.json();
-        set({ serverClockOffset: (Date.now() / 1000) - data.serverTime });
-    } catch (e) { console.warn("Clock sync failed:", e); }
-  },
+  setRoomData: (data) => set({ playlistTitle: data.title, playlist: data.playlist, isLoading: false, error: null }),
 
-  initializePlayer: (domId) => {
-    if (isAudioEngineInitialized) return;
-
-    const { audioElement } = get();
-    if (!audioElement) return;
-
-    audioElement.ontimeupdate = () => { if (!get().isSeeking) set({ currentTime: audioElement.currentTime }); };
-    audioElement.onplay = () => set({ isPlaying: true });
-    audioElement.onpause = () => set({ isPlaying: false });
-    audioElement.onended = () => { if (get().isAdmin) get().nextTrack(); };
-    audioElement.onerror = (e) => { if(get().isAdmin) setTimeout(() => get().nextTrack(), 500); };
-    
-    const onPlayerStateChange = (e: any) => {
-        const { isAdmin, nextTrack, _emitStateUpdate, playerReady, isPlaying } = get();
-        if (!playerReady) return;
-        const newIsPlaying = e.data === window.YT.PlayerState.PLAYING;
-        if (e.data === window.YT.PlayerState.ENDED && isAdmin) { nextTrack(); return; }
-        if (isAdmin && isPlaying !== newIsPlaying) {
-          _emitStateUpdate({ isPlaying: newIsPlaying });
-        }
-        set({ isPlaying: newIsPlaying });
-    };
-
-    const onPlayerReady = (e: any) => { console.log('✅ YouTube player ready'); set({ player: e.target, playerReady: true }); if (e.target?.setVolume) e.target.setVolume(get().volume); };
-    const onPlayerError = (e: any) => { if (get().isAdmin) setTimeout(() => get().nextTrack(), 1000); };
-
-    window.onYouTubeIframeAPIReady = () => { new window.YT.Player(domId, { height: '0', width: '0', playerVars: { controls: 0, disablekb: 1, enablejsapi: 1, playsinline: 1, origin: 'https://www.moodsync.fun' }, events: { onReady: onPlayerReady, onStateChange: onPlayerStateChange, onError: onPlayerError }, }); };
-    if (typeof window !== 'undefined' && window.YT?.Player) window.onYouTubeIframeAPIReady();
-    isAudioEngineInitialized = true;
-  },
-
-  setPlaylistData: (title, playlist) => { set({ playlistTitle: title, playlist, isLoading: false, error: null }); if (playlist.length > 0 && playlist[0]?.youtubeId) get().fetchLyrics(playlist[0].youtubeId); },
-  
   playPause: () => {
-    const { isAdmin, isCollaborative, isPlaying, player, audioElement, playlist, currentTrackIndex } = get();
-    if (!isAdmin && !isCollaborative) return;
-    const isUpload = playlist[currentTrackIndex]?.isUpload;
-    if (isUpload && audioElement) { !isPlaying ? audioElement.play().catch(()=>{}) : audioElement.pause(); }
-    else if (player) { !isPlaying ? player.playVideo() : player.pauseVideo(); }
-    get()._emitStateUpdate({ isPlaying: !isPlaying });
+    if (!get().isAdmin) return;
+    const { audioElement, isPlaying } = get();
+    set({ isPlaying: !isPlaying });
+    isPlaying ? audioElement?.pause() : audioElement?.play();
+    get()._emitStateUpdate({ isPlaying: !isPlaying, currentTime: audioElement?.currentTime });
   },
-
-  nextTrack: () => {
-    const { isAdmin, isCollaborative, currentTrackIndex, playlist, player, audioElement } = get();
-    if (!isAdmin && !isCollaborative) return;
-    const newIndex = (currentTrackIndex + 1) % playlist.length;
-    player?.stopVideo();
-    if (audioElement) { audioElement.pause(); audioElement.src = ''; }
-    get()._emitStateUpdate({ trackIndex: newIndex, currentTime: 0, isPlaying: true });
-  },
-
-  prevTrack: () => {
-    const { isAdmin, isCollaborative, currentTrackIndex, playlist, player, audioElement } = get();
-    if (!isAdmin && !isCollaborative) return;
-    const newIndex = (currentTrackIndex - 1 + playlist.length) % playlist.length;
-    player?.stopVideo();
-    if (audioElement) { audioElement.pause(); audioElement.src = ''; }
-    get()._emitStateUpdate({ trackIndex: newIndex, currentTime: 0, isPlaying: true });
-  },
-
+  
   selectTrack: (index) => {
-    const { isAdmin, isCollaborative, currentTrackIndex, player, audioElement, playlist } = get();
-    if (!isAdmin && !isCollaborative) return;
-    if (index !== currentTrackIndex) {
-        if (!playlist[index]) return; // Guard against invalid index
-        player?.stopVideo();
-        if (audioElement) { audioElement.pause(); audioElement.src = ''; }
-        get()._emitStateUpdate({ trackIndex: index, currentTime: 0, isPlaying: true });
-    } else {
-        get().playPause();
+    if (!get().isAdmin) return;
+    const { playlist, audioElement, currentTrackIndex } = get();
+    if (index === currentTrackIndex) return get().playPause();
+    const track = playlist[index];
+    if (track?.audioUrl && audioElement) {
+      audioElement.src = track.audioUrl;
+      audioElement.load();
+      audioElement.play();
+      set({ currentTrackIndex: index, isPlaying: true });
+      get()._emitStateUpdate({ trackIndex: index, currentTime: 0, isPlaying: true });
     }
   },
 
-  setVolume: (volume) => { const { isAdmin } = get(); set({ volume }); if (isAdmin) get()._emitStateUpdate({ volume }); },
-  setEqualizer: (settings) => { const { isAdmin } = get(); set({ equalizer: settings }); if (isAdmin) get()._emitStateUpdate({ equalizer: settings }); },
-  toggleCollaborative: () => { const { isAdmin, isCollaborative } = get(); if (isAdmin) { const newState = !isCollaborative; set({ isCollaborative: newState }); get()._emitStateUpdate({ isCollaborative: newState }); } },
+  nextTrack: () => get().selectTrack((get().currentTrackIndex + 1) % get().playlist.length),
+  prevTrack: () => get().selectTrack((get().currentTrackIndex - 1 + get().playlist.length) % get().playlist.length),
   
-  primePlayer: () => { 
-    const { audioNodes } = get(); 
-    if (audioNodes?.context?.state === 'suspended') {
-      audioNodes.context.resume().then(() => set({ contextUnlocked: true })).catch(()=>{});
-    } else { set({ contextUnlocked: true }); }
+  setVolume: (volume) => {
+    const { audioElement } = get();
+    set({ volume });
+    if (audioElement) audioElement.volume = volume / 100;
+    if(get().isAdmin) get()._emitStateUpdate({ volume });
   },
-  fetchLyrics: async (youtubeId) => { if (!youtubeId) return; set({ lyrics: { lines: [], isLoading: true } }); try { const res = await fetch(`${API_URL}/api/lyrics/${youtubeId}`); const lines = res.ok ? await res.json() : []; set({ lyrics: { lines, isLoading: false } }); } catch (e) { set({ lyrics: { lines: [], isLoading: false } }); } },
-  refreshPlaylist: async () => { const { roomCode, playlist } = get(); if (!roomCode) return; try { const res = await fetch(`${API_URL}/api/room/${roomCode}`); if (res.ok) { const data = await res.json(); if (JSON.stringify(data.playlist) !== JSON.stringify(playlist)) set({ playlist: data.playlist }); } } catch (e) {} },
-  uploadFile: async (file, title, artist) => { const { roomCode } = get(); const formData = new FormData(); formData.append('file', file); const res = await fetch(`${API_URL}/api/upload`, { method: 'POST', body: formData }); if (!res.ok) throw new Error('Upload failed'); const data = await res.json(); await fetch(`${API_URL}/api/room/${roomCode}/add-upload`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ filename: data.filename, title: title || file.name.replace(/\.[^/.]+$/, ''), artist: artist || 'Unknown Artist', audioUrl: data.audioUrl }) }); return data; },
+
+  setEqualizer: (settings) => {
+    set({equalizer: settings})
+    const { bass, mids, treble } = get().audioNodes;
+    if (bass && mids && treble) {
+        bass.gain.value = settings.bass;
+        mids.gain.value = settings.mids;
+        treble.gain.value = settings.treble;
+    }
+    get()._emitStateUpdate({ equalizer: settings });
+  },
+
+  uploadFile: async (file: File, title?: string, artist?: string) => {
+      const state = get();
+      const formData = new FormData();
+      formData.append('file', file);
+      
+      const res = await fetch(`${API_URL}/api/upload-local`, { method: 'POST', body: formData });
+      if (!res.ok) throw new Error(`Upload failed: ${await res.text()}`);
+      const { audioUrl } = await res.json();
+      
+      await fetch(`${API_URL}/api/room/${state.roomCode}/add-upload`, {
+          method: 'POST', headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ title: title || file.name.replace(/\.[^/.]+$/, ''), artist: artist || 'Unknown Artist', audioUrl })
+      });
+  },
 }));
 
 ### ./client/tailwind.config.ts ###
@@ -2294,6 +1704,11 @@ except Exception as e:
     print(f"❌ Error importing lrc module: {e}")
 
 print("\n=== Debug complete ===")
+
+### ./dump.rdb ###
+
+[Error reading file: 'utf-8' codec can't decode byte 0xfa in position 9: invalid start byte]
+
 
 ### ./dump_project.py ###
 
@@ -2645,1861 +2060,6 @@ def test_spotify_connection():
 
 if __name__ == "__main__":
     test_spotify_connection()
-
-### ./static/mood-interactions.js ###
-
-document.addEventListener('DOMContentLoaded', () => {
-    // --- Mood selection for visualizer (unchanged) ---
-    document.querySelectorAll('.mood-option input').forEach(option => {
-        option.addEventListener('change', (e) => {
-            moodVisualizer.setMood(e.target.value);
-        });
-    });
-
-    // --- Form for CREATING a room ---
-    const generateForm = document.getElementById('generate-form');
-    generateForm.addEventListener('submit', (e) => {
-        // Check if a mood is selected
-        const selectedMood = document.querySelector('input[name="mood"]:checked');
-        if (!selectedMood) {
-            e.preventDefault(); // Stop form submission
-            alert('Please select a mood to create a room!');
-            return;
-        }
-        // Set the current hour before submitting
-        document.getElementById('hour-input').value = new Date().getHours();
-    });
-
-    // --- Form for JOINING a room ---
-    const joinForm = document.getElementById('join-form');
-    joinForm.addEventListener('submit', (e) => {
-        e.preventDefault(); // We'll handle the redirect ourselves
-        const roomCodeInput = document.getElementById('room-code-input');
-        const roomCode = roomCodeInput.value.trim().toUpperCase();
-
-        if (roomCode) {
-            // Redirect the user to the room URL
-            window.location.href = `/room/${roomCode}`;
-        } else {
-            alert('Please enter a room code.');
-        }
-    });
-
-    // Initial animation
-    moodVisualizer.animate();
-});
-
-### ./static/mood-visualizer.js ###
-
-class MoodVisualizer {
-    constructor(canvasId) {
-        this.canvas = document.getElementById(canvasId);
-        this.ctx = this.canvas.getContext('2d');
-        this.particles = [];
-        this.setupCanvas();
-        this.currentMood = null;
-    }
-
-    setupCanvas() {
-        this.canvas.width = window.innerWidth;
-        this.canvas.height = window.innerHeight;
-        window.addEventListener('resize', () => this.resizeCanvas());
-    }
-
-    resizeCanvas() {
-        this.canvas.width = window.innerWidth;
-        this.canvas.height = window.innerHeight;
-    }
-
-    createParticles(mood) {
-        this.particles = [];
-        const particleCount = 100;
-        const colors = {
-            'happy': ['#FFD700', '#FF6B6B', '#4ECDC4'],
-            'sad': ['#4A90E2', '#5BCAFF', '#1A2980'],
-            'energetic': ['#FF4500', '#FF6B6B', '#FF9A3C']
-        };
-
-        for (let i = 0; i < particleCount; i++) {
-            this.particles.push({
-                x: Math.random() * this.canvas.width,
-                y: Math.random() * this.canvas.height,
-                radius: Math.random() * 3 + 1,
-                color: colors[mood][Math.floor(Math.random() * colors[mood].length)],
-                speedX: (Math.random() - 0.5) * 2,
-                speedY: (Math.random() - 0.5) * 2,
-                alpha: 0.7
-            });
-        }
-    }
-
-    animate(mood) {
-        this.ctx.clearRect(0, 0, this.canvas.width, this.canvas.height);
-        
-        this.particles.forEach((particle, index) => {
-            // Update particle position
-            particle.x += particle.speedX;
-            particle.y += particle.speedY;
-
-            // Bounce off walls
-            if (particle.x < 0 || particle.x > this.canvas.width) particle.speedX *= -1;
-            if (particle.y < 0 || particle.y > this.canvas.height) particle.speedY *= -1;
-
-            // Draw particle
-            this.ctx.beginPath();
-            this.ctx.arc(particle.x, particle.y, particle.radius, 0, Math.PI * 2);
-            this.ctx.fillStyle = particle.color;
-            this.ctx.globalAlpha = particle.alpha;
-            this.ctx.fill();
-        });
-
-        requestAnimationFrame(() => this.animate(mood));
-    }
-
-    setMood(mood) {
-        this.currentMood = mood;
-        this.createParticles(mood);
-    }
-}
-
-// Initialize mood visualizer
-const moodVisualizer = new MoodVisualizer('moodCanvas');
-
-### ./static/player.js ###
-
-// static/player.js
-
-document.addEventListener('DOMContentLoaded', () => {
-    const roomDataDiv = document.getElementById('room-data');
-    if (!roomDataDiv) return;
-
-    // ======== STATE & CONFIG ========
-    const ROOM_CODE = roomDataDiv.dataset.roomCode;
-    let player;
-    let updateInterval;
-    let visualizerAnimationId;
-    let username = '';
-    let isUserAdmin = false;
-    let isSeeking = false;
-    let currentTrackIndex = -1;
-    const tracks = Array.from(document.querySelectorAll('.track'));
-
-    // ======== DOM ELEMENTS ========
-    const participantList = document.getElementById('participant-list');
-    const allControls = document.querySelectorAll('.control-btn, .slider');
-    const playerContainer = document.getElementById('player-container');
-    const nowPlayingTitle = document.getElementById('now-playing-title');
-    const nowPlayingArtist = document.getElementById('now-playing-artist');
-    const playerAlbumArtImg = document.querySelector('#player-album-art img');
-    const playPauseBtn = document.getElementById('play-pause-btn');
-    const nextBtn = document.getElementById('next-btn');
-    const prevBtn = document.getElementById('prev-btn');
-    const timelineSlider = document.getElementById('timeline-slider');
-    const currentTimeEl = document.getElementById('current-time');
-    const totalTimeEl = document.getElementById('total-time');
-    const volumeSlider = document.getElementById('volume-slider');
-    const visualizerCanvas = document.getElementById('player-visualizer-canvas');
-    const playIconSVG = `<svg role="img" height="24" width="24" aria-hidden="true" viewBox="0 0 24 24"><path d="M7.05 3.606a.75.75 0 0 1 .591.905l-1.282 5.599a.75.75 0 0 1-1.442-.315L6.2 4.094a.75.75 0 0 1 .85-.488zM9.533 3.692a.75.75 0 0 1 .728.843l-1.282 5.599a.75.75 0 0 1-1.442-.315L8.81 4.22a.75.75 0 0 1 .723-.528zM12.016 3.69a.75.75 0 0 1 .727.845l-1.282 5.599a.75.75 0 0 1-1.442-.315L11.29 4.22a.75.75 0 0 1 .726-.53zM14.5 3.694a.75.75 0 0 1 .726.845l-1.282 5.599a.75.75 0 1 1-1.442-.315L13.77 4.22a.75.75 0 0 1 .73-.527zM16.983 3.69a.75.75 0 0 1 .727.845l-1.282 5.599a.75.75 0 1 1-1.442-.315L16.26 4.22a.75.75 0 0 1 .723-.53z"></path></svg>`;
-    const pauseIconSVG = `<svg role="img" height="24" width="24" aria-hidden="true" viewBox="0 0 24 24"><path d="M5.7 3a.7.7 0 0 0-.7.7v16.6a.7.7 0 0 0 .7.7h2.6a.7.7 0 0 0 .7-.7V3.7a.7.7 0 0 0-.7-.7H5.7zm10 0a.7.7 0 0 0-.7.7v16.6a.7.7 0 0 0 .7.7h2.6a.7.7 0 0 0 .7-.7V3.7a.7.7 0 0 0-.7-.7h-2.6z"></path></svg>`;
-
-    // ======== INITIALIZATION ========
-    function init() {
-        username = prompt("Please enter your name:", "Guest") || "Guest";
-        allControls.forEach(el => el.disabled = true);
-        playPauseBtn.innerHTML = playIconSVG;
-    }
-    init();
-
-    // ======== SOCKET.IO ========
-    const socket = io();
-    
-    socket.on('connect', () => {
-        console.log('Connected to server');
-        socket.emit('join_room', { room_code: ROOM_CODE, username: username });
-    });
-    
-    socket.on('disconnect', () => {
-        console.log('Disconnected from server');
-    });
-    
-    socket.on('error', (data) => {
-        console.error('Socket error:', data);
-        alert('Error: ' + data.message);
-    });
-    
-    socket.on('update_user_list', renderUserList);
-    socket.on('load_current_state', (state) => syncPlayer(state, true));
-    socket.on('sync_player_state', (state) => syncPlayer(state, false));
-
-    // ======== YOUTUBE PLAYER ========
-    window.onYouTubeIframeAPIReady = () => {
-        player = new YT.Player('youtube-player', {
-            height: '100', 
-            width: '100',
-            playerVars: { 
-                'playsinline': 1, 
-                'controls': 0,
-                'disablekb': 1,
-                'fs': 0,
-                'modestbranding': 1,
-                'rel': 0
-            },
-            events: { 
-                'onReady': onPlayerReady, 
-                'onStateChange': onPlayerStateChange,
-                'onError': onPlayerError
-            }
-        });
-    };
-
-    function onPlayerReady() {
-        console.log('YouTube player ready');
-        if(player && typeof player.setVolume === 'function') {
-            player.setVolume(volumeSlider.value);
-        }
-    }
-
-    function onPlayerStateChange(event) {
-        if (!isUserAdmin || isSeeking) return;
-        
-        console.log('Player state changed:', event.data);
-        updatePlayPauseButton(event.data);
-        
-        if (event.data === YT.PlayerState.PLAYING) {
-            startTimelineUpdater();
-            startVisualizer();
-        } else if (event.data === YT.PlayerState.PAUSED) {
-            clearInterval(updateInterval);
-        } else if (event.data === YT.PlayerState.ENDED) {
-            // Auto-play next track
-            const nextIndex = (currentTrackIndex + 1) % tracks.length;
-            playSong(nextIndex);
-            return; // Don't emit state for auto-advance
-        }
-        
-        // Emit state with slight delay to ensure player is ready
-        setTimeout(() => {
-            emitPlayerState();
-        }, 100);
-    }
-
-    function onPlayerError(event) {
-        console.error('YouTube player error:', event.data);
-        alert('Error playing video. Skipping to next track.');
-        if (isUserAdmin) {
-            const nextIndex = (currentTrackIndex + 1) % tracks.length;
-            playSong(nextIndex);
-        }
-    }
-
-    // ======== CORE LOGIC ========
-    function syncPlayer(state, isFirstLoad) {
-        if (!player || typeof player.seekTo !== 'function') {
-            console.log('Player not ready for sync');
-            return;
-        }
-        
-        console.log('Syncing player:', state);
-        isSeeking = true;
-        
-        const { trackIndex, currentTime, isPlaying, timestamp } = state;
-
-        // Load new track if different
-        if (currentTrackIndex !== trackIndex) {
-            playSong(trackIndex, false);
-        }
-        
-        // Calculate time drift for sync
-        const timeDiff = (Date.now() / 1000) - timestamp;
-        let seekTime = currentTime;
-        
-        // Only apply drift compensation if playing and not first load
-        if (isPlaying && !isFirstLoad) {
-            seekTime = Math.max(0, currentTime + timeDiff);
-        }
-        
-        // Seek to position
-        player.seekTo(seekTime, true);
-        
-        // Set play state
-        if (isPlaying) {
-            player.playVideo();
-        } else {
-            player.pauseVideo();
-        }
-        
-        updatePlayPauseButton(isPlaying ? YT.PlayerState.PLAYING : YT.PlayerState.PAUSED);
-        
-        if (isPlaying) {
-            startTimelineUpdater();
-            startVisualizer();
-        } else {
-            clearInterval(updateInterval);
-        }
-
-        // Allow seeking again after sync
-        setTimeout(() => { 
-            isSeeking = false; 
-        }, 500);
-    }
-    
-    function playSong(trackIndex, shouldEmit = true) {
-        const trackElement = tracks[trackIndex];
-        if (!trackElement) {
-            console.error('Track not found:', trackIndex);
-            return;
-        }
-
-        const videoId = trackElement.dataset.youtubeId;
-        if (!videoId || videoId === 'none') {
-            alert("This song is not available for playback.");
-            return;
-        }
-
-        console.log('Playing song:', trackIndex, trackElement.dataset.songName);
-        
-        currentTrackIndex = trackIndex;
-        updateAllTrackPlayingStates();
-        
-        // Update now playing display
-        nowPlayingTitle.textContent = trackElement.dataset.songName;
-        nowPlayingArtist.textContent = trackElement.dataset.artistName;
-        
-        // Update album art with error handling
-        const albumArt = trackElement.dataset.albumArt;
-        if (albumArt && albumArt !== 'None') {
-            playerAlbumArtImg.src = albumArt;
-            playerAlbumArtImg.onerror = () => {
-                playerAlbumArtImg.src = '/static/default-album-art.png'; // Fallback
-            };
-        }
-        
-        // Load the video
-        player.loadVideoById(videoId);
-
-        // Emit state if admin and should emit
-        if (isUserAdmin && shouldEmit) {
-            setTimeout(() => {
-                emitPlayerState();
-            }, 1000); // Give player time to load
-        }
-    }
-
-    function emitPlayerState() {
-        if (!isUserAdmin || !player || typeof player.getPlayerState !== 'function') {
-            return;
-        }
-        
-        try {
-            const state = {
-                isPlaying: player.getPlayerState() === YT.PlayerState.PLAYING,
-                trackIndex: currentTrackIndex,
-                currentTime: player.getCurrentTime() || 0,
-                timestamp: Date.now() / 1000
-            };
-            
-            console.log('Emitting player state:', state);
-            socket.emit('update_player_state', { room_code: ROOM_CODE, state: state });
-        } catch (error) {
-            console.error('Error emitting player state:', error);
-        }
-    }
-
-    // ======== UI & VISUALS ========
-    function renderUserList(users) {
-        console.log('Updating user list:', users);
-        participantList.innerHTML = '';
-        
-        // Find current user and update admin status
-        const currentUser = users.find(u => u.name === username);
-        if (currentUser) {
-            isUserAdmin = currentUser.isAdmin;
-            toggleAdminControls(isUserAdmin);
-            console.log('User is admin:', isUserAdmin);
-        }
-        
-        // Render user list
-        users.forEach(user => {
-            const li = document.createElement('li');
-            li.className = 'participant-item';
-            li.innerHTML = `
-                ${user.isAdmin ? '<span class="admin-icon">👑</span>' : ''} 
-                <span class="participant-name">${user.name}</span>
-            `;
-            participantList.appendChild(li);
-        });
-    }
-
-    function toggleAdminControls(isAdmin) {
-        allControls.forEach(el => {
-            el.disabled = !isAdmin;
-            el.style.opacity = isAdmin ? '1' : '0.5';
-        });
-        
-        // Update UI feedback
-        if (isAdmin) {
-            playerContainer.classList.add('admin-mode');
-        } else {
-            playerContainer.classList.remove('admin-mode');
-        }
-    }
-
-    function updatePlayPauseButton(playerState) {
-        const isPlaying = (playerState === YT.PlayerState.PLAYING);
-        playPauseBtn.innerHTML = isPlaying ? pauseIconSVG : playIconSVG;
-        playPauseBtn.setAttribute('aria-label', isPlaying ? 'Pause' : 'Play');
-    }
-
-    function startTimelineUpdater() {
-        clearInterval(updateInterval);
-        updateInterval = setInterval(() => {
-            if (player && typeof player.getDuration === 'function' && !isSeeking) {
-                try {
-                    const currentTime = player.getCurrentTime() || 0;
-                    const duration = player.getDuration() || 0;
-                    
-                    if (duration > 0) {
-                        timelineSlider.value = (currentTime / duration) * 100;
-                        currentTimeEl.textContent = formatTime(currentTime);
-                        totalTimeEl.textContent = formatTime(duration);
-                    }
-                } catch (error) {
-                    console.error('Error updating timeline:', error);
-                }
-            }
-        }, 1000);
-    }
-
-    function formatTime(seconds) {
-        if (isNaN(seconds) || seconds < 0) return '0:00';
-        const min = Math.floor(seconds / 60);
-        const sec = Math.floor(seconds % 60).toString().padStart(2, '0');
-        return `${min}:${sec}`;
-    }
-
-    function startVisualizer() {
-        if (!visualizerCanvas) return;
-        
-        cancelAnimationFrame(visualizerAnimationId);
-        const ctx = visualizerCanvas.getContext('2d');
-        const barCount = 16;
-        
-        function animate() {
-            if (!player || player.getPlayerState() !== YT.PlayerState.PLAYING) {
-                ctx.clearRect(0, 0, visualizerCanvas.width, visualizerCanvas.height);
-                visualizerAnimationId = requestAnimationFrame(animate);
-                return;
-            }
-            
-            ctx.clearRect(0, 0, visualizerCanvas.width, visualizerCanvas.height);
-            
-            for (let i = 0; i < barCount; i++) {
-                const barHeight = Math.random() * visualizerCanvas.height * 0.8;
-                const x = (visualizerCanvas.width / barCount) * i;
-                const barWidth = (visualizerCanvas.width / barCount) - 2;
-                
-                // Create gradient for bars
-                const gradient = ctx.createLinearGradient(0, visualizerCanvas.height, 0, visualizerCanvas.height - barHeight);
-                gradient.addColorStop(0, `rgba(29, 185, 84, ${Math.random() * 0.5 + 0.5})`);
-                gradient.addColorStop(1, `rgba(30, 215, 96, ${Math.random() * 0.3 + 0.7})`);
-                
-                ctx.fillStyle = gradient;
-                ctx.fillRect(x, visualizerCanvas.height - barHeight, barWidth, barHeight);
-            }
-            
-            visualizerAnimationId = requestAnimationFrame(animate);
-        }
-        animate();
-    }
-    
-    function updateAllTrackPlayingStates() {
-        tracks.forEach((track, index) => {
-            track.classList.toggle('playing', index === currentTrackIndex);
-        });
-    }
-
-    // ======== EVENT LISTENERS ========
-    tracks.forEach((track, index) => {
-        track.addEventListener('click', () => { 
-            if (isUserAdmin) {
-                playSong(index); 
-            }
-        });
-    });
-
-    playPauseBtn.addEventListener('click', () => {
-        if (!isUserAdmin || !player) return;
-        
-        try {
-            if (player.getPlayerState() === YT.PlayerState.PLAYING) {
-                player.pauseVideo();
-            } else {
-                player.playVideo();
-            }
-        } catch (error) {
-            console.error('Error toggling play/pause:', error);
-        }
-    });
-
-    nextBtn.addEventListener('click', () => { 
-        if (isUserAdmin) {
-            const nextIndex = (currentTrackIndex + 1) % tracks.length;
-            playSong(nextIndex); 
-        }
-    });
-    
-    prevBtn.addEventListener('click', () => { 
-        if (isUserAdmin) {
-            const prevIndex = (currentTrackIndex - 1 + tracks.length) % tracks.length;
-            playSong(prevIndex); 
-        }
-    });
-
-    // Timeline slider events
-    timelineSlider.addEventListener('mousedown', () => { 
-        if (isUserAdmin) {
-            isSeeking = true; 
-        }
-    });
-    
-    timelineSlider.addEventListener('mouseup', () => {
-        if (isUserAdmin && player) {
-            try {
-                const duration = player.getDuration() || 0;
-                const seekTime = (timelineSlider.value / 100) * duration;
-                player.seekTo(seekTime, true);
-                
-                setTimeout(() => {
-                    isSeeking = false;
-                    emitPlayerState();
-                }, 200);
-            } catch (error) {
-                console.error('Error seeking:', error);
-                isSeeking = false;
-            }
-        }
-    });
-
-    volumeSlider.addEventListener('input', () => {
-        if (player && typeof player.setVolume === 'function') {
-            try {
-                player.setVolume(volumeSlider.value);
-            } catch (error) {
-                console.error('Error setting volume:', error);
-            }
-        }
-    });
-
-    // Keyboard shortcuts for admin
-    document.addEventListener('keydown', (e) => {
-        if (!isUserAdmin) return;
-        
-        switch(e.code) {
-            case 'Space':
-                e.preventDefault();
-                playPauseBtn.click();
-                break;
-            case 'ArrowLeft':
-                e.preventDefault();
-                prevBtn.click();
-                break;
-            case 'ArrowRight':
-                e.preventDefault();
-                nextBtn.click();
-                break;
-        }
-    });
-
-    // Cleanup on page unload
-    window.addEventListener('beforeunload', () => {
-        clearInterval(updateInterval);
-        cancelAnimationFrame(visualizerAnimationId);
-        if (socket) {
-            socket.disconnect();
-        }
-    });
-});
-
-### ./static/playlist-visualizer.js ###
-
-class PlaylistVisualizer {
-    constructor(canvasId) {
-        this.canvas = document.getElementById(canvasId);
-        this.ctx = this.canvas.getContext('2d');
-        this.particles = [];
-        this.setupCanvas();
-    }
-
-    setupCanvas() {
-        this.canvas.width = window.innerWidth;
-        this.canvas.height = window.innerHeight;
-        window.addEventListener('resize', () => this.resizeCanvas());
-    }
-
-    resizeCanvas() {
-        this.canvas.width = window.innerWidth;
-        this.canvas.height = window.innerHeight;
-    }
-
-    createMusicWaveParticles() {
-        this.particles = [];
-        const particleCount = 200;
-        const colors = ['#00f260', '#0575e6', '#4ECDC4'];
-
-        for (let i = 0; i < particleCount; i++) {
-            this.particles.push({
-                x: Math.random() * this.canvas.width,
-                y: this.canvas.height / 2 + Math.sin(i * 0.1) * 100,
-                radius: Math.random() * 3 + 1,
-                color: colors[Math.floor(Math.random() * colors.length)],
-                speed: Math.random() * 2 + 1,
-                amplitude: Math.random() * 50 + 20
-            });
-        }
-    }
-
-    animate() {
-        this.ctx.clearRect(0, 0, this.canvas.width, this.canvas.height);
-        
-        this.particles.forEach((particle, index) => {
-            // Update particle position with wave-like motion
-            particle.x -= particle.speed;
-            particle.y = this.canvas.height / 2 + 
-                         Math.sin(particle.x * 0.01) * particle.amplitude;
-
-            // Reset particle position when it goes off-screen
-            if (particle.x < 0) {
-                particle.x = this.canvas.width;
-            }
-
-            // Draw particle
-            this.ctx.beginPath();
-            this.ctx.arc(particle.x, particle.y, particle.radius, 0, Math.PI * 2);
-            this.ctx.fillStyle = particle.color;
-            this.ctx.globalAlpha = 0.7;
-            this.ctx.fill();
-        });
-
-        requestAnimationFrame(() => this.animate());
-    }
-
-    init() {
-        this.createMusicWaveParticles();
-        this.animate();
-    }
-}
-
-// Initialize playlist visualizer
-document.addEventListener('DOMContentLoaded', () => {
-    const playlistVisualizer = new PlaylistVisualizer('playlistCanvas');
-    playlistVisualizer.init();
-});
-
-### ./static/style.css ###
-
-/* static/style.css - Improved MoodSync Styles */
-
-/* --- IMPORTS & CSS CUSTOM PROPERTIES --- */
-@import url('https://fonts.googleapis.com/css2?family=Poppins:wght@300;400;500;600;700&display=swap');
-
-:root {
-    /* Color Palette */
-    --primary-gradient: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
-    --secondary-gradient: linear-gradient(45deg, #1db954, #1ed760);
-    --accent-gradient: linear-gradient(45deg, #00f260, #0575e6);
-    --background-dark: linear-gradient(45deg, #1a1a2e, #16213e);
-    
-    /* Semantic Colors */
-    --surface-primary: rgba(255, 255, 255, 0.1);
-    --surface-secondary: rgba(255, 255, 255, 0.05);
-    --surface-hover: rgba(255, 255, 255, 0.2);
-    --surface-active: rgba(29, 185, 84, 0.2);
-    --surface-glass: rgba(255, 255, 255, 0.08);
-    
-    /* Text Colors */
-    --text-primary: #ffffff;
-    --text-secondary: rgba(255, 255, 255, 0.8);
-    --text-tertiary: rgba(255, 255, 255, 0.6);
-    --text-accent: #1db954;
-    
-    /* Borders */
-    --border-primary: rgba(255, 255, 255, 0.1);
-    --border-secondary: rgba(255, 255, 255, 0.05);
-    --border-accent: rgba(29, 185, 84, 0.3);
-    
-    /* Spacing */
-    --spacing-xs: 0.25rem;
-    --spacing-sm: 0.5rem;
-    --spacing-md: 1rem;
-    --spacing-lg: 1.5rem;
-    --spacing-xl: 2rem;
-    --spacing-xxl: 3rem;
-    
-    /* Border Radius */
-    --radius-sm: 0.375rem;
-    --radius-md: 0.5rem;
-    --radius-lg: 0.75rem;
-    --radius-xl: 1rem;
-    --radius-pill: 50px;
-    
-    /* Shadows */
-    --shadow-sm: 0 2px 10px rgba(0, 0, 0, 0.1);
-    --shadow-md: 0 4px 20px rgba(0, 0, 0, 0.15);
-    --shadow-lg: 0 8px 30px rgba(0, 0, 0, 0.2);
-    --shadow-glow: 0 0 20px rgba(29, 185, 84, 0.3);
-    
-    /* Transitions */
-    --transition-fast: 0.15s ease;
-    --transition-normal: 0.3s ease;
-    --transition-slow: 0.5s ease;
-    
-    /* Layout */
-    --player-height: 90px;
-    --sidebar-width: 280px;
-    --content-max-width: 1200px;
-}
-
-/* --- RESET & BASE STYLES --- */
-* {
-    margin: 0;
-    padding: 0;
-    box-sizing: border-box;
-}
-
-html, body {
-    font-family: 'Poppins', -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
-    background: var(--primary-gradient);
-    min-height: 100vh;
-    color: var(--text-primary);
-    font-size: 16px;
-    line-height: 1.5;
-    -webkit-font-smoothing: antialiased;
-    -moz-osx-font-smoothing: grayscale;
-}
-
-body {
-    overflow-x: hidden;
-}
-
-/* --- SCROLLBAR STYLES --- */
-*::-webkit-scrollbar {
-    width: 8px;
-    height: 8px;
-}
-
-*::-webkit-scrollbar-track {
-    background: var(--surface-secondary);
-    border-radius: var(--radius-sm);
-}
-
-*::-webkit-scrollbar-thumb {
-    background: var(--secondary-gradient);
-    border-radius: var(--radius-sm);
-    transition: background var(--transition-fast);
-}
-
-*::-webkit-scrollbar-thumb:hover {
-    background: var(--accent-gradient);
-}
-
-/* --- UTILITY CLASSES --- */
-.glass-effect {
-    background: var(--surface-glass);
-    backdrop-filter: blur(20px);
-    -webkit-backdrop-filter: blur(20px);
-    border: 1px solid var(--border-primary);
-}
-
-.gradient-text {
-    background: var(--secondary-gradient);
-    -webkit-background-clip: text;
-    background-clip: text;
-    -webkit-text-fill-color: transparent;
-    background-clip: text;
-}
-
-.hover-lift {
-    transition: transform var(--transition-fast), box-shadow var(--transition-fast);
-}
-
-.hover-lift:hover {
-    transform: translateY(-2px);
-    box-shadow: var(--shadow-lg);
-}
-
-.pulse-animation {
-    animation: pulse 2s infinite;
-}
-
-@keyframes pulse {
-    0%, 100% { opacity: 1; }
-    50% { opacity: 0.7; }
-}
-
-/* --- HOME PAGE STYLES --- */
-.mood-visualizer-container {
-    display: flex;
-    justify-content: center;
-    align-items: center;
-    min-height: 100vh;
-    position: relative;
-    padding: var(--spacing-lg);
-}
-
-.mood-canvas {
-    position: absolute;
-    top: 0;
-    left: 0;
-    width: 100%;
-    height: 100%;
-    z-index: 1;
-}
-
-.mood-selector {
-    position: relative;
-    z-index: 10;
-    text-align: center;
-    width: 100%;
-    max-width: 600px;
-    padding: var(--spacing-xxl);
-    background: var(--surface-glass);
-    border-radius: var(--radius-xl);
-    backdrop-filter: blur(20px);
-    border: 1px solid var(--border-primary);
-    box-shadow: var(--shadow-lg);
-}
-
-.app-title {
-    font-size: clamp(2.5rem, 5vw, 3.5rem);
-    font-weight: 700;
-    margin-bottom: var(--spacing-sm);
-    background: var(--secondary-gradient);
-    -webkit-background-clip: text;
-    background-clip: text;
-    -webkit-text-fill-color: transparent;
-    letter-spacing: -0.02em;
-}
-
-.subtitle {
-    color: var(--text-secondary);
-    font-size: 1.1rem;
-    margin-bottom: var(--spacing-xl);
-    font-weight: 400;
-}
-
-.mood-options {
-    display: grid;
-    grid-template-columns: repeat(auto-fit, minmax(100px, 1fr));
-    gap: var(--spacing-md);
-    margin-bottom: var(--spacing-xl);
-}
-
-.mood-option input {
-    display: none;
-}
-
-.mood-label {
-    display: flex;
-    flex-direction: column;
-    align-items: center;
-    justify-content: center;
-    cursor: pointer;
-    padding: var(--spacing-lg);
-    border-radius: var(--radius-lg);
-    transition: all var(--transition-normal);
-    background: var(--surface-primary);
-    border: 2px solid transparent;
-    min-height: 120px;
-}
-
-.mood-label:hover {
-    background: var(--surface-hover);
-    transform: translateY(-2px);
-    box-shadow: var(--shadow-md);
-}
-
-.mood-emoji {
-    font-size: 2.5rem;
-    margin-bottom: var(--spacing-sm);
-    transition: transform var(--transition-fast);
-}
-
-.mood-label:hover .mood-emoji {
-    transform: scale(1.1);
-}
-
-.mood-option input:checked + .mood-label {
-    background: var(--surface-active);
-    border-color: var(--text-accent);
-    transform: scale(1.05);
-    box-shadow: var(--shadow-glow);
-}
-
-.mood-option input:checked + .mood-label .mood-emoji {
-    transform: scale(1.2);
-}
-
-.generate-btn {
-    background: var(--secondary-gradient);
-    color: var(--text-primary);
-    border: none;
-    padding: var(--spacing-lg) var(--spacing-xl);
-    border-radius: var(--radius-pill);
-    font-size: 1.1rem;
-    font-weight: 600;
-    cursor: pointer;
-    width: 100%;
-    transition: all var(--transition-normal);
-    box-shadow: var(--shadow-sm);
-    position: relative;
-    overflow: hidden;
-}
-
-.generate-btn::before {
-    content: '';
-    position: absolute;
-    top: 0;
-    left: -100%;
-    width: 100%;
-    height: 100%;
-    background: linear-gradient(90deg, transparent, rgba(255, 255, 255, 0.2), transparent);
-    transition: left var(--transition-slow);
-}
-
-.generate-btn:hover::before {
-    left: 100%;
-}
-
-.generate-btn:hover {
-    transform: translateY(-2px);
-    box-shadow: 0 8px 25px rgba(29, 185, 84, 0.4);
-}
-
-.generate-btn:active {
-    transform: translateY(0);
-}
-
-.divider {
-    text-align: center;
-    color: var(--text-tertiary);
-    margin: var(--spacing-xl) 0;
-    font-weight: 500;
-    position: relative;
-}
-
-.divider::before,
-.divider::after {
-    content: '';
-    position: absolute;
-    top: 50%;
-    width: 40%;
-    height: 1px;
-    background: var(--border-primary);
-}
-
-.divider::before {
-    left: 0;
-}
-
-.divider::after {
-    right: 0;
-}
-
-.join-room-form {
-    display: flex;
-    gap: var(--spacing-md);
-    align-items: center;
-}
-
-.join-room-form input {
-    flex: 1;
-    padding: var(--spacing-lg);
-    border-radius: var(--radius-pill);
-    border: 2px solid var(--border-primary);
-    background: var(--surface-secondary);
-    color: var(--text-primary);
-    font-family: inherit;
-    font-size: 1rem;
-    text-align: center;
-    transition: all var(--transition-fast);
-    letter-spacing: 1px;
-}
-
-.join-room-form input:focus {
-    outline: none;
-    border-color: var(--text-accent);
-    box-shadow: 0 0 0 3px rgba(29, 185, 84, 0.2);
-}
-
-.join-room-form input::placeholder {
-    color: var(--text-tertiary);
-}
-
-.join-btn {
-    background: linear-gradient(45deg, #5BCAFF, #4A90E2);
-    color: var(--text-primary);
-    border: none;
-    padding: var(--spacing-lg) var(--spacing-xl);
-    border-radius: var(--radius-pill);
-    font-size: 1rem;
-    font-weight: 600;
-    cursor: pointer;
-    transition: all var(--transition-normal);
-    white-space: nowrap;
-}
-
-.join-btn:hover {
-    transform: translateY(-2px);
-    box-shadow: 0 8px 25px rgba(91, 202, 255, 0.4);
-}
-
-/* --- MAIN LAYOUT --- */
-.main-container {
-    display: flex;
-    height: calc(100vh - var(--player-height));
-    max-width: var(--content-max-width);
-    margin: 0 auto;
-}
-
-/* --- SIDEBAR --- */
-.sidebar {
-    width: var(--sidebar-width);
-    flex-shrink: 0;
-    background: var(--surface-glass);
-    backdrop-filter: blur(20px);
-    padding: var(--spacing-xl);
-    display: flex;
-    flex-direction: column;
-    border-right: 1px solid var(--border-primary);
-}
-
-.sidebar h3 {
-    font-size: 1.3rem;
-    font-weight: 600;
-    margin-bottom: var(--spacing-lg);
-    color: var(--text-primary);
-    text-align: center;
-}
-
-.room-share-info {
-    background: var(--surface-primary);
-    padding: var(--spacing-lg);
-    border-radius: var(--radius-lg);
-    margin-bottom: var(--spacing-xl);
-    text-align: center;
-    border: 1px solid var(--border-primary);
-}
-
-.room-share-info p {
-    font-size: 0.9rem;
-    margin-bottom: var(--spacing-sm);
-    color: var(--text-secondary);
-}
-
-.room-code-display {
-    font-size: 1.5rem;
-    font-weight: 700;
-    letter-spacing: 3px;
-    color: var(--text-accent);
-    background: var(--surface-active);
-    padding: var(--spacing-md) var(--spacing-lg);
-    border-radius: var(--radius-md);
-    display: inline-block;
-    border: 1px solid var(--border-accent);
-    font-family: 'Courier New', monospace;
-}
-
-#participant-list {
-    list-style: none;
-    flex-grow: 1;
-    overflow-y: auto;
-    padding-right: var(--spacing-sm);
-}
-
-#participant-list li {
-    padding: var(--spacing-md);
-    margin-bottom: var(--spacing-sm);
-    background: var(--surface-primary);
-    border-radius: var(--radius-md);
-    font-size: 0.9rem;
-    transition: all var(--transition-fast);
-    border: 1px solid var(--border-secondary);
-    display: flex;
-    align-items: center;
-    gap: var(--spacing-sm);
-}
-
-#participant-list li:hover {
-    background: var(--surface-hover);
-    transform: translateX(4px);
-}
-
-#participant-list li.admin {
-    background: var(--surface-active);
-    border-color: var(--border-accent);
-    font-weight: 500;
-}
-
-#participant-list li.admin::before {
-    content: '👑';
-    font-size: 0.8rem;
-}
-
-.back-btn {
-    display: inline-block;
-    padding: var(--spacing-lg);
-    background: var(--surface-primary);
-    color: var(--text-primary);
-    text-decoration: none;
-    border-radius: var(--radius-lg);
-    text-align: center;
-    margin-top: var(--spacing-lg);
-    transition: all var(--transition-normal);
-    border: 1px solid var(--border-primary);
-    font-weight: 500;
-}
-
-.back-btn:hover {
-    background: var(--surface-hover);
-    transform: translateY(-2px);
-    box-shadow: var(--shadow-md);
-}
-
-/* --- PLAYLIST AREA --- */
-.playlist-area {
-    flex: 1;
-    padding: var(--spacing-xl);
-    overflow-y: auto;
-    background: var(--surface-secondary);
-}
-
-.playlist-title {
-    font-size: clamp(2rem, 4vw, 3rem);
-    font-weight: 700;
-    margin-bottom: var(--spacing-xl);
-    text-align: center;
-    background: var(--secondary-gradient);
-    -webkit-background-clip: text;
-    background-clip: text;
-    -webkit-text-fill-color: transparent;
-    letter-spacing: -0.02em;
-}
-
-.playlist-tracks {
-    display: grid;
-    gap: var(--spacing-md);
-    max-width: 800px;
-    margin: 0 auto;
-}
-
-.track {
-    display: flex;
-    align-items: center;
-    padding: var(--spacing-lg);
-    background: var(--surface-glass);
-    backdrop-filter: blur(10px);
-    border-radius: var(--radius-lg);
-    transition: all var(--transition-normal);
-    cursor: pointer;
-    border: 1px solid var(--border-primary);
-    position: relative;
-    overflow: hidden;
-}
-
-.track::before {
-    content: '';
-    position: absolute;
-    top: 0;
-    left: -100%;
-    width: 100%;
-    height: 100%;
-    background: linear-gradient(90deg, transparent, rgba(255, 255, 255, 0.1), transparent);
-    transition: left var(--transition-slow);
-}
-
-.track:hover::before {
-    left: 100%;
-}
-
-.track:hover {
-    background: var(--surface-hover);
-    transform: translateY(-2px);
-    box-shadow: var(--shadow-lg);
-}
-
-.track.playing {
-    background: var(--surface-active);
-    border-color: var(--text-accent);
-    box-shadow: var(--shadow-glow);
-}
-
-.track.playing::after {
-    content: '';
-    position: absolute;
-    left: 0;
-    top: 0;
-    width: 3px;
-    height: 100%;
-    background: var(--secondary-gradient);
-}
-
-.track-number {
-    font-size: 1.1rem;
-    font-weight: 600;
-    margin-right: var(--spacing-lg);
-    min-width: 35px;
-    text-align: center;
-    color: var(--text-accent);
-}
-
-.track-album-art {
-    width: 55px;
-    height: 55px;
-    border-radius: var(--radius-md);
-    margin-right: var(--spacing-lg);
-    overflow: hidden;
-    background: var(--surface-primary);
-    display: flex;
-    align-items: center;
-    justify-content: center;
-    flex-shrink: 0;
-    box-shadow: var(--shadow-sm);
-}
-
-.track-album-art img {
-    width: 100%;
-    height: 100%;
-    object-fit: cover;
-    transition: transform var(--transition-fast);
-}
-
-.track:hover .track-album-art img {
-    transform: scale(1.05);
-}
-
-.placeholder-art {
-    font-size: 1.5rem;
-    color: var(--text-tertiary);
-}
-
-.track-info {
-    flex: 1;
-    min-width: 0;
-}
-
-.track-name {
-    font-size: 1.1rem;
-    font-weight: 600;
-    margin-bottom: var(--spacing-xs);
-    color: var(--text-primary);
-    white-space: nowrap;
-    overflow: hidden;
-    text-overflow: ellipsis;
-}
-
-.track-artist {
-    font-size: 0.9rem;
-    color: var(--text-secondary);
-    white-space: nowrap;
-    overflow: hidden;
-    text-overflow: ellipsis;
-}
-
-/* --- PLAYER BAR --- */
-.player-container {
-    position: fixed;
-    bottom: 0;
-    left: 0;
-    right: 0;
-    height: var(--player-height);
-    background: rgba(0, 0, 0, 0.95);
-    backdrop-filter: blur(30px);
-    border-top: 1px solid var(--border-primary);
-    display: grid;
-    grid-template-columns: 1fr 2fr 1fr;
-    align-items: center;
-    padding: 0 var(--spacing-xl);
-    gap: var(--spacing-xl);
-    z-index: 1000;
-    box-shadow: 0 -4px 20px rgba(0, 0, 0, 0.3);
-}
-
-#youtube-player-wrapper {
-    position: absolute;
-    left: -9999px;
-    top: -9999px;
-    width: 1px;
-    height: 1px;
-    overflow: hidden;
-    visibility: hidden;
-}
-
-.player-left {
-    display: flex;
-    align-items: center;
-    gap: var(--spacing-md);
-    min-width: 0;
-}
-
-#player-album-art {
-    width: 60px;
-    height: 60px;
-    border-radius: var(--radius-md);
-    overflow: hidden;
-    background: var(--surface-primary);
-    flex-shrink: 0;
-    box-shadow: var(--shadow-sm);
-}
-
-#player-album-art img {
-    width: 100%;
-    height: 100%;
-    object-fit: cover;
-    transition: transform var(--transition-fast);
-}
-
-#player-info {
-    min-width: 0;
-    flex: 1;
-}
-
-#now-playing-title {
-    font-size: 1rem;
-    font-weight: 600;
-    color: var(--text-primary);
-    white-space: nowrap;
-    overflow: hidden;
-    text-overflow: ellipsis;
-    margin-bottom: var(--spacing-xs);
-}
-
-#now-playing-artist {
-    font-size: 0.85rem;
-    color: var(--text-secondary);
-    white-space: nowrap;
-    overflow: hidden;
-    text-overflow: ellipsis;
-}
-
-.player-center {
-    display: flex;
-    flex-direction: column;
-    align-items: center;
-    gap: var(--spacing-md);
-    min-width: 0;
-}
-
-.controls-wrapper {
-    display: flex;
-    align-items: center;
-    gap: var(--spacing-lg);
-}
-
-.control-btn {
-    background: none;
-    border: none;
-    color: var(--text-secondary);
-    padding: var(--spacing-sm);
-    border-radius: 50%;
-    cursor: pointer;
-    transition: all var(--transition-fast);
-    display: flex;
-    align-items: center;
-    justify-content: center;
-    width: 36px;
-    height: 36px;
-}
-
-.control-btn:hover {
-    background: var(--surface-primary);
-    color: var(--text-primary);
-    transform: scale(1.1);
-}
-
-.control-btn:disabled {
-    opacity: 0.4;
-    cursor: not-allowed;
-    pointer-events: none;
-}
-
-.control-btn#play-pause-btn {
-    background: var(--text-primary);
-    color: #000;
-    width: 44px;
-    height: 44px;
-    box-shadow: var(--shadow-sm);
-}
-
-.control-btn#play-pause-btn:hover {
-    background: var(--text-primary);
-    transform: scale(1.05);
-    box-shadow: var(--shadow-md);
-}
-
-.timeline-wrapper {
-    display: flex;
-    align-items: center;
-    gap: var(--spacing-md);
-    width: 100%;
-    font-size: 0.8rem;
-    color: var(--text-tertiary);
-}
-
-.slider {
-    -webkit-appearance: none;
-    appearance: none;
-    width: 100%;
-    height: 4px;
-    background: var(--surface-primary);
-    border-radius: var(--radius-sm);
-    outline: none;
-    cursor: pointer;
-    transition: all var(--transition-fast);
-    position: relative;
-}
-
-.slider:hover {
-    height: 6px;
-}
-
-.slider::-webkit-slider-thumb {
-    -webkit-appearance: none;
-    appearance: none;
-    width: 16px;
-    height: 16px;
-    background: var(--text-primary);
-    border-radius: 50%;
-    cursor: pointer;
-    box-shadow: var(--shadow-sm);
-    transition: all var(--transition-fast);
-}
-
-.slider::-webkit-slider-thumb:hover {
-    transform: scale(1.2);
-    box-shadow: var(--shadow-md);
-}
-
-.slider::-moz-range-thumb {
-    width: 16px;
-    height: 16px;
-    background: var(--text-primary);
-    border-radius: 50%;
-    cursor: pointer;
-    border: none;
-    box-shadow: var(--shadow-sm);
-}
-
-.player-right {
-    display: flex;
-    align-items: center;
-    justify-content: flex-end;
-    gap: var(--spacing-md);
-}
-
-.volume-wrapper {
-    display: flex;
-    align-items: center;
-    gap: var(--spacing-sm);
-    width: 120px;
-}
-
-.volume-icon {
-    color: var(--text-secondary);
-    flex-shrink: 0;
-}
-
-#player-visualizer-canvas {
-    height: 40px;
-    width: 150px;
-    border-radius: var(--radius-sm);
-    background: var(--surface-primary);
-}
-
-/* --- RESPONSIVE DESIGN --- */
-@media (max-width: 768px) {
-    :root {
-        --sidebar-width: 250px;
-        --player-height: 80px;
-    }
-    
-    .mood-selector {
-        margin: var(--spacing-md);
-        padding: var(--spacing-xl);
-    }
-    
-    .app-title {
-        font-size: 2.5rem;
-    }
-    
-    .mood-options {
-        grid-template-columns: repeat(2, 1fr);
-        gap: var(--spacing-sm);
-    }
-    
-    .mood-label {
-        padding: var(--spacing-md);
-        min-height: 100px;
-    }
-    
-    .mood-emoji {
-        font-size: 2rem;
-    }
-    
-    .main-container {
-        flex-direction: column;
-        height: auto;
-    }
-    
-    .sidebar {
-        width: 100%;
-        height: auto;
-        border-right: none;
-        border-bottom: 1px solid var(--border-primary);
-    }
-    
-    .player-container {
-        grid-template-columns: 1fr;
-        grid-template-rows: 1fr auto;
-        height: auto;
-        padding: var(--spacing-md);
-    }
-    
-    .player-left {
-        justify-content: center;
-    }
-    
-    .player-center {
-        order: 2;
-    }
-    
-    .player-right {
-        display: none;
-    }
-    
-    .join-room-form {
-        flex-direction: column;
-    }
-    
-    .join-room-form input {
-        width: 100%;
-        margin-bottom: var(--spacing-md);
-    }
-}
-
-@media (max-width: 480px) {
-    :root {
-        --spacing-md: 0.75rem;
-        --spacing-lg: 1rem;
-        --spacing-xl: 1.5rem;
-    }
-    
-    .playlist-area {
-        padding: var(--spacing-md);
-    }
-    
-    .track {
-        padding: var(--spacing-md);
-    }
-    
-    .track-album-art {
-        width: 45px;
-        height: 45px;
-    }
-    
-    .sidebar {
-        padding: var(--spacing-md);
-    }
-}
-
-/* --- ANIMATIONS --- */
-@keyframes fadeIn {
-    from {
-        opacity: 0;
-        transform: translateY(20px);
-    }
-    to {
-        opacity: 1;
-        transform: translateY(0);
-    }
-}
-
-@keyframes slideIn {
-    from {
-        transform: translateX(-100%);
-    }
-    to {
-        transform: translateX(0);
-    }
-}
-
-@keyframes glow {
-    0%, 100% {
-        box-shadow: 0 0 5px rgba(29, 185, 84, 0.5);
-    }
-    50% {
-        box-shadow: 0 0 20px rgba(29, 185, 84, 0.8);
-    }
-}
-
-.fade-in {
-    animation: fadeIn 0.5s ease-out;
-}
-
-.slide-in {
-    animation: slideIn 0.3s ease-out;
-}
-
-.glow-effect {
-    animation: glow 2s ease-in-out infinite;
-}
-
-/* --- FOCUS STYLES --- */
-.control-btn:focus,
-.generate-btn:focus,
-.join-btn:focus,
-.back-btn:focus {
-    outline: 2px solid var(--text-accent);
-    outline-offset: 2px;
-}
-
-.slider:focus {
-    outline: none;
-    box-shadow: 0 0 0 3px rgba(29, 185, 84, 0.3);
-}
-
-/* --- PRINT STYLES --- */
-@media print {
-    .player-container,
-    .sidebar,
-    .mood-canvas {
-        display: none !important;
-    }
-    
-    .playlist-area {
-        width: 100%;
-        padding: 0;
-    }
-}
-
-### ./templates/error.html ###
-
-<!DOCTYPE html>
-<html lang="en">
-<head>
-    <meta charset="UTF-8">
-    <title>MoodSync - Error</title>
-    <link rel="stylesheet" href="{{ url_for('static', filename='style.css') }}">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <style>
-        .error-container {
-            display: flex;
-            flex-direction: column;
-            justify-content: center;
-            align-items: center;
-            height: 100vh;
-            text-align: center;
-            background: linear-gradient(45deg, #ff416c, #ff4b2b);
-            color: white;
-            padding: 20px;
-        }
-        .error-icon {
-            font-size: 5rem;
-            margin-bottom: 20px;
-        }
-        .error-message {
-            max-width: 600px;
-            font-size: 1.2rem;
-            margin-bottom: 30px;
-        }
-        .error-action {
-            display: inline-block;
-            padding: 10px 20px;
-            background: white;
-            color: #ff416c;
-            text-decoration: none;
-            border-radius: 50px;
-            transition: all 0.3s ease;
-        }
-        .error-action:hover {
-            transform: scale(1.05);
-            box-shadow: 0 10px 20px rgba(0,0,0,0.1);
-        }
-    </style>
-</head>
-<body>
-    <div class="error-container">
-        <div class="error-icon">🚫</div>
-        <h1>Oops! Something Went Wrong</h1>
-        <p class="error-message">
-            {{ error or "An unexpected error occurred. Please try again later." }}
-        </p>
-        <a href="/" class="error-action">Back to Home</a>
-    </div>
-</body>
-</html>
-
-### ./templates/index.html ###
-
-<!DOCTYPE html>
-<html lang="en">
-<head>
-    <meta charset="UTF-8">
-    <title>MoodSync - Musical Mood Generator</title>
-    <link rel="stylesheet" href="{{ url_for('static', filename='style.css') }}">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0">
-</head>
-<body>
-    <div class="mood-visualizer-container">
-        <canvas id="moodCanvas" class="mood-canvas"></canvas>
-        
-        <div class="mood-selector">
-            <h1 class="app-title">MoodSync</h1>
-            <p class="subtitle">What's your musical vibe today?</p>
-            
-            <!-- This form now submits to /generate -->
-            <form id="generate-form" method="POST" action="/generate">
-                <div class="mood-options">
-                    <!-- ... mood options (happy, sad, energetic) are the same ... -->
-                    <div class="mood-option" data-mood="happy">
-                        <input type="radio" name="mood" value="happy" id="happy-mood" required>
-                        <label for="happy-mood" class="mood-label"><span class="mood-emoji">😊</span><span class="mood-text">Happy</span></label>
-                    </div>
-                    <div class="mood-option" data-mood="sad">
-                        <input type="radio" name="mood" value="sad" id="sad-mood">
-                        <label for="sad-mood" class="mood-label"><span class="mood-emoji">😢</span><span class="mood-text">Sad</span></label>
-                    </div>
-                    <div class="mood-option" data-mood="energetic">
-                        <input type="radio" name="mood" value="energetic" id="energetic-mood">
-                        <label for="energetic-mood" class="mood-label"><span class="mood-emoji">⚡</span><span class="mood-text">Energetic</span></label>
-                    </div>
-                </div>
-                <!-- Hidden input for the hour, will be set by JS -->
-                <input type="hidden" name="hour" id="hour-input">
-                <button type="submit" id="generatePlaylist" class="generate-btn">
-                    Create a Listening Room
-                    <div class="btn-particle-flow"></div>
-                </button>
-            </form>
-
-            <div class="divider">OR</div>
-
-            <!-- NEW: Join Room Form -->
-            <form id="join-form" class="join-room-form">
-                <input type="text" id="room-code-input" placeholder="Enter Room Code" required>
-                <button type="submit" class="join-btn">Join Room</button>
-            </form>
-
-        </div>
-    </div>
-
-    <script src="{{ url_for('static', filename='mood-visualizer.js') }}"></script>
-    <script src="{{ url_for('static', filename='mood-interactions.js') }}"></script>
-</body>
-</html>
-
-### ./templates/result.html ###
-
-<!-- templates/result.html -->
-
-<!DOCTYPE html>
-<html lang="en">
-<head>
-    <meta charset="UTF-8">
-    <title>MoodSync - {{ playlist_title }}</title>
-    <link rel="icon" href="data:image/svg+xml,<svg xmlns=%22http://www.w3.org/2000/svg%22 viewBox=%220 0 100 100%22><text y=%22.9em%22 font-size=%2290%22>🎵</text></svg>">
-    <link rel="stylesheet" href="{{ url_for('static', filename='style.css') }}">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0">
-</head>
-<body>
-    <!-- Hidden div to pass room code to JavaScript -->
-    <div id="room-data" data-room-code="{{ room_code }}"></div>
-
-    <div class="main-container">
-        <!-- Sidebar for participants and room info -->
-        <div class="sidebar">
-            <h3>In The Room</h3>
-            <div class="room-share-info">
-                <p>Room Code:</p>
-                <strong class="room-code-display">{{ room_code }}</strong>
-            </div>
-            <ul id="participant-list">
-                <!-- User list will be populated by JS -->
-            </ul>
-            <a href="/" class="back-btn">Leave Room</a>
-        </div>
-
-        <!-- Main playlist content area -->
-        <div class="playlist-area">
-            <h1 class="playlist-title">{{ playlist_title }}</h1>
-            <div class="playlist-tracks">
-                {% for song in songs %}
-                <div class="track" 
-                     data-youtube-id="{{ song.youtubeId or 'none' }}" 
-                     data-song-name="{{ song.name }}"
-                     data-artist-name="{{ song.artist }}"
-                     data-album-art="{{ song.albumArt or url_for('static', filename='placeholder.png') }}">
-                    <div class="track-number">{{ loop.index }}</div>
-                    <div class="track-album-art">
-                        {% if song.albumArt %}
-                        <img src="{{ song.albumArt }}" alt="{{ song.name }}">
-                        {% else %}
-                        <div class="placeholder-art">🎵</div>
-                        {% endif %}
-                    </div>
-                    <div class="track-info">
-                        <h3 class="track-name">{{ song.name }}</h3>
-                        <p class="track-artist">{{ song.artist }}</p>
-                    </div>
-                </div>
-                {% endfor %}
-            </div>
-        </div>
-    </div>
-
-    <!-- Redesigned Player Bar -->
-    <div id="player-container" class="player-container">
-        <!-- Hidden YouTube Player Iframe -->
-        <div id="youtube-player-wrapper"><div id="youtube-player"></div></div>
-        
-        <!-- Left Section: Song Info -->
-        <div class="player-left">
-            <div id="player-album-art"><img src="" alt="Album Art"></div>
-            <div id="player-info">
-                <span id="now-playing-title">Select a song</span>
-                <span id="now-playing-artist"></span>
-            </div>
-        </div>
-
-        <!-- Center Section: Playback Controls -->
-        <div class="player-center">
-            <div class="controls-wrapper">
-                <button id="prev-btn" class="control-btn"><svg role="img" height="16" width="16" aria-hidden="true" viewBox="0 0 16 16"><path d="M3.3 1a.7.7 0 0 1 .7.7v5.15l9.95-5.744a.7.7 0 0 1 1.05.606v12.575a.7.7 0 0 1-1.05.607L4 8.15V13.3a.7.7 0 0 1-1.4 0V1.7a.7.7 0 0 1 .7-.7z"></path></svg></button>
-                <button id="play-pause-btn" class="control-btn play-btn"></button>
-                <button id="next-btn" class="control-btn"><svg role="img" height="16" width="16" aria-hidden="true" viewBox="0 0 16 16"><path d="M12.7 1a.7.7 0 0 0-.7.7v5.15L2.05 1.107A.7.7 0 0 0 1 1.712v12.575a.7.7 0 0 0 1.05.607L12 8.15V13.3a.7.7 0 0 0 1.4 0V1.7a.7.7 0 0 0-.7-.7z"></path></svg></button>
-            </div>
-            <div class="timeline-wrapper">
-                <span id="current-time">0:00</span>
-                <input type="range" id="timeline-slider" class="slider" value="0" min="0" max="100">
-                <span id="total-time">0:00</span>
-            </div>
-        </div>
-
-        <!-- Right Section: Visualizer and Volume -->
-        <div class="player-right">
-            <canvas id="player-visualizer-canvas" width="150" height="40"></canvas>
-            <div class="volume-wrapper">
-                <svg role="img" height="16" width="16" aria-hidden="true" class="volume-icon" viewBox="0 0 16 16"><path d="M9.741.85a.75.75 0 0 1 .375.65v13a.75.75 0 0 1-1.125.65l-6.925-4a3.642 3.642 0 0 1-1.33-4.967 3.639 3.639 0 0 1 1.33-1.033l6.925-4a.75.75 0 0 1 .75 0zm-6.924 5.3a2.142 2.142 0 0 0-1.033 3.28.75.75 0 0 1 0 .28l.001.002 1.033 1.785a2.14 2.14 0 0 0 2.75-.44l.004-.007a2.14 2.14 0 0 0 .222-.327l.002-.003.001-.002-.001-.002-.002-.003a2.14 2.14 0 0 0-.222-.327l-.004-.007a2.14 2.14 0 0 0-2.75-.44l-1.033-1.785z"></path></svg>
-                <input type="range" id="volume-slider" class="slider" value="100" min="0" max="100">
-            </div>
-        </div>
-    </div>
-
-    <!-- JavaScript Files -->
-    <script src="https://www.youtube.com/iframe_api"></script>
-    <script src="https://cdn.socket.io/4.5.4/socket.io.min.js"></script>
-    <script src="{{ url_for('static', filename='player.js') }}"></script>
-</body>
-</html>
 
 ### ./test_different_songs.py ###
 
