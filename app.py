@@ -1,155 +1,183 @@
-import os, random, string, logging, time, json
+import os, random, string, logging, time, json, re
 from flask import Flask, jsonify, request, send_from_directory, url_for
 from flask_socketio import SocketIO, join_room, emit
 from flask_cors import CORS
 from dotenv import load_dotenv
 import redis
+import yt_dlp
+import syncedlyrics
+from googleapiclient.discovery import build
 from werkzeug.utils import secure_filename
 from werkzeug.middleware.proxy_fix import ProxyFix
 
 load_dotenv()
+
+# --- SETUP ---
 app = Flask(__name__)
 app.wsgi_app = ProxyFix(app.wsgi_app, x_for=1, x_proto=1, x_host=1, x_prefix=1)
+CORS(app, origins="*")
+socketio = SocketIO(app, cors_allowed_origins="*", async_mode='gevent')
 
-# --- CONFIGURATION ---
-CORS(app, origins=os.getenv("FRONTEND_URL", "http://localhost:3000"), supports_credentials=True)
-socketio = SocketIO(app, cors_allowed_origins=os.getenv("FRONTEND_URL", "http://localhost:3000"), async_mode='gevent')
-
+# --- CONFIG ---
 UPLOAD_FOLDER = 'uploads'
 os.makedirs(UPLOAD_FOLDER, exist_ok=True)
-app.config['UPLOAD_FOLDER'] = UPLOAD_FOLDER
-app.config['MAX_CONTENT_LENGTH'] = 50 * 1024 * 1024
+YOUTUBE_API_KEY = os.getenv('YOUTUBE_API_KEY')
+youtube = build('youtube', 'v3', developerKey=YOUTUBE_API_KEY) if YOUTUBE_API_KEY else None
 
-def allowed_file(filename):
-    return '.' in filename and filename.rsplit('.', 1)[1].lower() in {'mp3', 'wav', 'ogg', 'm4a', 'flac'}
-
-try:
-    redis_url = os.getenv('REDIS_URL')
-    if not redis_url: raise ValueError("REDIS_URL env var not set.")
-    r = redis.from_url(redis_url, decode_responses=True)
-    r.ping()
-    app.logger.info("Redis connection successful.")
-except Exception as e:
-    app.logger.error(f"FATAL: Redis connection failed: {e}"); exit(1)
+# --- REDIS ---
+redis_url = os.getenv('REDIS_URL', 'redis://localhost:6379')
+r = redis.from_url(redis_url, decode_responses=True)
 
 def safe_get(key): return r.get(key)
-def safe_set(key, value, ex): r.set(key, value, ex=ex)
-def safe_delete(key): r.delete(key)
+def safe_set(key, val, ex=86400): r.set(key, val, ex=ex)
 
-@app.route('/ping', methods=['GET'])
-def ping_pong():
-    return jsonify({'serverTime': time.time()})
+# --- HELPERS ---
+def get_lyrics(term):
+    """Finds lyrics using syncedlyrics"""
+    try:
+        # Search for LRC (Synced) first, fallback to plain text
+        lrc = syncedlyrics.search(term)
+        return lrc if lrc else None
+    except Exception as e:
+        print(f"Lyrics Error: {e}")
+        return None
 
-@app.route('/generate', methods=['POST'])
-def generate_route():
-    while True:
-        room_code = ''.join(random.choices(string.ascii_uppercase + string.digits, k=6))
-        if not r.exists(f"room:{room_code}"): break
-
-    # THIS IS THE CRITICAL FIX: The placeholder now has the same "shape" as a real song object.
-    placeholder_playlist = [{'name': "Your Playlist is Empty", 'artist': "Upload a track to begin!", 'isUpload': False, 'audioUrl': None, 'albumArt': None}]
-    room_data = {
-        'playlist': placeholder_playlist, 
-        'title': "Shared Sonic Space", 
-        'users': {}, 
-        'admin_sid': None, 
-        'current_state': {'isPlaying': False, 'trackIndex': 0, 'currentTime': 0, 'volume': 80, 'equalizer': {'bass': 0, 'mids': 0, 'treble': 0}, 'isCollaborative': True, 'serverTimestamp': time.time()}
-    }
-    safe_set(f"room:{room_code}", json.dumps(room_data), ex=86400)
-    return jsonify({'room_code': room_code})
-
-@app.route('/api/room/<string:room_code>')
-def get_room_data(room_code):
-    room_data_json = safe_get(f"room:{room_code.upper()}")
-    if not room_data_json: return jsonify({'error': 'Room not found'}), 404
-    return jsonify(json.loads(room_data_json))
+# --- ROUTES ---
+@app.route('/ping')
+def ping(): return jsonify({'time': time.time()})
 
 @app.route('/uploads/<path:filename>')
-def serve_uploaded_file(filename):
-    return send_from_directory(os.path.abspath(UPLOAD_FOLDER), secure_filename(filename))
+def serve_file(filename):
+    return send_from_directory(os.path.abspath(UPLOAD_FOLDER), filename)
 
-@app.route('/api/upload-local', methods=['POST'])
-def upload_file_local():
-    if 'file' not in request.files or not allowed_file(request.files['file'].filename): return jsonify({'error': 'Invalid file'}), 400
+@app.route('/generate', methods=['POST'])
+def generate():
+    while True:
+        code = ''.join(random.choices(string.ascii_uppercase + string.digits, k=6))
+        if not r.exists(f"room:{code}"): break
+    
+    room_data = {
+        'playlist': [],
+        'title': "Sonic Space",
+        'users': {},
+        'admin_sid': None,
+        'current_state': {'isPlaying': False, 'trackIndex': 0, 'currentTime': 0, 'volume': 80, 'equalizer': {'bass': 0, 'mids': 0, 'treble': 0}}
+    }
+    safe_set(f"room:{code}", json.dumps(room_data))
+    return jsonify({'room_code': code})
+
+@app.route('/api/room/<code_in>')
+def get_room(code_in):
+    data = safe_get(f"room:{code_in.upper()}")
+    return jsonify(json.loads(data) if data else {'error': 'Not found'})
+
+# --- 1. LOCAL UPLOAD ---
+@app.route('/api/upload', methods=['POST'])
+def upload_file():
+    if 'file' not in request.files: return jsonify({'error': 'No file'}), 400
     file = request.files['file']
-    filename = f"{os.urandom(8).hex()}_{secure_filename(file.filename)}"
-    try:
-        file.save(os.path.join(UPLOAD_FOLDER, filename))
-        audio_url = url_for('serve_uploaded_file', filename=filename, _external=True, _scheme=request.scheme)
-        return jsonify({'audioUrl': audio_url}), 200
-    except Exception as e:
-        app.logger.error(f"Local file save error: {e}")
-        return jsonify({'error': 'Failed to save file'}), 500
+    filename = secure_filename(f"{os.urandom(4).hex()}_{file.filename}")
+    path = os.path.join(UPLOAD_FOLDER, filename)
+    file.save(path)
+    
+    url = url_for('serve_file', filename=filename, _external=True, _scheme='https')
+    return jsonify({'url': url, 'filename': filename})
 
-@app.route('/api/room/<string:room_code>/add-upload', methods=['POST'])
-def add_upload_to_playlist(room_code):
-    room_key, data = f"room:{room_code.upper()}", request.get_json()
+# --- 2. YOUTUBE SEARCH ---
+@app.route('/api/search', methods=['POST'])
+def search_yt():
+    if not youtube: return jsonify({'error': 'Server missing YouTube Key'}), 500
+    q = request.json.get('query')
+    try:
+        req = youtube.search().list(q=q, part="snippet", maxResults=10, type="video")
+        res = req.execute()
+        items = [{'id': i['id']['videoId'], 'title': i['snippet']['title'], 'artist': i['snippet']['channelTitle'], 'thumb': i['snippet']['thumbnails']['default']['url']} for i in res['items']]
+        return jsonify({'results': items})
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+
+# --- 3. ADD TRACK (Universal) ---
+@app.route('/api/room/add', methods=['POST'])
+def add_track():
+    data = request.json
+    room_code = data.get('code', '').upper()
+    
+    # Is it a YouTube ID or a direct Upload?
+    video_id = data.get('videoId')
+    direct_url = data.get('audioUrl')
+    
+    final_url = direct_url
+    
+    # If YouTube, Download it
+    if video_id:
+        filename = f"{video_id}.mp3"
+        filepath = os.path.join(UPLOAD_FOLDER, filename)
+        
+        if not os.path.exists(filepath):
+            try:
+                ydl_opts = {
+                    'format': 'bestaudio/best',
+                    'outtmpl': os.path.join(UPLOAD_FOLDER, f'{video_id}.%(ext)s'),
+                    'postprocessors': [{'key': 'FFmpegExtractAudio','preferredcodec': 'mp3'}],
+                    'quiet': True
+                }
+                with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+                    ydl.download([f"https://www.youtube.com/watch?v={video_id}"])
+            except Exception as e:
+                return jsonify({'error': f"Download failed: {str(e)}"}), 500
+        
+        final_url = url_for('serve_file', filename=filename, _external=True, _scheme='https')
+
+    # Fetch Lyrics
+    lyrics = get_lyrics(f"{data.get('title')} {data.get('artist')}")
+
+    # Update Redis
+    room_key = f"room:{room_code}"
     with r.lock(f"lock:{room_key}", timeout=5):
         room_data = json.loads(safe_get(room_key) or '{}')
-        if not room_data: return jsonify({'error': 'Room not found'}), 404
-        new_track = {'name': data.get('title'), 'artist': data.get('artist'), 'isUpload': True, 'audioUrl': data.get('audioUrl'), 'albumArt': None}
-        is_first = not any(t.get('audioUrl') for t in room_data['playlist'])
-        if is_first:
-            room_data['playlist'] = [new_track]
-            room_data['current_state'].update({'trackIndex': 0, 'currentTime': 0, 'isPlaying': True})
-        else:
-            room_data['playlist'].append(new_track)
-        safe_set(room_key, json.dumps(room_data), ex=86400)
-        socketio.emit('refresh_playlist', room_data, to=room_code.upper())
-        if is_first: socketio.emit('sync_player_state', room_data['current_state'], to=room_code.upper())
-    return jsonify({'message': 'Track added'}), 200
+        if not room_data: return jsonify({'error': 'Room missing'}), 404
+        
+        new_track = {
+            'name': data.get('title'),
+            'artist': data.get('artist'),
+            'audioUrl': final_url,
+            'lyrics': lyrics, # <--- Lyrics added here
+            'albumArt': data.get('thumb')
+        }
+        
+        room_data['playlist'].append(new_track)
+        
+        # Auto-play if first
+        if len(room_data['playlist']) == 1:
+             room_data['current_state']['isPlaying'] = True
+             socketio.emit('sync_player_state', room_data['current_state'], to=room_code)
 
+        safe_set(room_key, json.dumps(room_data))
+        socketio.emit('refresh_playlist', room_data, to=room_code)
+
+    return jsonify({'success': True})
+
+# --- SOCKET ---
 @socketio.on('join_room')
-def handle_join_room(data):
-    room_code, username, sid = data['room_code'].upper(), data.get('username', 'Guest'), request.sid
-    room_key = f"room:{room_code}"
-    with r.lock(f"lock:{room_key}", timeout=5):
-        room_data_json = safe_get(room_key)
-        if not room_data_json: return emit('error', {'message': 'Room not found'})
-        room_data = json.loads(room_data_json)
-        join_room(room_code)
-        is_admin = not room_data.get('admin_sid')
-        if is_admin: room_data['admin_sid'] = sid
-        room_data['users'][sid] = {'name': username, 'isAdmin': is_admin}
-        if safe_set(room_key, json.dumps(room_data), ex=86400):
-            r.set(f"sid_to_room:{sid}", room_code, ex=86400)
-            emit('load_current_state', room_data['current_state'], to=sid)
-            emit('update_user_list', list(room_data['users'].values()), to=room_code)
+def on_join(data):
+    room = data['room_code'].upper()
+    join_room(room)
+    room_data = json.loads(safe_get(f"room:{room}") or '{}')
+    if room_data:
+        emit('refresh_playlist', room_data)
+        emit('sync_player_state', room_data['current_state'])
 
 @socketio.on('update_player_state')
-def handle_player_state_update(data):
-    room_code, sid = data['room_code'].upper(), request.sid
-    room_key = f"room:{room_code}"
-    with r.lock(f"lock:{room_key}", timeout=2):
-        room_data_json = safe_get(room_key)
-        if not room_data_json: return
-        room_data = json.loads(room_data_json)
-        if not room_data['current_state'].get('isCollaborative', False) and room_data.get('admin_sid') != sid: return
-        room_data['current_state'].update(data['state'])
-        if safe_set(room_key, json.dumps(room_data), ex=86400):
-            emit('sync_player_state', room_data['current_state'], to=room_code, include_self=False)
-
-@socketio.on('disconnect')
-def handle_disconnect():
-    sid = request.sid
-    room_code = safe_get(f"sid_to_room:{sid}")
-    if not room_code: return
-    room_key = f"room:{room_code}"
-    safe_delete(f"sid_to_room:{sid}")
-    with r.lock(f"lock:{room_key}", timeout=5):
-        room_data_json = safe_get(room_key)
-        if not room_data_json: return
-        room_data = json.loads(room_data_json)
-        if sid in room_data.get('users', {}):
-            del room_data['users'][sid]
-            if not room_data['users']: return safe_delete(room_key)
-            if room_data.get('admin_sid') == sid:
-                new_admin_sid = next(iter(room_data['users']))
-                room_data['admin_sid'] = new_admin_sid
-                room_data['users'][new_admin_sid]['isAdmin'] = True
-            safe_set(room_key, json.dumps(room_data), ex=86400)
-            emit('update_user_list', list(room_data['users'].values()), to=room_code)
+def on_state(data):
+    room = data['room_code'].upper()
+    state = data['state']
+    # Quick Update
+    r_key = f"room:{room}"
+    rd = json.loads(safe_get(r_key) or '{}')
+    if rd:
+        rd['current_state'].update(state)
+        safe_set(r_key, json.dumps(rd))
+        emit('sync_player_state', state, to=room, include_self=False)
 
 if __name__ == '__main__':
-    logging.basicConfig(level=logging.INFO, format='%(asctime)s %(levelname)s:%(message)s')
-    socketio.run(app, debug=True, host='0.0.0.0', port=5001)
+    socketio.run(app, host='0.0.0.0', port=5001)
