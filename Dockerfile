@@ -1,28 +1,22 @@
-# Use a slim Python image
 FROM python:3.11-slim
 
-# Install system dependencies: FFmpeg (for audio) and Git (for some pip packages)
+# Install FFmpeg (Crucial for Audio) and Git
 RUN apt-get update && \
-    apt-get install -y ffmpeg git curl && \
-    apt-get clean && \
-    rm -rf /var/lib/apt/lists/*
+    apt-get install -y ffmpeg git && \
+    apt-get clean
 
-# Verify FFmpeg installation
-RUN ffmpeg -version
-
-# Set working directory
 WORKDIR /app
 
-# Install Python dependencies
+# Install dependencies
 COPY requirements.txt .
-RUN pip install --no-cache-dir -r requirements.txt && \
-    pip install --upgrade yt-dlp
+RUN pip install --no-cache-dir -r requirements.txt
 
-# Copy application code
+# Copy app code
 COPY . .
 
-# Create uploads directory with proper permissions
-RUN mkdir -p uploads && chmod 755 uploads
+# Expose port
+EXPOSE 5001
 
-# Run the app using Gunicorn with Gevent (Required for Socket.IO)
-CMD ["gunicorn", "-k", "gevent", "-w", "1", "-b", "0.0.0.0:5001", "--timeout", "300", "app:app"]
+# --- THE FIX IS HERE ---
+# Changed "-k gevent" to "-k geventwebsocket.gunicorn.workers.GeventWebSocketWorker"
+CMD ["gunicorn", "-k", "geventwebsocket.gunicorn.workers.GeventWebSocketWorker", "-w", "1", "-b", "0.0.0.0:5001", "app:app"]
