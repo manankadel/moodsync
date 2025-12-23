@@ -1,4 +1,4 @@
-import os, random, string, logging, time, json, re
+import os, random, string, logging, time, json
 from flask import Flask, jsonify, request, send_from_directory, url_for
 from flask_socketio import SocketIO, join_room, emit
 from flask_cors import CORS
@@ -6,61 +6,65 @@ from dotenv import load_dotenv
 import redis
 import yt_dlp
 import syncedlyrics
-from googleapiclient.discovery import build
 from werkzeug.utils import secure_filename
 from werkzeug.middleware.proxy_fix import ProxyFix
 
 load_dotenv()
-
-# --- SETUP ---
 app = Flask(__name__)
+# Fix for HTTPS on Render
 app.wsgi_app = ProxyFix(app.wsgi_app, x_for=1, x_proto=1, x_host=1, x_prefix=1)
-CORS(app, origins="*")
+
+# --- CONFIGURATION ---
+CORS(app, origins="*", supports_credentials=True)
 socketio = SocketIO(app, cors_allowed_origins="*", async_mode='gevent')
 
-# --- CONFIG ---
 UPLOAD_FOLDER = 'uploads'
 os.makedirs(UPLOAD_FOLDER, exist_ok=True)
-YOUTUBE_API_KEY = os.getenv('YOUTUBE_API_KEY')
-youtube = build('youtube', 'v3', developerKey=YOUTUBE_API_KEY) if YOUTUBE_API_KEY else None
 
-# --- REDIS ---
-redis_url = os.getenv('REDIS_URL', 'redis://localhost:6379')
-r = redis.from_url(redis_url, decode_responses=True)
+# --- REDIS CONNECTION ---
+try:
+    redis_url = os.getenv('REDIS_URL', 'redis://localhost:6379')
+    r = redis.from_url(redis_url, decode_responses=True)
+    r.ping()
+    print("✅ Redis Connected")
+except Exception as e:
+    print(f"❌ Redis Connection Failed: {e}")
 
 def safe_get(key): return r.get(key)
-def safe_set(key, val, ex=86400): r.set(key, val, ex=ex)
+def safe_set(key, value, ex=86400): r.set(key, value, ex=ex)
 
-# --- HELPERS ---
-def get_lyrics(term):
-    """Finds lyrics using syncedlyrics"""
+# --- HELPER: Get Lyrics ---
+def fetch_lyrics(title, artist):
     try:
-        # Search for LRC (Synced) first, fallback to plain text
-        lrc = syncedlyrics.search(term)
-        return lrc if lrc else None
+        # Search for synced lyrics (LRC format)
+        term = f"{title} {artist}"
+        print(f"🔍 Searching lyrics for: {term}")
+        lrc_content = syncedlyrics.search(term)
+        return lrc_content if lrc_content else None
     except Exception as e:
-        print(f"Lyrics Error: {e}")
+        print(f"⚠️ Lyrics fetch failed: {e}")
         return None
 
 # --- ROUTES ---
+
 @app.route('/ping')
-def ping(): return jsonify({'time': time.time()})
+def ping(): return jsonify({'status': 'ok', 'time': time.time()})
 
 @app.route('/uploads/<path:filename>')
 def serve_file(filename):
     return send_from_directory(os.path.abspath(UPLOAD_FOLDER), filename)
 
 @app.route('/generate', methods=['POST'])
-def generate():
+def generate_room():
     while True:
         code = ''.join(random.choices(string.ascii_uppercase + string.digits, k=6))
         if not r.exists(f"room:{code}"): break
     
     room_data = {
-        'playlist': [],
-        'title': "Sonic Space",
-        'users': {},
-        'admin_sid': None,
+        'playlist': [], 
+        'title': "Shared Sonic Space", 
+        'users': {}, 
+        'admin_sid': None, 
         'current_state': {'isPlaying': False, 'trackIndex': 0, 'currentTime': 0, 'volume': 80, 'equalizer': {'bass': 0, 'mids': 0, 'treble': 0}}
     }
     safe_set(f"room:{code}", json.dumps(room_data))
@@ -69,115 +73,112 @@ def generate():
 @app.route('/api/room/<code_in>')
 def get_room(code_in):
     data = safe_get(f"room:{code_in.upper()}")
-    return jsonify(json.loads(data) if data else {'error': 'Not found'})
+    return jsonify(json.loads(data) if data else {'error': 'Room not found'})
 
-# --- 1. LOCAL UPLOAD ---
-@app.route('/api/upload', methods=['POST'])
-def upload_file():
-    if 'file' not in request.files: return jsonify({'error': 'No file'}), 400
-    file = request.files['file']
-    filename = secure_filename(f"{os.urandom(4).hex()}_{file.filename}")
-    path = os.path.join(UPLOAD_FOLDER, filename)
-    file.save(path)
-    
-    url = url_for('serve_file', filename=filename, _external=True, _scheme='https')
-    return jsonify({'url': url, 'filename': filename})
-
-# --- 2. YOUTUBE SEARCH ---
-@app.route('/api/search', methods=['POST'])
+# 1. Search YouTube (No API Key needed, uses yt-dlp scraping)
+@app.route('/api/yt-search', methods=['POST'])
 def search_yt():
-    if not youtube: return jsonify({'error': 'Server missing YouTube Key'}), 500
-    q = request.json.get('query')
+    query = request.json.get('query')
+    if not query: return jsonify({'error': 'No query'}), 400
     try:
-        req = youtube.search().list(q=q, part="snippet", maxResults=10, type="video")
-        res = req.execute()
-        items = [{'id': i['id']['videoId'], 'title': i['snippet']['title'], 'artist': i['snippet']['channelTitle'], 'thumb': i['snippet']['thumbnails']['default']['url']} for i in res['items']]
-        return jsonify({'results': items})
+        ydl_opts = {'format': 'bestaudio', 'noplaylist': True, 'quiet': True, 'default_search': 'ytsearch5'}
+        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+            info = ydl.extract_info(query, download=False)
+            results = [{
+                'id': e['id'], 
+                'title': e['title'], 
+                'artist': e.get('uploader', 'Unknown'),
+                'thumbnail': e.get('thumbnail')
+            } for e in info['entries']]
+            return jsonify({'results': results})
     except Exception as e:
         return jsonify({'error': str(e)}), 500
 
-# --- 3. ADD TRACK (Universal) ---
-@app.route('/api/room/add', methods=['POST'])
-def add_track():
+# 2. Add Track (Downloads Audio + Fetches Lyrics)
+@app.route('/api/room/<room_code>/add-yt', methods=['POST'])
+def add_yt_track(room_code):
     data = request.json
-    room_code = data.get('code', '').upper()
+    video_id = data.get('id')
+    title = data.get('title')
+    artist = data.get('artist')
     
-    # Is it a YouTube ID or a direct Upload?
-    video_id = data.get('videoId')
-    direct_url = data.get('audioUrl')
-    
-    final_url = direct_url
-    
-    # If YouTube, Download it
-    if video_id:
-        filename = f"{video_id}.mp3"
-        filepath = os.path.join(UPLOAD_FOLDER, filename)
-        
-        if not os.path.exists(filepath):
-            try:
-                ydl_opts = {
-                    'format': 'bestaudio/best',
-                    'outtmpl': os.path.join(UPLOAD_FOLDER, f'{video_id}.%(ext)s'),
-                    'postprocessors': [{'key': 'FFmpegExtractAudio','preferredcodec': 'mp3'}],
-                    'quiet': True
-                }
-                with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-                    ydl.download([f"https://www.youtube.com/watch?v={video_id}"])
-            except Exception as e:
-                return jsonify({'error': f"Download failed: {str(e)}"}), 500
-        
-        final_url = url_for('serve_file', filename=filename, _external=True, _scheme='https')
+    filename = f"{video_id}.mp3"
+    filepath = os.path.join(UPLOAD_FOLDER, filename)
+    audio_url = url_for('serve_file', filename=filename, _external=True, _scheme='https')
+
+    # Download if missing
+    if not os.path.exists(filepath):
+        try:
+            ydl_opts = {
+                'format': 'bestaudio/best',
+                'outtmpl': os.path.join(UPLOAD_FOLDER, f'{video_id}.%(ext)s'),
+                'postprocessors': [{'key': 'FFmpegExtractAudio', 'preferredcodec': 'mp3'}],
+                'quiet': True
+            }
+            with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+                ydl.download([f"https://www.youtube.com/watch?v={video_id}"])
+        except Exception as e:
+            return jsonify({'error': 'Download failed'}), 500
 
     # Fetch Lyrics
-    lyrics = get_lyrics(f"{data.get('title')} {data.get('artist')}")
+    lyrics = fetch_lyrics(title, artist)
 
-    # Update Redis
-    room_key = f"room:{room_code}"
+    # Update Room
+    room_key = f"room:{room_code.upper()}"
     with r.lock(f"lock:{room_key}", timeout=5):
         room_data = json.loads(safe_get(room_key) or '{}')
-        if not room_data: return jsonify({'error': 'Room missing'}), 404
+        if not room_data: return jsonify({'error': 'Room not found'}), 404
         
         new_track = {
-            'name': data.get('title'),
-            'artist': data.get('artist'),
-            'audioUrl': final_url,
-            'lyrics': lyrics, # <--- Lyrics added here
-            'albumArt': data.get('thumb')
+            'name': title, 
+            'artist': artist, 
+            'audioUrl': audio_url, 
+            'albumArt': data.get('thumbnail'),
+            'lyrics': lyrics  # <--- Lyrics saved here
         }
         
         room_data['playlist'].append(new_track)
         
-        # Auto-play if first
+        # Auto-play if first song
         if len(room_data['playlist']) == 1:
-             room_data['current_state']['isPlaying'] = True
-             socketio.emit('sync_player_state', room_data['current_state'], to=room_code)
+            room_data['current_state'].update({'trackIndex': 0, 'isPlaying': True})
+            socketio.emit('sync_player_state', room_data['current_state'], to=room_code.upper())
 
         safe_set(room_key, json.dumps(room_data))
-        socketio.emit('refresh_playlist', room_data, to=room_code)
+        socketio.emit('refresh_playlist', room_data, to=room_code.upper())
 
-    return jsonify({'success': True})
+    return jsonify({'success': True}), 200
 
-# --- SOCKET ---
+# --- SOCKET HANDLERS ---
 @socketio.on('join_room')
-def on_join(data):
-    room = data['room_code'].upper()
+def handle_join(data):
+    room, user, sid = data['room_code'].upper(), data.get('username', 'Guest'), request.sid
     join_room(room)
-    room_data = json.loads(safe_get(f"room:{room}") or '{}')
-    if room_data:
-        emit('refresh_playlist', room_data)
-        emit('sync_player_state', room_data['current_state'])
+    room_key = f"room:{room}"
+    
+    room_data = json.loads(safe_get(room_key) or '{}')
+    if not room_data: return
+    
+    is_admin = not room_data.get('admin_sid')
+    if is_admin: room_data['admin_sid'] = sid
+    room_data['users'][sid] = {'name': user, 'isAdmin': is_admin}
+    
+    safe_set(room_key, json.dumps(room_data))
+    
+    emit('load_current_state', room_data['current_state'])
+    emit('update_user_list', list(room_data['users'].values()), to=room)
 
 @socketio.on('update_player_state')
-def on_state(data):
+def handle_state(data):
     room = data['room_code'].upper()
     state = data['state']
-    # Quick Update
-    r_key = f"room:{room}"
-    rd = json.loads(safe_get(r_key) or '{}')
+    
+    # Update Redis
+    rd = json.loads(safe_get(f"room:{room}") or '{}')
     if rd:
         rd['current_state'].update(state)
-        safe_set(r_key, json.dumps(rd))
+        safe_set(f"room:{room}", json.dumps(rd))
         emit('sync_player_state', state, to=room, include_self=False)
 
 if __name__ == '__main__':
-    socketio.run(app, host='0.0.0.0', port=5001)
+    socketio.run(app, debug=True, host='0.0.0.0', port=5001)
