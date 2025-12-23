@@ -4,12 +4,19 @@ import { io, Socket } from 'socket.io-client';
 const API_URL = process.env.NEXT_PUBLIC_API_URL || 'http://localhost:5001';
 
 // --- INTERFACES ---
-interface Song { name: string; artist: string; isUpload: boolean; audioUrl: string | null; albumArt: string | null; }
+// --- INTERFACES ---
+export interface Song { 
+    name: string; 
+    artist: string; 
+    isUpload: boolean; 
+    audioUrl: string | null; 
+    albumArt: string | null; 
+    lyrics?: string | null; // <--- NEW: Added Lyrics support
+}
 interface User { name: string; isAdmin: boolean; }
 interface EqualizerSettings { bass: number; mids: number; treble: number; }
 interface AudioNodes { context: AudioContext | null; source: MediaElementAudioSourceNode | null; bass: BiquadFilterNode | null; mids: BiquadFilterNode | null; treble: BiquadFilterNode | null; }
 interface SyncState { isPlaying?: boolean; trackIndex?: number; volume?: number; equalizer?: EqualizerSettings; currentTime?: number; serverTimestamp?: number; }
-
 declare global { 
     interface Window { webkitAudioContext: any; } 
     // Removed conflicting Navigator definition. TypeScript lib.dom knows mediaSession exists.
