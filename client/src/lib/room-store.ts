@@ -78,8 +78,9 @@ export const useRoomStore = create<RoomState>()((set, get) => ({
     // This prevents the app from getting stuck if the socket is slow.
     set({ username: name, roomCode: code });
     
-    const socket = io(API_URL, { 
-        transports: ['websocket'],
+   const socket = io(API_URL, { 
+        // CHANGE THIS LINE: Allow polling fallback
+        transports: ['polling', 'websocket'], 
         reconnection: true,
         reconnectionAttempts: Infinity,
         timeout: 10000,
