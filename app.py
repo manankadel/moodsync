@@ -1,11 +1,10 @@
-import os, random, string, logging, time, json
+import os, random, string, logging, time, json, subprocess
 from flask import Flask, jsonify, request, send_from_directory, url_for
 from flask_socketio import SocketIO, join_room, emit
 from flask_cors import CORS
 from dotenv import load_dotenv
 import redis
-import yt_dlp
-import syncedlyrics
+import requests
 from googleapiclient.discovery import build
 from werkzeug.utils import secure_filename
 from werkzeug.middleware.proxy_fix import ProxyFix
@@ -51,9 +50,42 @@ def safe_set(key, value, ex=86400):
 
 def fetch_lyrics(title, artist):
     try:
+        import syncedlyrics
         return syncedlyrics.search(f"{title} {artist}") or None
     except:
         return None
+
+def download_youtube_audio(video_id, output_path):
+    """Download YouTube audio using yt-dlp subprocess"""
+    try:
+        logger.info(f"📥 Starting download: {video_id}")
+        
+        cmd = [
+            'yt-dlp',
+            '--quiet',
+            '--no-warnings',
+            '-f', 'bestaudio/best',
+            '-x',
+            '--audio-format', 'mp3',
+            '--audio-quality', '192',
+            '-o', output_path,
+            f'https://www.youtube.com/watch?v={video_id}',
+        ]
+        
+        result = subprocess.run(cmd, capture_output=True, text=True, timeout=120)
+        
+        if result.returncode == 0:
+            logger.info(f"✅ Download successful: {video_id}")
+            return True
+        else:
+            logger.error(f"❌ yt-dlp failed: {result.stderr}")
+            return False
+    except subprocess.TimeoutExpired:
+        logger.error(f"⏱️ Download timeout for {video_id}")
+        return False
+    except Exception as e:
+        logger.error(f"❌ Download error: {str(e)}")
+        return False
 
 # --- ROUTES ---
 
@@ -93,33 +125,55 @@ def search_yt():
     if not query: 
         return jsonify({'error': 'No query'}), 400
     
-    # Try API first (Most Reliable)
+    logger.info(f"🔍 Searching: {query}")
+    
+    # Try YouTube API first
     if youtube_client:
         try:
+            logger.info("Trying YouTube API...")
             req = youtube_client.search().list(q=query, part="snippet", maxResults=10, type="video")
             res = req.execute()
-            return jsonify({'results': [{
+            results = [{
                 'id': i['id']['videoId'],
                 'title': i['snippet']['title'],
                 'artist': i['snippet']['channelTitle'],
                 'thumbnail': i['snippet']['thumbnails']['high']['url']
-            } for i in res['items']]})
+            } for i in res['items']]
+            logger.info(f"✅ API search found {len(results)} results")
+            return jsonify({'results': results})
         except Exception as e:
-            logger.error(f"API Search Failed: {e}")
+            logger.error(f"⚠️ API Search failed: {e}")
     
-    # Fallback to Scraping
+    # Fallback: Use invidious (free YouTube proxy)
     try:
-        ydl_opts = {'format': 'bestaudio', 'noplaylist': True, 'quiet': True, 'default_search': 'ytsearch5'}
-        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-            info = ydl.extract_info(query, download=False)
-            return jsonify({'results': [{
-                'id': e['id'], 
-                'title': e['title'], 
-                'artist': e.get('uploader', 'Unknown'),
-                'thumbnail': e.get('thumbnail')
-            } for e in info['entries']]})
+        logger.info("Trying Invidious proxy...")
+        invidious_url = "https://invidious.jing.rocks/api/v1/search"
+        params = {
+            'q': query,
+            'type': 'video',
+            'page': 1
+        }
+        
+        response = requests.get(invidious_url, params=params, timeout=10)
+        response.raise_for_status()
+        data = response.json()
+        
+        results = []
+        for item in data.get('items', [])[:10]:
+            if item.get('type') == 'video':
+                results.append({
+                    'id': item.get('videoId'),
+                    'title': item.get('title', 'Unknown'),
+                    'artist': item.get('author', 'Unknown'),
+                    'thumbnail': f"https://invidious.jing.rocks/vi/{item.get('videoId')}/maxresdefault.jpg"
+                })
+        
+        logger.info(f"✅ Invidious found {len(results)} results")
+        return jsonify({'results': results})
+    
     except Exception as e:
-        return jsonify({'error': str(e)}), 500
+        logger.error(f"❌ Invidious search failed: {e}")
+        return jsonify({'error': f'Search failed: {str(e)}'}), 500
 
 @app.route('/api/room/<room_code>/add-yt', methods=['POST'])
 def add_yt_track(room_code):
@@ -133,49 +187,27 @@ def add_yt_track(room_code):
         
         filename = f"{video_id}.mp3"
         filepath = os.path.join(UPLOAD_FOLDER, filename)
+        
+        # Download if not exists
+        if not os.path.exists(filepath):
+            logger.info(f"📥 File not found, downloading: {video_id}")
+            
+            success = download_youtube_audio(video_id, filepath)
+            
+            if not success or not os.path.exists(filepath):
+                logger.error(f"❌ Download failed or file not created: {filepath}")
+                return jsonify({'error': 'Failed to download video. Try another song.'}), 500
+        else:
+            logger.info(f"✅ File already exists: {filepath}")
+        
+        # Generate serving URL
         audio_url = url_for('serve_file', filename=filename, _external=True, _scheme='https')
-
-        if not os.path.exists(filepath):
-            logger.info(f"📥 Downloading: {video_id}")
-            try:
-                ydl_opts = {
-                    'format': 'bestaudio/best',
-                    'outtmpl': os.path.join(UPLOAD_FOLDER, f'{video_id}.%(ext)s'),
-                    'postprocessors': [{'key': 'FFmpegExtractAudio', 'preferredcodec': 'mp3', 'preferredquality': '192'}],
-                    'quiet': False,
-                    'no_warnings': False,
-                    'nocheckcertificate': True,
-                    'socket_timeout': 30,
-                    'extractor_args': {'youtube': {'player_client': ['web']}},
-                    'http_headers': {
-                        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
-                        'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
-                        'Accept-Language': 'en-us,en;q=0.5',
-                        'Accept-Encoding': 'gzip, deflate',
-                        'DNT': '1',
-                        'Connection': 'keep-alive',
-                        'Upgrade-Insecure-Requests': '1'
-                    }
-                }
-                
-                with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-                    logger.info(f"⏳ Starting download for {video_id}...")
-                    info = ydl.extract_info(f"https://www.youtube.com/watch?v={video_id}", download=True)
-                    logger.info(f"✅ Download complete for {video_id}")
-                    
-            except Exception as e:
-                logger.error(f"❌ Download failed for {video_id}: {str(e)}", exc_info=True)
-                return jsonify({'error': f'Failed to download video: {str(e)}'}), 500
-
-        # Check if file was created
-        if not os.path.exists(filepath):
-            logger.error(f"File not found after download: {filepath}")
-            return jsonify({'error': 'Download completed but file not found'}), 500
-
-        # Fetch Lyrics
+        logger.info(f"📡 Audio URL: {audio_url}")
+        
+        # Fetch lyrics
         lyrics = fetch_lyrics(title, artist)
 
-        # Update Room
+        # Update room
         room_key = f"room:{room_code.upper()}"
         with r.lock(f"lock:{room_key}", timeout=5):
             room_data = json.loads(safe_get(room_key) or '{}')
