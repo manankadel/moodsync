@@ -72,20 +72,22 @@ export const useRoomStore = create<RoomState>()((set, get) => ({
 
   connect: (code, name) => {
     if (get().socket) return;
-    set({ username: name, roomCode: code, isLoading: true });
     
-    // Configured for connection stability
+    // CHANGE: Do NOT set isLoading: true here. 
+    // We let the HTTP fetch in page.tsx handle the loading state.
+    // This prevents the app from getting stuck if the socket is slow.
+    set({ username: name, roomCode: code });
+    
     const socket = io(API_URL, { 
         transports: ['websocket'],
         reconnection: true,
         reconnectionAttempts: Infinity,
         timeout: 10000,
-        // Removed pingInterval/pingTimeout (Server controlled)
     });
     set({ socket });
 
     socket.on('connect', () => {
-        console.log("✅ Socket connected. Emitting join_room.");
+        console.log("✅ Socket connected");
         socket.emit('join_room', { room_code: code, username: name });
         set({ isDisconnected: false });
     });
@@ -98,7 +100,11 @@ export const useRoomStore = create<RoomState>()((set, get) => ({
         get().updateMediaSession();
     });
     socket.on('disconnect', () => set({ isDisconnected: true }));
-    socket.on('connect_error', () => get().setError("Connection failed. Server might be busy."));
+    socket.on('connect_error', (err) => {
+        console.warn("Socket connection warning:", err);
+        // We do NOT set an error state here, because the HTTP fallback 
+        // allows the user to still see the playlist/lyrics while reconnecting.
+    });
   },
 
   disconnect: () => {

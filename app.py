@@ -14,8 +14,8 @@ app = Flask(__name__)
 # Fix for HTTPS on Render
 app.wsgi_app = ProxyFix(app.wsgi_app, x_for=1, x_proto=1, x_host=1, x_prefix=1)
 
-# --- CONFIGURATION ---
-CORS(app, origins="*", supports_credentials=True)
+# Allow credentials and ALL origins explicitly
+CORS(app, resources={r"/*": {"origins": "*"}}, supports_credentials=True)
 socketio = SocketIO(app, cors_allowed_origins="*", async_mode='gevent')
 
 UPLOAD_FOLDER = 'uploads'
