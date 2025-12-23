@@ -19,16 +19,13 @@ app = Flask(__name__)
 app.wsgi_app = ProxyFix(app.wsgi_app, x_for=1, x_proto=1, x_host=1, x_prefix=1)
 
 # --- CONFIGURATION ---
-# Allow all origins to prevent CORS issues
 CORS(app, resources={r"/*": {"origins": "*"}}, supports_credentials=True)
-# Allow Polling + WebSocket to fix connection issues
 socketio = SocketIO(app, cors_allowed_origins="*", async_mode='gevent')
 
 UPLOAD_FOLDER = 'uploads'
 os.makedirs(UPLOAD_FOLDER, exist_ok=True)
 
 # --- CONNECTIONS ---
-# 1. Redis
 try:
     redis_url = os.getenv('REDIS_URL', 'redis://localhost:6379')
     r = redis.from_url(redis_url, decode_responses=True)
@@ -37,7 +34,6 @@ try:
 except Exception as e:
     logger.error(f"❌ Redis Connection Failed: {e}")
 
-# 2. YouTube API (For Search)
 YOUTUBE_API_KEY = os.getenv('YOUTUBE_API_KEY')
 youtube_client = None
 if YOUTUBE_API_KEY:
@@ -46,25 +42,20 @@ if YOUTUBE_API_KEY:
         logger.info("✅ YouTube API Client Ready")
     except Exception as e:
         logger.error(f"⚠️ YouTube API Error: {e}")
-else:
-    logger.warning("⚠️ No YOUTUBE_API_KEY found. Search might fail.")
 
 def safe_get(key): return r.get(key)
 def safe_set(key, value, ex=86400): r.set(key, value, ex=ex)
 
-# --- HELPER: Get Lyrics ---
 def fetch_lyrics(title, artist):
     try:
-        term = f"{title} {artist}"
-        return syncedlyrics.search(term) or None
-    except Exception as e:
-        logger.error(f"Lyrics fetch failed: {e}")
+        return syncedlyrics.search(f"{title} {artist}") or None
+    except:
         return None
 
 # --- ROUTES ---
 
 @app.route('/ping')
-def ping(): return jsonify({'status': 'ok', 'time': time.time()})
+def ping(): return jsonify({'status': 'ok'})
 
 @app.route('/uploads/<path:filename>')
 def serve_file(filename):
@@ -81,7 +72,7 @@ def generate_room():
         'title': "Shared Sonic Space", 
         'users': {}, 
         'admin_sid': None, 
-        'current_state': {'isPlaying': False, 'trackIndex': 0, 'currentTime': 0, 'volume': 80, 'equalizer': {'bass': 0, 'mids': 0, 'treble': 0}}
+        'current_state': {'isPlaying': False, 'trackIndex': 0, 'currentTime': 0, 'volume': 80}
     }
     safe_set(f"room:{code}", json.dumps(room_data))
     return jsonify({'room_code': code})
@@ -91,47 +82,39 @@ def get_room(code_in):
     data = safe_get(f"room:{code_in.upper()}")
     return jsonify(json.loads(data) if data else {'error': 'Room not found'})
 
-# --- SEARCH: Use Official API (Reliable) ---
 @app.route('/api/yt-search', methods=['POST'])
 def search_yt():
     query = request.json.get('query')
     if not query: return jsonify({'error': 'No query'}), 400
     
-    # Method A: Official API (Preferred)
+    # Try API first (Most Reliable)
     if youtube_client:
         try:
             req = youtube_client.search().list(q=query, part="snippet", maxResults=10, type="video")
             res = req.execute()
-            results = []
-            for item in res['items']:
-                results.append({
-                    'id': item['id']['videoId'],
-                    'title': item['snippet']['title'],
-                    'artist': item['snippet']['channelTitle'],
-                    'thumbnail': item['snippet']['thumbnails']['high']['url']
-                })
-            return jsonify({'results': results})
+            return jsonify({'results': [{
+                'id': i['id']['videoId'],
+                'title': i['snippet']['title'],
+                'artist': i['snippet']['channelTitle'],
+                'thumbnail': i['snippet']['thumbnails']['high']['url']
+            } for i in res['items']]})
         except Exception as e:
-            logger.error(f"YouTube API Failed: {e}")
-            # Fallback to Method B below if API fails
+            logger.error(f"API Search Failed: {e}")
     
-    # Method B: yt-dlp Scraping (Fallback)
+    # Fallback to Scraping
     try:
         ydl_opts = {'format': 'bestaudio', 'noplaylist': True, 'quiet': True, 'default_search': 'ytsearch5'}
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
             info = ydl.extract_info(query, download=False)
-            results = [{
+            return jsonify({'results': [{
                 'id': e['id'], 
                 'title': e['title'], 
                 'artist': e.get('uploader', 'Unknown'),
                 'thumbnail': e.get('thumbnail')
-            } for e in info['entries']]
-            return jsonify({'results': results})
+            } for e in info['entries']]})
     except Exception as e:
-        logger.error(f"Scraping Failed: {e}")
         return jsonify({'error': str(e)}), 500
 
-# --- ADD TRACK: Use yt-dlp (Robust for Download) ---
 @app.route('/api/room/<room_code>/add-yt', methods=['POST'])
 def add_yt_track(room_code):
     data = request.json
@@ -143,22 +126,30 @@ def add_yt_track(room_code):
     filepath = os.path.join(UPLOAD_FOLDER, filename)
     audio_url = url_for('serve_file', filename=filename, _external=True, _scheme='https')
 
-    # Download if missing
     if not os.path.exists(filepath):
         try:
+            # ANTI-BLOCK CONFIGURATION
             ydl_opts = {
                 'format': 'bestaudio/best',
                 'outtmpl': os.path.join(UPLOAD_FOLDER, f'{video_id}.%(ext)s'),
-                'postprocessors': [{'key': 'FFmpegExtractAudio', 'preferredcodec': 'mp3', 'preferredquality': '192'}],
+                'postprocessors': [{'key': 'FFmpegExtractAudio', 'preferredcodec': 'mp3'}],
                 'quiet': True,
-                # Fix for 403 Forbidden:
                 'nocheckcertificate': True,
+                # Force IPv4 to avoid IPv6 blocks
+                'source_address': '0.0.0.0', 
+                # Pretend to be a real browser
+                'http_headers': {
+                    'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36',
+                    'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
+                    'Accept-Language': 'en-us,en;q=0.5',
+                    'Sec-Fetch-Mode': 'navigate',
+                }
             }
             with yt_dlp.YoutubeDL(ydl_opts) as ydl:
                 ydl.download([f"https://www.youtube.com/watch?v={video_id}"])
         except Exception as e:
             logger.error(f"Download Error: {e}")
-            return jsonify({'error': 'Download failed. Try another song.'}), 500
+            return jsonify({'error': 'Download blocked by YouTube. Try another song.'}), 500
 
     # Fetch Lyrics
     lyrics = fetch_lyrics(title, artist)
@@ -166,10 +157,9 @@ def add_yt_track(room_code):
     # Update Room
     room_key = f"room:{room_code.upper()}"
     with r.lock(f"lock:{room_key}", timeout=5):
-        room_data_json = safe_get(room_key)
-        if not room_data_json: return jsonify({'error': 'Room not found'}), 404
+        room_data = json.loads(safe_get(room_key) or '{}')
+        if not room_data: return jsonify({'error': 'Room not found'}), 404
         
-        room_data = json.loads(room_data_json)
         new_track = {
             'name': title, 
             'artist': artist, 
@@ -189,7 +179,7 @@ def add_yt_track(room_code):
 
     return jsonify({'success': True}), 200
 
-# --- SOCKET HANDLERS ---
+# --- SOCKET ---
 @socketio.on('join_room')
 def handle_join(data):
     room, user, sid = data['room_code'].upper(), data.get('username', 'Guest'), request.sid
@@ -214,7 +204,6 @@ def handle_state(data):
     room = data['room_code'].upper()
     state = data['state']
     
-    # Update Redis
     rd_json = safe_get(f"room:{room}")
     if rd_json:
         rd = json.loads(rd_json)
