@@ -1,4 +1,4 @@
-import os, random, string, logging, time, json
+import os, random, string, logging, time, json, traceback
 from flask import Flask, jsonify, request, send_from_directory, url_for
 from flask_socketio import SocketIO, join_room, emit
 from flask_cors import CORS
@@ -10,7 +10,7 @@ from googleapiclient.discovery import build
 from werkzeug.utils import secure_filename
 from werkzeug.middleware.proxy_fix import ProxyFix
 
-# --- LOGGING SETUP ---
+# --- LOGGING ---
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
@@ -18,7 +18,7 @@ load_dotenv()
 app = Flask(__name__)
 app.wsgi_app = ProxyFix(app.wsgi_app, x_for=1, x_proto=1, x_host=1, x_prefix=1)
 
-# --- CONFIGURATION ---
+# --- CONFIG ---
 CORS(app, resources={r"/*": {"origins": "*"}}, supports_credentials=True)
 socketio = SocketIO(app, cors_allowed_origins="*", async_mode='gevent')
 
@@ -87,7 +87,7 @@ def search_yt():
     query = request.json.get('query')
     if not query: return jsonify({'error': 'No query'}), 400
     
-    # Try API first (Most Reliable)
+    # Method 1: API
     if youtube_client:
         try:
             req = youtube_client.search().list(q=query, part="snippet", maxResults=10, type="video")
@@ -99,9 +99,9 @@ def search_yt():
                 'thumbnail': i['snippet']['thumbnails']['high']['url']
             } for i in res['items']]})
         except Exception as e:
-            logger.error(f"API Search Failed: {e}")
-    
-    # Fallback to Scraping
+            logger.error(f"API Error: {e}")
+
+    # Method 2: Fallback
     try:
         ydl_opts = {'format': 'bestaudio', 'noplaylist': True, 'quiet': True, 'default_search': 'ytsearch5'}
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
@@ -128,38 +128,37 @@ def add_yt_track(room_code):
 
     if not os.path.exists(filepath):
         try:
-            # ANTI-BLOCK CONFIGURATION
+            # === THE FIX: SPOOF ANDROID CLIENT ===
             ydl_opts = {
                 'format': 'bestaudio/best',
                 'outtmpl': os.path.join(UPLOAD_FOLDER, f'{video_id}.%(ext)s'),
-                'postprocessors': [{'key': 'FFmpegExtractAudio', 'preferredcodec': 'mp3'}],
+                'postprocessors': [{'key': 'FFmpegExtractAudio', 'preferredcodec': 'mp3', 'preferredquality': '192'}],
                 'quiet': True,
                 'nocheckcertificate': True,
-                # Force IPv4 to avoid IPv6 blocks
-                'source_address': '0.0.0.0', 
-                # Pretend to be a real browser
-                'http_headers': {
-                    'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36',
-                    'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
-                    'Accept-Language': 'en-us,en;q=0.5',
-                    'Sec-Fetch-Mode': 'navigate',
+                'no_cache_dir': True, # Disable cache to prevent stuck errors
+                # This mimics the YouTube Android App (Bypasses many web blocks)
+                'extractor_args': {
+                    'youtube': {
+                        'player_client': ['android', 'web'],
+                    }
                 }
             }
             with yt_dlp.YoutubeDL(ydl_opts) as ydl:
                 ydl.download([f"https://www.youtube.com/watch?v={video_id}"])
         except Exception as e:
-            logger.error(f"Download Error: {e}")
-            return jsonify({'error': 'Download blocked by YouTube. Try another song.'}), 500
+            error_details = traceback.format_exc()
+            logger.error(f"Download Error: {error_details}")
+            # Return the ACTUAL error so we know what is wrong
+            return jsonify({'error': f"Download failed: {str(e)}"}), 500
 
-    # Fetch Lyrics
     lyrics = fetch_lyrics(title, artist)
 
-    # Update Room
     room_key = f"room:{room_code.upper()}"
     with r.lock(f"lock:{room_key}", timeout=5):
-        room_data = json.loads(safe_get(room_key) or '{}')
-        if not room_data: return jsonify({'error': 'Room not found'}), 404
+        room_data_json = safe_get(room_key)
+        if not room_data_json: return jsonify({'error': 'Room not found'}), 404
         
+        room_data = json.loads(room_data_json)
         new_track = {
             'name': title, 
             'artist': artist, 
@@ -203,7 +202,6 @@ def handle_join(data):
 def handle_state(data):
     room = data['room_code'].upper()
     state = data['state']
-    
     rd_json = safe_get(f"room:{room}")
     if rd_json:
         rd = json.loads(rd_json)

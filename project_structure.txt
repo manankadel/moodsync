@@ -1,5 +1,6 @@
 .git/ [EXCLUDED]
 .gitignore
+Dockerfile
 app.py
 client/
   .next/ [EXCLUDED]
@@ -11,6 +12,7 @@ client/
   public/
     Blueblood Logo.png [EXCLUDED]
     favicon.ico [EXCLUDED]
+    manifest.json
   src/
     app/
       globals.css
@@ -22,6 +24,9 @@ client/
     components/
       Equalizer.tsx
       FileUploadModal.tsx
+      InstallPrompt.tsx
+      Lyrics.tsx
+      SearchModal.tsx
       cta.tsx
       features.tsx
       hero-scene.tsx

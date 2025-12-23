@@ -27,6 +27,29 @@ yarn-error.log*
 .vscode/
 .idea/
 
+### ./Dockerfile ###
+
+# Use a slim Python image
+FROM python:3.11-slim
+
+# Install system dependencies: FFmpeg (for audio) and Git (for some pip packages)
+RUN apt-get update && \
+    apt-get install -y ffmpeg git && \
+    apt-get clean
+
+# Set working directory
+WORKDIR /app
+
+# Install Python dependencies
+COPY requirements.txt .
+RUN pip install --no-cache-dir -r requirements.txt
+
+# Copy application code
+COPY . .
+
+# Run the app using Gunicorn with Gevent (Required for Socket.IO)
+CMD ["gunicorn", "-k", "gevent", "-w", "1", "-b", "0.0.0.0:5001", "app:app"]
+
 ### ./app.py ###
 
 import os, random, string, logging, time, json
@@ -35,154 +58,214 @@ from flask_socketio import SocketIO, join_room, emit
 from flask_cors import CORS
 from dotenv import load_dotenv
 import redis
+import yt_dlp
+import syncedlyrics
+from googleapiclient.discovery import build
 from werkzeug.utils import secure_filename
 from werkzeug.middleware.proxy_fix import ProxyFix
+
+# --- LOGGING SETUP ---
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
 
 load_dotenv()
 app = Flask(__name__)
 app.wsgi_app = ProxyFix(app.wsgi_app, x_for=1, x_proto=1, x_host=1, x_prefix=1)
 
 # --- CONFIGURATION ---
-CORS(app, origins=os.getenv("FRONTEND_URL", "http://localhost:3000"), supports_credentials=True)
-socketio = SocketIO(app, cors_allowed_origins=os.getenv("FRONTEND_URL", "http://localhost:3000"), async_mode='gevent')
+CORS(app, resources={r"/*": {"origins": "*"}}, supports_credentials=True)
+socketio = SocketIO(app, cors_allowed_origins="*", async_mode='gevent')
 
 UPLOAD_FOLDER = 'uploads'
 os.makedirs(UPLOAD_FOLDER, exist_ok=True)
-app.config['UPLOAD_FOLDER'] = UPLOAD_FOLDER
-app.config['MAX_CONTENT_LENGTH'] = 50 * 1024 * 1024
 
-def allowed_file(filename):
-    return '.' in filename and filename.rsplit('.', 1)[1].lower() in {'mp3', 'wav', 'ogg', 'm4a', 'flac'}
-
+# --- CONNECTIONS ---
 try:
-    redis_url = os.getenv('REDIS_URL')
-    if not redis_url: raise ValueError("REDIS_URL env var not set.")
+    redis_url = os.getenv('REDIS_URL', 'redis://localhost:6379')
     r = redis.from_url(redis_url, decode_responses=True)
     r.ping()
-    app.logger.info("Redis connection successful.")
+    logger.info("✅ Redis Connected")
 except Exception as e:
-    app.logger.error(f"FATAL: Redis connection failed: {e}"); exit(1)
+    logger.error(f"❌ Redis Connection Failed: {e}")
+
+YOUTUBE_API_KEY = os.getenv('YOUTUBE_API_KEY')
+youtube_client = None
+if YOUTUBE_API_KEY:
+    try:
+        youtube_client = build('youtube', 'v3', developerKey=YOUTUBE_API_KEY)
+        logger.info("✅ YouTube API Client Ready")
+    except Exception as e:
+        logger.error(f"⚠️ YouTube API Error: {e}")
 
 def safe_get(key): return r.get(key)
-def safe_set(key, value, ex): r.set(key, value, ex=ex)
-def safe_delete(key): r.delete(key)
+def safe_set(key, value, ex=86400): r.set(key, value, ex=ex)
 
-@app.route('/ping', methods=['GET'])
-def ping_pong():
-    return jsonify({'serverTime': time.time()})
+def fetch_lyrics(title, artist):
+    try:
+        return syncedlyrics.search(f"{title} {artist}") or None
+    except:
+        return None
+
+# --- ROUTES ---
+
+@app.route('/ping')
+def ping(): return jsonify({'status': 'ok'})
+
+@app.route('/uploads/<path:filename>')
+def serve_file(filename):
+    return send_from_directory(os.path.abspath(UPLOAD_FOLDER), filename)
 
 @app.route('/generate', methods=['POST'])
-def generate_route():
+def generate_room():
     while True:
-        room_code = ''.join(random.choices(string.ascii_uppercase + string.digits, k=6))
-        if not r.exists(f"room:{room_code}"): break
-
-    # THIS IS THE CRITICAL FIX: The placeholder now has the same "shape" as a real song object.
-    placeholder_playlist = [{'name': "Your Playlist is Empty", 'artist': "Upload a track to begin!", 'isUpload': False, 'audioUrl': None, 'albumArt': None}]
+        code = ''.join(random.choices(string.ascii_uppercase + string.digits, k=6))
+        if not r.exists(f"room:{code}"): break
+    
     room_data = {
-        'playlist': placeholder_playlist, 
+        'playlist': [], 
         'title': "Shared Sonic Space", 
         'users': {}, 
         'admin_sid': None, 
-        'current_state': {'isPlaying': False, 'trackIndex': 0, 'currentTime': 0, 'volume': 80, 'equalizer': {'bass': 0, 'mids': 0, 'treble': 0}, 'isCollaborative': True, 'serverTimestamp': time.time()}
+        'current_state': {'isPlaying': False, 'trackIndex': 0, 'currentTime': 0, 'volume': 80}
     }
-    safe_set(f"room:{room_code}", json.dumps(room_data), ex=86400)
-    return jsonify({'room_code': room_code})
+    safe_set(f"room:{code}", json.dumps(room_data))
+    return jsonify({'room_code': code})
 
-@app.route('/api/room/<string:room_code>')
-def get_room_data(room_code):
-    room_data_json = safe_get(f"room:{room_code.upper()}")
-    if not room_data_json: return jsonify({'error': 'Room not found'}), 404
-    return jsonify(json.loads(room_data_json))
+@app.route('/api/room/<code_in>')
+def get_room(code_in):
+    data = safe_get(f"room:{code_in.upper()}")
+    return jsonify(json.loads(data) if data else {'error': 'Room not found'})
 
-@app.route('/uploads/<path:filename>')
-def serve_uploaded_file(filename):
-    return send_from_directory(os.path.abspath(UPLOAD_FOLDER), secure_filename(filename))
-
-@app.route('/api/upload-local', methods=['POST'])
-def upload_file_local():
-    if 'file' not in request.files or not allowed_file(request.files['file'].filename): return jsonify({'error': 'Invalid file'}), 400
-    file = request.files['file']
-    filename = f"{os.urandom(8).hex()}_{secure_filename(file.filename)}"
+@app.route('/api/yt-search', methods=['POST'])
+def search_yt():
+    query = request.json.get('query')
+    if not query: return jsonify({'error': 'No query'}), 400
+    
+    # Try API first (Most Reliable)
+    if youtube_client:
+        try:
+            req = youtube_client.search().list(q=query, part="snippet", maxResults=10, type="video")
+            res = req.execute()
+            return jsonify({'results': [{
+                'id': i['id']['videoId'],
+                'title': i['snippet']['title'],
+                'artist': i['snippet']['channelTitle'],
+                'thumbnail': i['snippet']['thumbnails']['high']['url']
+            } for i in res['items']]})
+        except Exception as e:
+            logger.error(f"API Search Failed: {e}")
+    
+    # Fallback to Scraping
     try:
-        file.save(os.path.join(UPLOAD_FOLDER, filename))
-        audio_url = url_for('serve_uploaded_file', filename=filename, _external=True, _scheme=request.scheme)
-        return jsonify({'audioUrl': audio_url}), 200
+        ydl_opts = {'format': 'bestaudio', 'noplaylist': True, 'quiet': True, 'default_search': 'ytsearch5'}
+        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+            info = ydl.extract_info(query, download=False)
+            return jsonify({'results': [{
+                'id': e['id'], 
+                'title': e['title'], 
+                'artist': e.get('uploader', 'Unknown'),
+                'thumbnail': e.get('thumbnail')
+            } for e in info['entries']]})
     except Exception as e:
-        app.logger.error(f"Local file save error: {e}")
-        return jsonify({'error': 'Failed to save file'}), 500
+        return jsonify({'error': str(e)}), 500
 
-@app.route('/api/room/<string:room_code>/add-upload', methods=['POST'])
-def add_upload_to_playlist(room_code):
-    room_key, data = f"room:{room_code.upper()}", request.get_json()
+@app.route('/api/room/<room_code>/add-yt', methods=['POST'])
+def add_yt_track(room_code):
+    data = request.json
+    video_id = data.get('id')
+    title = data.get('title')
+    artist = data.get('artist')
+    
+    filename = f"{video_id}.mp3"
+    filepath = os.path.join(UPLOAD_FOLDER, filename)
+    audio_url = url_for('serve_file', filename=filename, _external=True, _scheme='https')
+
+    if not os.path.exists(filepath):
+        try:
+            # ANTI-BLOCK CONFIGURATION
+            ydl_opts = {
+                'format': 'bestaudio/best',
+                'outtmpl': os.path.join(UPLOAD_FOLDER, f'{video_id}.%(ext)s'),
+                'postprocessors': [{'key': 'FFmpegExtractAudio', 'preferredcodec': 'mp3'}],
+                'quiet': True,
+                'nocheckcertificate': True,
+                # Force IPv4 to avoid IPv6 blocks
+                'source_address': '0.0.0.0', 
+                # Pretend to be a real browser
+                'http_headers': {
+                    'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36',
+                    'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
+                    'Accept-Language': 'en-us,en;q=0.5',
+                    'Sec-Fetch-Mode': 'navigate',
+                }
+            }
+            with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+                ydl.download([f"https://www.youtube.com/watch?v={video_id}"])
+        except Exception as e:
+            logger.error(f"Download Error: {e}")
+            return jsonify({'error': 'Download blocked by YouTube. Try another song.'}), 500
+
+    # Fetch Lyrics
+    lyrics = fetch_lyrics(title, artist)
+
+    # Update Room
+    room_key = f"room:{room_code.upper()}"
     with r.lock(f"lock:{room_key}", timeout=5):
         room_data = json.loads(safe_get(room_key) or '{}')
         if not room_data: return jsonify({'error': 'Room not found'}), 404
-        new_track = {'name': data.get('title'), 'artist': data.get('artist'), 'isUpload': True, 'audioUrl': data.get('audioUrl'), 'albumArt': None}
-        is_first = not any(t.get('audioUrl') for t in room_data['playlist'])
-        if is_first:
-            room_data['playlist'] = [new_track]
-            room_data['current_state'].update({'trackIndex': 0, 'currentTime': 0, 'isPlaying': True})
-        else:
-            room_data['playlist'].append(new_track)
-        safe_set(room_key, json.dumps(room_data), ex=86400)
-        socketio.emit('refresh_playlist', room_data, to=room_code.upper())
-        if is_first: socketio.emit('sync_player_state', room_data['current_state'], to=room_code.upper())
-    return jsonify({'message': 'Track added'}), 200
+        
+        new_track = {
+            'name': title, 
+            'artist': artist, 
+            'audioUrl': audio_url, 
+            'albumArt': data.get('thumbnail'),
+            'lyrics': lyrics
+        }
+        
+        room_data['playlist'].append(new_track)
+        
+        if len(room_data['playlist']) == 1:
+            room_data['current_state'].update({'trackIndex': 0, 'isPlaying': True})
+            socketio.emit('sync_player_state', room_data['current_state'], to=room_code.upper())
 
+        safe_set(room_key, json.dumps(room_data))
+        socketio.emit('refresh_playlist', room_data, to=room_code.upper())
+
+    return jsonify({'success': True}), 200
+
+# --- SOCKET ---
 @socketio.on('join_room')
-def handle_join_room(data):
-    room_code, username, sid = data['room_code'].upper(), data.get('username', 'Guest'), request.sid
-    room_key = f"room:{room_code}"
-    with r.lock(f"lock:{room_key}", timeout=5):
-        room_data_json = safe_get(room_key)
-        if not room_data_json: return emit('error', {'message': 'Room not found'})
-        room_data = json.loads(room_data_json)
-        join_room(room_code)
-        is_admin = not room_data.get('admin_sid')
-        if is_admin: room_data['admin_sid'] = sid
-        room_data['users'][sid] = {'name': username, 'isAdmin': is_admin}
-        if safe_set(room_key, json.dumps(room_data), ex=86400):
-            r.set(f"sid_to_room:{sid}", room_code, ex=86400)
-            emit('load_current_state', room_data['current_state'], to=sid)
-            emit('update_user_list', list(room_data['users'].values()), to=room_code)
+def handle_join(data):
+    room, user, sid = data['room_code'].upper(), data.get('username', 'Guest'), request.sid
+    join_room(room)
+    room_key = f"room:{room}"
+    
+    room_data_json = safe_get(room_key)
+    if not room_data_json: return
+    room_data = json.loads(room_data_json)
+    
+    is_admin = not room_data.get('admin_sid')
+    if is_admin: room_data['admin_sid'] = sid
+    room_data['users'][sid] = {'name': user, 'isAdmin': is_admin}
+    
+    safe_set(room_key, json.dumps(room_data))
+    
+    emit('load_current_state', room_data['current_state'])
+    emit('update_user_list', list(room_data['users'].values()), to=room)
 
 @socketio.on('update_player_state')
-def handle_player_state_update(data):
-    room_code, sid = data['room_code'].upper(), request.sid
-    room_key = f"room:{room_code}"
-    with r.lock(f"lock:{room_key}", timeout=2):
-        room_data_json = safe_get(room_key)
-        if not room_data_json: return
-        room_data = json.loads(room_data_json)
-        if not room_data['current_state'].get('isCollaborative', False) and room_data.get('admin_sid') != sid: return
-        room_data['current_state'].update(data['state'])
-        if safe_set(room_key, json.dumps(room_data), ex=86400):
-            emit('sync_player_state', room_data['current_state'], to=room_code, include_self=False)
-
-@socketio.on('disconnect')
-def handle_disconnect():
-    sid = request.sid
-    room_code = safe_get(f"sid_to_room:{sid}")
-    if not room_code: return
-    room_key = f"room:{room_code}"
-    safe_delete(f"sid_to_room:{sid}")
-    with r.lock(f"lock:{room_key}", timeout=5):
-        room_data_json = safe_get(room_key)
-        if not room_data_json: return
-        room_data = json.loads(room_data_json)
-        if sid in room_data.get('users', {}):
-            del room_data['users'][sid]
-            if not room_data['users']: return safe_delete(room_key)
-            if room_data.get('admin_sid') == sid:
-                new_admin_sid = next(iter(room_data['users']))
-                room_data['admin_sid'] = new_admin_sid
-                room_data['users'][new_admin_sid]['isAdmin'] = True
-            safe_set(room_key, json.dumps(room_data), ex=86400)
-            emit('update_user_list', list(room_data['users'].values()), to=room_code)
+def handle_state(data):
+    room = data['room_code'].upper()
+    state = data['state']
+    
+    rd_json = safe_get(f"room:{room}")
+    if rd_json:
+        rd = json.loads(rd_json)
+        rd['current_state'].update(state)
+        safe_set(f"room:{room}", json.dumps(rd))
+        emit('sync_player_state', state, to=room, include_self=False)
 
 if __name__ == '__main__':
-    logging.basicConfig(level=logging.INFO, format='%(asctime)s %(levelname)s:%(message)s')
     socketio.run(app, debug=True, host='0.0.0.0', port=5001)
 
 ### ./client/next-env.d.ts ###
@@ -263,6 +346,27 @@ module.exports = {
   },
 }
 
+### ./client/public/manifest.json ###
+
+
+{
+  "name": "MoodSync",
+  "short_name": "MoodSync",
+  "description": "Synchronized Audio Experience",
+  "start_url": "/",
+  "display": "standalone",
+  "background_color": "#000000",
+  "theme_color": "#000000",
+  "orientation": "portrait",
+  "icons": [
+    {
+      "src": "/favicon.ico",
+      "sizes": "64x64 32x32 24x24 16x16",
+      "type": "image/x-icon"
+    }
+  ]
+}
+
 ### ./client/src/app/globals.css ###
 
 @tailwind base;
@@ -271,7 +375,8 @@ module.exports = {
 
 ### ./client/src/app/layout.tsx ###
 
-import type { Metadata } from "next";
+/* client/src/app/layout.tsx */
+import type { Metadata, Viewport } from "next";
 import { Sora } from "next/font/google";
 import "./globals.css";
 
@@ -283,6 +388,20 @@ const sora = Sora({
 export const metadata: Metadata = {
   title: "MoodSync",
   description: "Craft your sonic space.",
+  manifest: "/manifest.json",
+  appleWebApp: {
+    capable: true,
+    statusBarStyle: "black-translucent",
+    title: "MoodSync",
+  },
+};
+
+export const viewport: Viewport = {
+  width: "device-width",
+  initialScale: 1,
+  maximumScale: 1,
+  userScalable: false,
+  themeColor: "#000000",
 };
 
 export default function RootLayout({
@@ -328,9 +447,11 @@ import { motion, AnimatePresence } from 'framer-motion';
 import Player from '@/components/player';
 import { useRoomStore } from '@/lib/room-store';
 import { shallow } from 'zustand/shallow';
-import { Crown, Copy, Link as LinkIcon, Upload, WifiOff } from 'lucide-react';
+import { Crown, Copy, Link as LinkIcon, Upload, WifiOff, Search, Music2, Loader2, PlusCircle, Sparkles } from 'lucide-react';
 import FileUploadModal from '@/components/FileUploadModal';
+import SearchModal from '@/components/SearchModal';
 import WaveButton from '@/components/ui/WaveButton';
+import Lyrics from '@/components/Lyrics';
 
 const API_URL = process.env.NEXT_PUBLIC_API_URL || 'http://localhost:5001';
 
@@ -339,29 +460,36 @@ const MemoizedPlayer = memo(Player);
 const UsernameModal = ({ onSubmit }: { onSubmit: (name: string) => void }) => {
     const [name, setName] = useState('');
     return (
-        <motion.div initial={{ opacity: 0 }} animate={{ opacity: 1 }} className="fixed inset-0 z-50 bg-black/80 flex items-center justify-center p-4">
-          <motion.div initial={{ scale: 0.9 }} animate={{ scale: 1 }} className="bg-black/50 border border-white/10 rounded-xl p-8 w-full max-w-sm">
-            <h2 className="text-2xl font-semibold mb-6 text-center">Enter Your Name</h2>
+        <motion.div initial={{ opacity: 0 }} animate={{ opacity: 1 }} className="fixed inset-0 z-[60] bg-black/90 flex items-center justify-center p-4 backdrop-blur-md">
+          <motion.div initial={{ scale: 0.9, y: 20 }} animate={{ scale: 1, y: 0 }} className="bg-zinc-900/90 border border-white/10 rounded-2xl p-8 w-full max-w-sm shadow-2xl relative overflow-hidden">
+            <div className="absolute top-0 left-0 w-full h-1 bg-gradient-to-r from-cyan-500 via-purple-500 to-pink-500" />
+            <h2 className="text-3xl font-bold mb-2 text-center text-white">Identity</h2>
+            <p className="text-gray-400 text-center mb-6 text-sm">Who is joining the session?</p>
             <form onSubmit={(e) => { e.preventDefault(); if (name.trim()) onSubmit(name.trim()); }} className="flex flex-col gap-4">
-              <input type="text" value={name} onChange={(e) => setName(e.target.value)} placeholder="Your display name..." className="w-full rounded-md border-white/10 bg-white/5 p-3 text-center" autoFocus />
-              <WaveButton text="Enter Sonic Space" type="submit" disabled={!name.trim()} />
+              <input type="text" value={name} onChange={(e) => setName(e.target.value)} placeholder="Display Name" className="w-full rounded-xl border-white/10 bg-black/20 p-4 text-center text-white text-lg outline-none focus:border-cyan-400 focus:bg-black/40 transition-all placeholder:text-gray-600" autoFocus />
+              <button type="submit" disabled={!name.trim()} className="w-full py-4 rounded-xl bg-white text-black font-bold text-lg hover:bg-gray-200 transition-colors disabled:opacity-50 disabled:cursor-not-allowed">
+                  Enter Space
+              </button>
             </form>
           </motion.div>
         </motion.div>
     );
 };
 
-const DisconnectedOverlay = () => {
-    return (
-        <motion.div initial={{ opacity: 0 }} animate={{ opacity: 1 }} exit={{ opacity: 0 }} className="fixed bottom-28 z-20 w-full flex items-center justify-center gap-2 bg-yellow-900/80 text-yellow-200 py-2 border-t border-b border-yellow-400/30 backdrop-blur-sm">
-            <WifiOff size={16} /><span className="font-medium text-sm">Connection lost. Reconnecting...</span>
-        </motion.div>
-    );
-};
+const DisconnectedOverlay = () => (
+    <motion.div initial={{ opacity: 0, y: 20 }} animate={{ opacity: 1, y: 0 }} exit={{ opacity: 0, y: 20 }} className="fixed bottom-32 left-1/2 -translate-x-1/2 z-50 flex items-center gap-3 bg-red-500/10 border border-red-500/20 text-red-200 px-6 py-3 rounded-full backdrop-blur-md shadow-xl">
+        <WifiOff size={18} className="animate-pulse" /><span className="font-medium text-sm">Reconnecting to server...</span>
+    </motion.div>
+);
 
-const RoomSidebar = memo(function RoomSidebar({ roomCode, onOpenUpload }: { roomCode: string, onOpenUpload: () => void }) {
+const RoomSidebar = memo(function RoomSidebar({ roomCode, onOpenUpload, onOpenSearch }: { roomCode: string, onOpenUpload: () => void, onOpenSearch: () => void }) {
     const { users, isAdmin } = useRoomStore(state => ({ users: state.users, isAdmin: state.isAdmin }), shallow);
     const [copied, setCopied] = useState(false);
+    
+    // Fallback: If socket fails, assume I am admin if I am the only user or if I just created it
+    // Real logic happens on server, but this unlocks the UI
+    const effectiveAdmin = isAdmin || users.length <= 1;
+
     const copyToClipboard = () => {
         navigator.clipboard.writeText(`${window.location.protocol}//${window.location.host}/room/${roomCode}`);
         setCopied(true);
@@ -369,78 +497,81 @@ const RoomSidebar = memo(function RoomSidebar({ roomCode, onOpenUpload }: { room
     };
 
     return (
-        <aside className="hidden lg:flex flex-col gap-8 sticky top-8">
+        <aside className="hidden lg:flex flex-col gap-8 sticky top-8 h-[calc(100vh-8rem)]">
             <motion.div initial={{opacity: 0, x: 20}} animate={{opacity: 1, x: 0}}>
-                <h2 className="text-sm font-light text-gray-400 mb-2">Share This Space</h2>
-                <div className="flex items-center gap-2 p-3 rounded-lg bg-white/5 border border-white/10">
-                    <LinkIcon size={16} className="text-gray-500" />
-                    <span className="font-mono text-sm font-semibold text-gray-400 truncate">{`${window.location.host}/room/${roomCode}`}</span>
-                    <button onClick={copyToClipboard} className="ml-auto p-2 rounded-md hover:bg-white/10" title="Copy link"><Copy size={16} className={copied ? "text-cyan-400" : "text-gray-400"} /></button>
+                <h2 className="text-xs font-bold tracking-widest text-gray-500 mb-3 uppercase">Session Link</h2>
+                <div className="flex items-center gap-2 p-1 rounded-xl bg-white/5 border border-white/10 pr-2 group hover:border-white/20 transition-colors">
+                    <div className="p-3 rounded-lg bg-black/40 text-gray-400 group-hover:text-white"><LinkIcon size={16} /></div>
+                    <span className="font-mono text-sm font-semibold text-gray-300 truncate select-all tracking-wider flex-1">{roomCode}</span>
+                    <button onClick={copyToClipboard} className="p-2 rounded-lg hover:bg-white/10 transition-colors">
+                        <Copy size={16} className={copied ? "text-cyan-400" : "text-gray-500"} />
+                    </button>
                 </div>
-                {copied && <p className="text-xs text-cyan-400 mt-2 animate-pulse">Link copied!</p>}
             </motion.div>
-            <motion.div initial={{opacity: 0, x: 20}} animate={{opacity: 1, x: 0}}>
-                <h2 className="text-sm font-light text-gray-400 mb-3">In The Room ({users.length})</h2>
-                <div className="space-y-2 max-h-64 overflow-y-auto pr-2">
+            
+            <motion.div initial={{opacity: 0, x: 20}} animate={{opacity: 1, x: 0}} className="flex-1 flex flex-col min-h-0">
+                <h2 className="text-xs font-bold tracking-widest text-gray-500 mb-3 uppercase flex justify-between">
+                    <span>Listeners</span>
+                    <span className="bg-white/10 px-2 rounded-full text-white">{users.length}</span>
+                </h2>
+                <div className="space-y-2 overflow-y-auto pr-2 custom-scrollbar">
                     {users.map((user, idx) => (
-                        <div key={idx} className="flex items-center gap-3 p-2 rounded-md bg-white/5">
-                            <span className="text-sm truncate">{user.name}</span>
-                            {user.isAdmin && <Crown size={14} className="ml-auto text-amber-400 flex-shrink-0" />}
+                        <div key={idx} className="flex items-center gap-3 p-2 rounded-lg bg-white/5 border border-transparent hover:border-white/10 transition-colors">
+                            <div className={`w-2 h-2 rounded-full ${user.isAdmin ? 'bg-amber-400 shadow-[0_0_8px_rgba(251,191,36,0.5)]' : 'bg-gray-600'}`} />
+                            <span className="text-sm truncate text-gray-200 font-medium">{user.name}</span>
+                            {user.isAdmin && <Crown size={12} className="ml-auto text-amber-400 flex-shrink-0" />}
                         </div>
                     ))}
                 </div>
             </motion.div>
-            {isAdmin && (
-                <motion.div initial={{opacity: 0, x: 20}} animate={{opacity: 1, x: 0}}>
-                    <h2 className="text-sm font-light text-gray-400 mb-3">Admin Controls</h2>
-                    <button onClick={onOpenUpload} className="w-full p-4 rounded-lg bg-gradient-to-r from-purple-500/20 to-pink-500/20 border border-purple-400/30 hover:border-purple-400/50 flex items-center justify-center gap-2 text-white font-medium"><Upload size={18} />Upload Music</button>
-                </motion.div>
-            )}
+            
+            {/* Always show controls if empty or admin */}
+            <motion.div initial={{opacity: 0, x: 20}} animate={{opacity: 1, x: 0}} className="space-y-3">
+                <button onClick={onOpenSearch} className="group w-full p-4 rounded-xl bg-gradient-to-r from-cyan-600 to-blue-600 hover:from-cyan-500 hover:to-blue-500 text-white font-bold flex items-center justify-center gap-3 transition-all shadow-lg shadow-cyan-900/20 hover:scale-[1.02] active:scale-[0.98]">
+                    <Search size={20} className="group-hover:scale-110 transition-transform" /> 
+                    <span>Add Song</span>
+                </button>
+                <button onClick={onOpenUpload} className="w-full p-4 rounded-xl bg-white/5 border border-white/10 hover:bg-white/10 text-gray-300 font-medium flex items-center justify-center gap-2 transition-colors hover:text-white">
+                    <Upload size={18} /> Upload File
+                </button>
+            </motion.div>
         </aside>
     );
 });
-
 
 export default function RoomPage() {
   const params = useParams();
   const roomCode = params.room_code as string;
   const [showNameModal, setShowNameModal] = useState(true);
   const [showUploadModal, setShowUploadModal] = useState(false);
+  const [showSearchModal, setShowSearchModal] = useState(false);
+  const [viewMode, setViewMode] = useState<'playlist' | 'lyrics'>('playlist');
 
-  // State selectors
   const { setRoomData, setLoading, setError, connect, disconnect, primePlayer } = useRoomStore.getState();
   const state = useRoomStore(s => ({
     isLoading: s.isLoading, error: s.error,
     playlist: s.playlist, currentTrackIndex: s.currentTrackIndex, playlistTitle: s.playlistTitle,
     isAdmin: s.isAdmin, isDisconnected: s.isDisconnected,
   }), shallow);
-  const playerControls = useRoomStore(s => ({
-      playPause: s.playPause, nextTrack: s.nextTrack, prevTrack: s.prevTrack, setVolume: s.setVolume, selectTrack: s.selectTrack 
-  }), shallow);
-  const playerState = useRoomStore(s => ({ 
-      isPlaying: s.isPlaying, volume: s.volume, duration: s.duration 
-  }), shallow);
+  const playerControls = useRoomStore(s => ({ playPause: s.playPause, nextTrack: s.nextTrack, prevTrack: s.prevTrack, setVolume: s.setVolume, selectTrack: s.selectTrack }), shallow);
+  const playerState = useRoomStore(s => ({ isPlaying: s.isPlaying, volume: s.volume, duration: s.duration }), shallow);
 
   const currentTrack = state.playlist[state.currentTrackIndex];
 
-  // Connection Management Effect
   useEffect(() => {
-    if (!showNameModal) {
-      connect(roomCode, "Guest");
-    }
+    if (!showNameModal) connect(roomCode, "Guest");
     return () => disconnect();
-  }, [roomCode, showNameModal, connect, disconnect]);
+  }, [roomCode, showNameModal]);
   
-  // Initial Room Data Fetching Effect
   useEffect(() => {
     if (showNameModal || !roomCode) return;
     setLoading(true);
     fetch(`${API_URL}/api/room/${roomCode}`)
-      .then(res => res.ok ? res.json() : Promise.reject(new Error('Room not found or server is busy.')))
+      .then(res => res.ok ? res.json() : Promise.reject(new Error('Room not found.')))
       .then(data => setRoomData(data))
-      .catch(err => setError(err.message || 'An unknown error occurred.'))
+      .catch(err => setError(err.message))
       .finally(() => setLoading(false));
-  }, [roomCode, showNameModal, setRoomData, setLoading, setError]);
+  }, [roomCode, showNameModal]);
 
   const handleNameSubmit = (name: string) => {
     setShowNameModal(false);
@@ -448,33 +579,96 @@ export default function RoomPage() {
     connect(roomCode, name);
   };
   
-  if (state.isLoading) return <main className="flex min-h-screen items-center justify-center bg-black"><p>Loading Room...</p></main>;
-  if (state.error) return <main className="flex min-h-screen flex-col gap-4 items-center justify-center bg-black p-4 text-center"><h1 className='text-2xl text-red-500 font-bold'>Error</h1><p className="text-gray-300">{state.error}</p><Link href="/" className="mt-4 p-2 bg-cyan-600 rounded-md">Go Home</Link></main>;
+  // Robust Loading Logic
   if (showNameModal) return <UsernameModal onSubmit={handleNameSubmit} />;
+  if (state.isLoading) return <main className="flex min-h-screen items-center justify-center bg-black text-white"><Loader2 className="animate-spin mr-2" /> Entering Space...</main>;
+  if (state.error) return <main className="flex min-h-screen flex-col gap-4 items-center justify-center bg-black p-4 text-center"><h1 className='text-2xl text-red-500 font-bold'>Error</h1><p className="text-gray-300">{state.error}</p><Link href="/" className="mt-4 p-2 bg-cyan-600 rounded-md text-white">Go Home</Link></main>;
 
   return (
-    <div className="min-h-screen bg-black text-white">
-      <div className="absolute inset-0 bg-gradient-to-b from-gray-900 via-black to-black z-[-1]" />
-      <main className="grid grid-cols-1 lg:grid-cols-[1fr_350px] gap-4 md:gap-8 max-w-7xl mx-auto p-4 sm:p-8 min-h-screen">
-        <div className="flex flex-col pt-4 md:pt-8 lg:pb-32 pb-48">
-          <motion.div initial={{ opacity: 0, y: -20 }} animate={{ opacity: 1, y: 0 }} className="mb-4 md:mb-8">
-            <h1 className="text-2xl sm:text-3xl md:text-4xl font-bold truncate">{state.playlistTitle}</h1>
-            {state.isAdmin && (
-                <div className='lg:hidden mt-4'>
-                    <button onClick={() => setShowUploadModal(true)} className="p-2 bg-purple-600/50 border border-purple-500/50 rounded-lg text-sm flex items-center gap-2 hover:bg-purple-600/80"><Upload size={16} /> Upload Music</button>
+    <div className="min-h-screen bg-black text-white overflow-hidden font-sans selection:bg-cyan-500/30">
+      <div className="fixed inset-0 z-[-1]">
+          <div className="absolute inset-0 bg-gradient-to-br from-gray-900 via-black to-black" />
+          <div className="absolute top-[-20%] right-[-10%] w-[600px] h-[600px] rounded-full bg-purple-600/10 blur-[100px]" />
+          <div className="absolute bottom-[-20%] left-[-10%] w-[500px] h-[500px] rounded-full bg-cyan-600/10 blur-[100px]" />
+      </div>
+      
+      {/* Mobile Header */}
+      <div className="lg:hidden fixed top-0 left-0 right-0 z-40 p-4 bg-black/80 backdrop-blur-xl border-b border-white/10 flex justify-between items-center">
+          <h1 className="font-bold truncate max-w-[50%] text-sm tracking-wider uppercase text-gray-400">{state.playlistTitle}</h1>
+          <div className="flex gap-2">
+            <button onClick={() => setViewMode(viewMode === 'playlist' ? 'lyrics' : 'playlist')} className="p-2 rounded-full bg-white/10 active:scale-95 transition-transform">
+                {viewMode === 'playlist' ? <Music2 size={20} className="text-purple-400"/> : <LinkIcon size={20}/>}
+            </button>
+            <button onClick={() => setShowSearchModal(true)} className="p-2 rounded-full bg-cyan-600 text-white shadow-lg shadow-cyan-900/50 active:scale-95 transition-transform"><PlusCircle size={20}/></button>
+          </div>
+      </div>
+
+      <main className="grid grid-cols-1 lg:grid-cols-[1fr_350px] gap-8 max-w-7xl mx-auto p-4 sm:p-8 h-screen pt-24 lg:pt-8 pb-32">
+        
+        {/* Main Content Area */}
+        <div className="relative h-full rounded-3xl bg-white/5 border border-white/10 overflow-hidden flex flex-col shadow-2xl">
+            {/* Desktop Toggle */}
+            <div className="absolute top-6 right-6 z-20 hidden lg:flex bg-black/40 backdrop-blur-md rounded-full p-1 border border-white/5">
+                <button onClick={() => setViewMode('playlist')} className={`px-6 py-2 rounded-full text-sm font-bold transition-all ${viewMode === 'playlist' ? 'bg-white text-black shadow-lg' : 'text-gray-400 hover:text-white'}`}>Playlist</button>
+                <button onClick={() => setViewMode('lyrics')} className={`px-6 py-2 rounded-full text-sm font-bold transition-all ${viewMode === 'lyrics' ? 'bg-white text-black shadow-lg' : 'text-gray-400 hover:text-white'}`}>Lyrics</button>
+            </div>
+
+            {viewMode === 'playlist' ? (
+                <div className="flex-1 overflow-y-auto p-6 lg:p-10 space-y-2 custom-scrollbar">
+                     <motion.div initial={{ opacity: 0, y: -20 }} animate={{ opacity: 1, y: 0 }} className="mb-8">
+                        <h1 className="text-4xl md:text-6xl font-black tracking-tight text-transparent bg-clip-text bg-gradient-to-br from-white via-gray-200 to-gray-600">{state.playlistTitle}</h1>
+                        <p className="text-gray-500 mt-2 font-medium flex items-center gap-2">
+                            {state.playlist.length} Tracks 
+                            <span className="w-1 h-1 rounded-full bg-gray-600" /> 
+                            {currentTrack ? <span className="text-cyan-400">Playing {currentTrack.name}</span> : 'Waiting for music'}
+                        </p>
+                    </motion.div>
+
+                    {state.playlist.length === 0 ? (
+                        <div className="flex flex-col items-center justify-center py-20 text-center opacity-80">
+                            <div className="w-24 h-24 rounded-full bg-white/5 flex items-center justify-center mb-6 animate-pulse">
+                                <Sparkles size={40} className="text-cyan-400" />
+                            </div>
+                            <h3 className="text-2xl font-bold text-white mb-2">It's quiet... too quiet.</h3>
+                            <p className="text-gray-400 max-w-xs mx-auto mb-8">Add a song from YouTube or upload a file to start the session.</p>
+                            <button onClick={() => setShowSearchModal(true)} className="px-8 py-4 rounded-full bg-cyan-600 text-white font-bold hover:scale-105 transition-transform shadow-lg shadow-cyan-600/20">
+                                Add First Song
+                            </button>
+                        </div>
+                    ) : (
+                        <div className="space-y-2">
+                             {state.playlist.map((song, index) => (
+                                <motion.div initial={{ opacity: 0, y: 10 }} animate={{ opacity: 1, y: 0 }} transition={{ delay: index * 0.05 }} key={index} onClick={() => playerControls.selectTrack(index)} 
+                                    className={`group flex items-center gap-5 p-4 rounded-2xl transition-all border cursor-pointer ${state.currentTrackIndex === index ? 'bg-white/10 border-cyan-500/30 shadow-lg shadow-black/20' : 'bg-transparent border-transparent hover:bg-white/5'}`}>
+                                    <div className="relative h-14 w-14 rounded-xl overflow-hidden bg-gray-800 flex-shrink-0 shadow-lg">
+                                        {song.albumArt ? <img src={song.albumArt} alt="art" className="object-cover h-full w-full group-hover:scale-110 transition-transform duration-500" /> : <div className="h-full w-full flex items-center justify-center text-2xl text-gray-600">🎵</div>}
+                                        {state.currentTrackIndex === index && playerState.isPlaying && (
+                                            <div className="absolute inset-0 bg-black/40 flex items-center justify-center gap-1">
+                                                <div className="w-1 h-4 bg-cyan-400 animate-[bounce_1s_infinite]" />
+                                                <div className="w-1 h-6 bg-cyan-400 animate-[bounce_1.2s_infinite]" />
+                                                <div className="w-1 h-3 bg-cyan-400 animate-[bounce_0.8s_infinite]" />
+                                            </div>
+                                        )}
+                                    </div>
+                                    <div className="min-w-0 flex-1">
+                                        <p className={`font-bold text-lg truncate ${state.currentTrackIndex === index ? 'text-cyan-400' : 'text-gray-100 group-hover:text-white'}`}>{song.name}</p>
+                                        <p className="text-sm text-gray-500 truncate font-medium">{song.artist}</p>
+                                    </div>
+                                    <div className="opacity-0 group-hover:opacity-100 transition-opacity">
+                                        <div className="p-2 rounded-full bg-white/10 hover:bg-white/20 text-white"><Music2 size={16} /></div>
+                                    </div>
+                                </motion.div>
+                            ))}
+                        </div>
+                    )}
                 </div>
+            ) : (
+                <Lyrics />
             )}
-          </motion.div>
-          <motion.ul initial="hidden" animate="visible" variants={{visible: { transition: {staggerChildren: 0.05} }}} className="space-y-2 overflow-y-auto -mr-4 pr-4">
-            {state.playlist.map((song, index) => (
-              <motion.li variants={{hidden: {opacity: 0, x: -20}, visible: {opacity: 1, x: 0}}} key={index} onClick={() => playerControls.selectTrack(index)} className={`flex items-center gap-4 p-3 rounded-lg border transition-colors ${state.currentTrackIndex === index ? 'bg-white/10 border-cyan-500' : 'border-transparent hover:bg-white/5'} ${state.isAdmin ? 'cursor-pointer' : ''}`}>
-                <div className="h-12 w-12 bg-gray-800 rounded-md flex-shrink-0 flex items-center justify-center text-2xl">🎵</div>
-                <div><p className="font-semibold truncate text-sm md:text-base">{song.name}</p><p className="text-xs md:text-sm text-gray-400 truncate">{song.artist}</p></div>
-              </motion.li>
-            ))}
-          </motion.ul>
         </div>
-        <div className="h-full hidden lg:flex flex-col justify-start pt-8"><RoomSidebar roomCode={roomCode} onOpenUpload={() => setShowUploadModal(true)} /></div>
+
+        {/* Sidebar (Desktop) */}
+        <RoomSidebar roomCode={roomCode} onOpenUpload={() => setShowUploadModal(true)} onOpenSearch={() => setShowSearchModal(true)} />
       </main>
       
       <AnimatePresence>
@@ -488,6 +682,7 @@ export default function RoomPage() {
       </AnimatePresence>
       <AnimatePresence>{state.isDisconnected && <DisconnectedOverlay />}</AnimatePresence>
       <FileUploadModal isOpen={showUploadModal} onClose={() => setShowUploadModal(false)} />
+      <SearchModal isOpen={showSearchModal} onClose={() => setShowSearchModal(false)} roomCode={roomCode} />
     </div>
   );
 }
@@ -835,6 +1030,242 @@ export default function FileUploadModal({ isOpen, onClose }: { isOpen: boolean; 
               >
                 {isUploading ? 'Uploading...' : success ? 'Done!' : 'Upload'}
               </button>
+            </div>
+          </motion.div>
+        </motion.div>
+      )}
+    </AnimatePresence>
+  );
+}
+
+### ./client/src/components/InstallPrompt.tsx ###
+
+/* client/src/components/InstallPrompt.tsx */
+"use client";
+import { useState, useEffect } from "react";
+import { motion, AnimatePresence } from "framer-motion";
+import { Share, PlusSquare, X } from "lucide-react";
+
+export default function InstallPrompt() {
+  const [isIOS, setIsIOS] = useState(false);
+  const [isStandalone, setIsStandalone] = useState(false);
+  const [showPrompt, setShowPrompt] = useState(false);
+
+  useEffect(() => {
+    const userAgent = window.navigator.userAgent.toLowerCase();
+    const isIphone = /iphone|ipad|ipod/.test(userAgent);
+    setIsIOS(isIphone);
+    setIsStandalone(window.matchMedia('(display-mode: standalone)').matches);
+    
+    // Show prompt if on iOS and not yet installed
+    if (isIphone && !window.matchMedia('(display-mode: standalone)').matches) {
+        // Wait a bit before showing
+        const timer = setTimeout(() => setShowPrompt(true), 2000);
+        return () => clearTimeout(timer);
+    }
+  }, []);
+
+  if (!showPrompt) return null;
+
+  return (
+    <AnimatePresence>
+      <motion.div 
+        initial={{ y: 100, opacity: 0 }}
+        animate={{ y: 0, opacity: 1 }}
+        exit={{ y: 100, opacity: 0 }}
+        className="fixed bottom-0 left-0 right-0 z-[60] p-4 pb-8 bg-zinc-900 border-t border-white/10 shadow-2xl"
+      >
+        <div className="max-w-md mx-auto flex flex-col gap-4">
+            <div className="flex justify-between items-start">
+                <h3 className="text-white font-bold text-lg">Install for Best Experience</h3>
+                <button onClick={() => setShowPrompt(false)}><X className="text-gray-400" /></button>
+            </div>
+            <p className="text-gray-300 text-sm">
+                To keep music playing in the background on iPhone, you must add this app to your home screen.
+            </p>
+            <div className="flex items-center gap-4 text-sm font-medium text-cyan-400">
+                <span className="flex items-center gap-2">1. Tap Share <Share size={16} /></span>
+                <span className="flex items-center gap-2">2. Add to Home Screen <PlusSquare size={16} /></span>
+            </div>
+        </div>
+      </motion.div>
+    </AnimatePresence>
+  );
+}
+
+### ./client/src/components/Lyrics.tsx ###
+
+"use client";
+import { useEffect, useState, useRef } from 'react';
+import { useRoomStore } from '@/lib/room-store';
+import { motion } from 'framer-motion';
+
+// Helper to parse LRC format: [00:12.50] Hello World -> { time: 12.5, text: "Hello World" }
+const parseLRC = (lrc: string) => {
+    const regex = /^\[(\d{2}):(\d{2}(?:\.\d+)?)\](.*)/;
+    const lines = lrc.split('\n');
+    const result = [];
+    for (const line of lines) {
+        const match = line.match(regex);
+        if (match) {
+            const min = parseInt(match[1]);
+            const sec = parseFloat(match[2]);
+            const text = match[3].trim();
+            if (text) result.push({ time: min * 60 + sec, text });
+        }
+    }
+    return result;
+};
+
+export default function Lyrics() {
+    const { playlist, currentTrackIndex, currentTime } = useRoomStore();
+    const currentTrack = playlist[currentTrackIndex];
+    const [lines, setLines] = useState<{time: number, text: string}[]>([]);
+    const [activeLine, setActiveLine] = useState(0);
+    const scrollRef = useRef<HTMLDivElement>(null);
+
+    useEffect(() => {
+        if (currentTrack?.lyrics) {
+            setLines(parseLRC(currentTrack.lyrics));
+        } else {
+            setLines([]);
+        }
+    }, [currentTrack]);
+
+    useEffect(() => {
+        // Find current active line
+        const index = lines.findIndex((line, i) => {
+            const nextLine = lines[i + 1];
+            return currentTime >= line.time && (!nextLine || currentTime < nextLine.time);
+        });
+        if (index !== -1) {
+            setActiveLine(index);
+            // Auto scroll
+            if (scrollRef.current) {
+                const el = scrollRef.current.children[index] as HTMLElement;
+                if (el) {
+                    el.scrollIntoView({ behavior: 'smooth', block: 'center' });
+                }
+            }
+        }
+    }, [currentTime, lines]);
+
+    if (!currentTrack?.lyrics || lines.length === 0) return (
+        <div className="h-full flex items-center justify-center text-gray-500/50 text-2xl font-bold tracking-widest uppercase select-none">
+            No Lyrics
+        </div>
+    );
+
+    return (
+        <div className="h-full w-full overflow-hidden relative mask-image-gradient">
+            <div className="absolute inset-0 pointer-events-none bg-gradient-to-b from-black/80 via-transparent to-black/80 z-10" />
+            <div ref={scrollRef} className="h-full overflow-y-auto px-4 py-[50vh] no-scrollbar space-y-6 text-center">
+                {lines.map((line, i) => (
+                    <motion.p 
+                        key={i}
+                        animate={{ 
+                            scale: i === activeLine ? 1.1 : 0.95,
+                            opacity: i === activeLine ? 1 : 0.3,
+                            filter: i === activeLine ? 'blur(0px)' : 'blur(1px)',
+                            color: i === activeLine ? '#ffffff' : '#9ca3af'
+                        }}
+                        className="text-xl md:text-3xl font-bold transition-all duration-300"
+                    >
+                        {line.text}
+                    </motion.p>
+                ))}
+            </div>
+        </div>
+    );
+}
+
+### ./client/src/components/SearchModal.tsx ###
+
+"use client";
+import { useState } from 'react';
+import { motion, AnimatePresence } from 'framer-motion';
+import { Search, Plus, X, Loader2, Music } from 'lucide-react';
+
+const API_URL = process.env.NEXT_PUBLIC_API_URL || 'http://localhost:5001';
+
+interface SearchResult { id: string; title: string; artist: string; thumbnail: string; }
+
+export default function SearchModal({ isOpen, onClose, roomCode }: { isOpen: boolean; onClose: () => void; roomCode: string }) {
+  const [query, setQuery] = useState('');
+  const [results, setResults] = useState<SearchResult[]>([]);
+  const [isSearching, setIsSearching] = useState(false);
+  const [addingId, setAddingId] = useState<string | null>(null);
+
+  const handleSearch = async (e: React.FormEvent) => {
+    e.preventDefault();
+    if (!query.trim()) return;
+    setIsSearching(true);
+    try {
+      const res = await fetch(`${API_URL}/api/yt-search`, {
+        method: 'POST', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ query })
+      });
+      const data = await res.json();
+      setResults(data.results || []);
+    } catch (error) {
+      console.error(error);
+    } finally { setIsSearching(false); }
+  };
+
+  const addTrack = async (track: SearchResult) => {
+    setAddingId(track.id);
+    try {
+      // Use the specific YT endpoint
+      await fetch(`${API_URL}/api/room/${roomCode}/add-yt`, {
+        method: 'POST', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(track)
+      });
+      onClose();
+      setResults([]);
+      setQuery('');
+    } catch (error) {
+      alert("Failed to add track. Server might be busy downloading.");
+    } finally { setAddingId(null); }
+  };
+
+  return (
+    <AnimatePresence>
+      {isOpen && (
+        <motion.div initial={{ opacity: 0 }} animate={{ opacity: 1 }} exit={{ opacity: 0 }} className="fixed inset-0 z-[100] bg-black/90 backdrop-blur-sm flex items-start justify-center p-4 pt-20" onClick={onClose}>
+          <motion.div initial={{ scale: 0.95, opacity: 0 }} animate={{ scale: 1, opacity: 1 }} exit={{ scale: 0.95, opacity: 0 }} className="bg-zinc-900 border border-white/10 rounded-xl w-full max-w-lg flex flex-col shadow-2xl overflow-hidden" onClick={e => e.stopPropagation()}>
+            
+            <div className="p-4 border-b border-white/10 flex gap-3 items-center bg-black/40">
+              <Search className="text-gray-400" size={20} />
+              <form onSubmit={handleSearch} className="flex-1">
+                <input autoFocus value={query} onChange={e => setQuery(e.target.value)} placeholder="Search YouTube..." className="w-full bg-transparent text-white outline-none placeholder:text-gray-500 text-lg" />
+              </form>
+              <button onClick={onClose}><X className="text-gray-400 hover:text-white" /></button>
+            </div>
+
+            <div className="max-h-[60vh] overflow-y-auto p-2">
+              {isSearching ? (
+                  <div className="flex justify-center p-8"><Loader2 className="animate-spin text-cyan-400" size={32} /></div>
+              ) : results.length === 0 ? (
+                  <div className="text-center p-8 text-gray-500">
+                      <Music size={48} className="mx-auto mb-2 opacity-20" />
+                      <p>Search for your favorite tracks</p>
+                  </div>
+              ) : (
+                  <div className="space-y-1">
+                      {results.map(r => (
+                        <div key={r.id} className="flex items-center gap-3 p-3 hover:bg-white/5 rounded-lg group transition-colors">
+                          <img src={r.thumbnail} className="h-12 w-12 rounded object-cover bg-gray-800" />
+                          <div className="flex-1 min-w-0">
+                            <p className="font-medium truncate text-white">{r.title}</p>
+                            <p className="text-sm text-gray-400 truncate">{r.artist}</p>
+                          </div>
+                          <button onClick={() => addTrack(r)} disabled={!!addingId} className="p-2 bg-white/5 text-cyan-400 rounded-full hover:bg-cyan-500 hover:text-white transition-all disabled:opacity-50">
+                            {addingId === r.id ? <Loader2 size={20} className="animate-spin" /> : <Plus size={20} />}
+                          </button>
+                        </div>
+                      ))}
+                  </div>
+              )}
             </div>
           </motion.div>
         </motion.div>
@@ -1418,13 +1849,23 @@ import { io, Socket } from 'socket.io-client';
 const API_URL = process.env.NEXT_PUBLIC_API_URL || 'http://localhost:5001';
 
 // --- INTERFACES ---
-interface Song { name: string; artist: string; isUpload: boolean; audioUrl: string | null; albumArt: string | null; }
+// --- INTERFACES ---
+export interface Song { 
+    name: string; 
+    artist: string; 
+    isUpload: boolean; 
+    audioUrl: string | null; 
+    albumArt: string | null; 
+    lyrics?: string | null; // <--- NEW: Added Lyrics support
+}
 interface User { name: string; isAdmin: boolean; }
 interface EqualizerSettings { bass: number; mids: number; treble: number; }
 interface AudioNodes { context: AudioContext | null; source: MediaElementAudioSourceNode | null; bass: BiquadFilterNode | null; mids: BiquadFilterNode | null; treble: BiquadFilterNode | null; }
 interface SyncState { isPlaying?: boolean; trackIndex?: number; volume?: number; equalizer?: EqualizerSettings; currentTime?: number; serverTimestamp?: number; }
-
-declare global { interface Window { webkitAudioContext: any; } }
+declare global { 
+    interface Window { webkitAudioContext: any; } 
+    // Removed conflicting Navigator definition. TypeScript lib.dom knows mediaSession exists.
+}
 
 interface RoomState {
   socket: Socket | null; audioElement: HTMLAudioElement | null;
@@ -1438,9 +1879,7 @@ interface RoomState {
   primePlayer: () => void;
   _emitStateUpdate: (overrideState?: Partial<SyncState>) => void;
   syncPlayerState: (state: SyncState) => void;
-  setRoomData: (data: {
-    title: string | undefined; playlistTitle: string; playlist: Song[] 
-}) => void;
+  setRoomData: (data: { title: string | undefined; playlistTitle: string; playlist: Song[] }) => void;
   selectTrack: (index: number) => void;
   playPause: () => void;
   nextTrack: () => void;
@@ -1451,19 +1890,23 @@ interface RoomState {
   setLoading: (loading: boolean) => void;
   setError: (error: string | null) => void;
   setIsSeeking: (seeking: boolean) => void;
+  updateMediaSession: () => void; 
 }
 
 let audioEl: HTMLAudioElement | null = null;
 if (typeof window !== 'undefined') {
   audioEl = new Audio();
   audioEl.crossOrigin = 'anonymous';
+  // CRITICAL for iOS Background Audio
+  audioEl.preload = "auto";
+  // Removed invalid 'playsInline' property
 }
 
 export const useRoomStore = create<RoomState>()((set, get) => ({
   socket: null, audioElement: audioEl,
   playlist: [], currentTrackIndex: 0, isPlaying: false, isSeeking: false,
   isAudioGraphConnected: false, roomCode: '', playlistTitle: '', users: [], username: '',
-  volume: 80, isLoading: true, error: null, isAdmin: false,
+  volume: 80, isLoading: false, error: null, isAdmin: false,
   equalizer: { bass: 0, mids: 0, treble: 0 },
   audioNodes: { context: null, source: null, bass: null, mids: null, treble: null },
   currentTime: 0, duration: 0, isConnecting: false, isDisconnected: false,
@@ -1474,20 +1917,40 @@ export const useRoomStore = create<RoomState>()((set, get) => ({
 
   connect: (code, name) => {
     if (get().socket) return;
-    set({ username: name, roomCode: code, isLoading: true });
-    const socket = io(API_URL, { transports: ['websocket'] });
+    
+    // CHANGE: Do NOT set isLoading: true here. 
+    // We let the HTTP fetch in page.tsx handle the loading state.
+    // This prevents the app from getting stuck if the socket is slow.
+    set({ username: name, roomCode: code });
+    
+   const socket = io(API_URL, { 
+        // CHANGE THIS LINE: Allow polling fallback
+        transports: ['polling', 'websocket'], 
+        reconnection: true,
+        reconnectionAttempts: Infinity,
+        timeout: 10000,
+    });
     set({ socket });
 
     socket.on('connect', () => {
-        console.log("✅ Socket connected. Emitting join_room.");
+        console.log("✅ Socket connected");
         socket.emit('join_room', { room_code: code, username: name });
+        set({ isDisconnected: false });
     });
+    
     socket.on('update_user_list', (users) => set({ users, isAdmin: users.find((u: User) => u.name === get().username)?.isAdmin ?? false }));
     socket.on('load_current_state', (state) => get().syncPlayerState(state));
     socket.on('sync_player_state', (state) => get().syncPlayerState(state));
-    socket.on('refresh_playlist', (data) => get().setRoomData(data));
+    socket.on('refresh_playlist', (data) => {
+        get().setRoomData(data);
+        get().updateMediaSession();
+    });
     socket.on('disconnect', () => set({ isDisconnected: true }));
-    socket.on('connect_error', () => get().setError("Connection failed. The server might be offline or misconfigured."));
+    socket.on('connect_error', (err) => {
+        console.warn("Socket connection warning:", err);
+        // We do NOT set an error state here, because the HTTP fallback 
+        // allows the user to still see the playlist/lyrics while reconnecting.
+    });
   },
 
   disconnect: () => {
@@ -1499,22 +1962,85 @@ export const useRoomStore = create<RoomState>()((set, get) => ({
   primePlayer: () => {
     const audio = get().audioElement;
     if (!audio || get().isAudioGraphConnected) return;
+
     try {
         const AudioContext = window.AudioContext || window.webkitAudioContext;
         const context = new AudioContext();
+        
+        // Mobile browsers require resume() on user interaction
         if (context.state === 'suspended') context.resume();
+        
         const source = context.createMediaElementSource(audio);
         const bass = context.createBiquadFilter(); bass.type = "lowshelf"; bass.frequency.value = 250;
         const mids = context.createBiquadFilter(); mids.type = "peaking"; mids.frequency.value = 1000; mids.Q.value = 0.8;
         const treble = context.createBiquadFilter(); treble.type = "highshelf"; treble.frequency.value = 3000;
+        
         source.connect(bass).connect(mids).connect(treble).connect(context.destination);
+        
         set({ audioNodes: { context, source, bass, mids, treble }, isAudioGraphConnected: true });
-        audio.ontimeupdate = () => set({ currentTime: audio.currentTime });
-        audio.onloadedmetadata = () => set({ duration: audio.duration });
+
+        // CRITICAL: request Wake Lock if available
+        if ('wakeLock' in navigator) {
+            // @ts-ignore: wakeLock types might be missing in some setups
+            navigator.wakeLock.request('screen').catch((err) => console.log(err));
+        }
+
+        audio.ontimeupdate = () => {
+            set({ currentTime: audio.currentTime });
+        };
+        
+        audio.onloadedmetadata = () => {
+            set({ duration: audio.duration });
+            get().updateMediaSession();
+        };
+        
         audio.onended = () => { if(get().isAdmin) get().nextTrack(); };
-        audio.onplaying = () => set({ isPlaying: true });
-        audio.onpause = () => set({ isPlaying: false });
+        audio.onplaying = () => {
+            set({ isPlaying: true });
+            get().updateMediaSession();
+        };
+        audio.onpause = () => {
+            set({ isPlaying: false });
+            get().updateMediaSession();
+        };
+
     } catch (e) { console.error("Could not prime audio player.", e); }
+  },
+
+  updateMediaSession: () => {
+    // Check if mediaSession exists on navigator (Typescript safe)
+    if (!('mediaSession' in navigator)) return;
+    
+    const { playlist, currentTrackIndex, isPlaying } = get();
+    const track = playlist[currentTrackIndex];
+    if (!track) return;
+
+    try {
+        navigator.mediaSession.metadata = new MediaMetadata({
+        title: track.name,
+        artist: track.artist,
+        artwork: [
+            { src: '/favicon.ico', sizes: '96x96', type: 'image/png' },
+        ]
+        });
+
+        // Set handlers to allow Lock Screen control
+        navigator.mediaSession.setActionHandler('play', () => {
+            if(get().isAdmin) get().playPause();
+        });
+        navigator.mediaSession.setActionHandler('pause', () => {
+            if(get().isAdmin) get().playPause();
+        });
+        navigator.mediaSession.setActionHandler('nexttrack', () => {
+            if(get().isAdmin) get().nextTrack();
+        });
+        navigator.mediaSession.setActionHandler('previoustrack', () => {
+            if(get().isAdmin) get().prevTrack();
+        });
+        navigator.mediaSession.playbackState = isPlaying ? "playing" : "paused";
+    } catch (e) {
+        console.warn("Media Session API error:", e);
+    }
   },
   
   _emitStateUpdate: (overrideState?: Partial<SyncState>) => {
@@ -1522,22 +2048,57 @@ export const useRoomStore = create<RoomState>()((set, get) => ({
     if (!state.socket || !state.isAdmin) return;
     state.socket.emit('update_player_state', { 
         room_code: state.roomCode, 
-        state: { isPlaying: state.isPlaying, trackIndex: state.currentTrackIndex, currentTime: state.audioElement?.currentTime ?? 0, volume: state.volume, equalizer: state.equalizer, serverTimestamp: Date.now() / 1000, ...overrideState } 
+        state: { 
+            isPlaying: state.isPlaying, 
+            trackIndex: state.currentTrackIndex, 
+            currentTime: state.audioElement?.currentTime ?? 0, 
+            volume: state.volume, 
+            equalizer: state.equalizer, 
+            serverTimestamp: Date.now() / 1000, 
+            ...overrideState 
+        } 
     });
   },
 
   syncPlayerState: (state) => {
     const { audioElement, currentTrackIndex, isPlaying, isAdmin, playlist } = get();
     if (!audioElement || isAdmin) return;
+
+    // 1. Sync Track
     if (state.trackIndex !== undefined && state.trackIndex !== currentTrackIndex) {
         const track = playlist[state.trackIndex];
-        if (track?.audioUrl) { audioElement.src = track.audioUrl; audioElement.load(); }
+        if (track?.audioUrl) { 
+            audioElement.src = track.audioUrl; 
+            audioElement.load(); 
+            // On mobile, we must call play() immediately if we were already playing
+            if(state.isPlaying) audioElement.play().catch(e => console.log("Autoplay prevented:", e));
+        }
         set({ currentTrackIndex: state.trackIndex });
+        get().updateMediaSession();
     }
-    if (state.currentTime !== undefined && Math.abs(state.currentTime - audioElement.currentTime) > 2.0) { audioElement.currentTime = state.currentTime; }
+
+    // 2. Sync Time (Drift Correction)
+    if (state.currentTime !== undefined) {
+        const drift = Math.abs(state.currentTime - audioElement.currentTime);
+        // Hard Sync if drift is huge (> 2 seconds)
+        if (drift > 2.0) { 
+            audioElement.currentTime = state.currentTime; 
+        }
+        // Soft Sync (Playback Rate) if drift is small (> 0.2s)
+        else if (drift > 0.2) {
+             // If we are behind, speed up slightly. If ahead, slow down slightly.
+             const isBehind = audioElement.currentTime < state.currentTime;
+             audioElement.playbackRate = isBehind ? 1.05 : 0.95;
+             // Reset to normal speed after 1 second
+             setTimeout(() => { audioElement.playbackRate = 1.0; }, 1000);
+        }
+    }
+
+    // 3. Sync Play/Pause
     if (state.isPlaying !== undefined && state.isPlaying !== isPlaying) {
         set({ isPlaying: state.isPlaying });
         state.isPlaying ? audioElement.play().catch(()=>{}) : audioElement.pause();
+        get().updateMediaSession();
     }
   },
 
@@ -1549,6 +2110,7 @@ export const useRoomStore = create<RoomState>()((set, get) => ({
     set({ isPlaying: !isPlaying });
     isPlaying ? audioElement?.pause() : audioElement?.play();
     get()._emitStateUpdate({ isPlaying: !isPlaying, currentTime: audioElement?.currentTime });
+    get().updateMediaSession();
   },
   
   selectTrack: (index) => {
@@ -1562,6 +2124,7 @@ export const useRoomStore = create<RoomState>()((set, get) => ({
       audioElement.play();
       set({ currentTrackIndex: index, isPlaying: true });
       get()._emitStateUpdate({ trackIndex: index, currentTime: 0, isPlaying: true });
+      get().updateMediaSession();
     }
   },
 
@@ -1939,8 +2502,11 @@ urllib3==2.5.0
 Werkzeug==3.1.3
 wsproto==1.2.0
 zipp==3.23.0
-zope.event==5.1.1
 zope.interface==7.2
+zope.event==5.1.1
+yt-dlp>=2024.03.10
+syncedlyrics==0.9.0
+beautifulsoup4==4.12.3
 
 ### ./spotify_test.py ###
 
