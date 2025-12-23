@@ -124,9 +124,14 @@ export default function RoomPage() {
     connect(roomCode, name);
   };
   
-  if (state.isLoading) return <main className="flex min-h-screen items-center justify-center bg-black text-white"><Loader2 className="animate-spin mr-2" /> Entering Space...</main>;
-  if (state.error) return <main className="flex min-h-screen flex-col gap-4 items-center justify-center bg-black p-4 text-center"><h1 className='text-2xl text-red-500 font-bold'>Error</h1><p className="text-gray-300">{state.error}</p><Link href="/" className="mt-4 p-2 bg-cyan-600 rounded-md text-white">Go Home</Link></main>;
+  // FIX: Check Name Modal FIRST. This breaks the deadlock.
   if (showNameModal) return <UsernameModal onSubmit={handleNameSubmit} />;
+
+  // Then check loading
+  if (state.isLoading) return <main className="flex min-h-screen items-center justify-center bg-black text-white"><Loader2 className="animate-spin mr-2" /> Entering Space...</main>;
+  
+  // Then check error
+  if (state.error) return <main className="flex min-h-screen flex-col gap-4 items-center justify-center bg-black p-4 text-center"><h1 className='text-2xl text-red-500 font-bold'>Error</h1><p className="text-gray-300">{state.error}</p><Link href="/" className="mt-4 p-2 bg-cyan-600 rounded-md text-white">Go Home</Link></main>;
 
   return (
     <div className="min-h-screen bg-black text-white overflow-hidden">

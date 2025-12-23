@@ -61,7 +61,7 @@ export const useRoomStore = create<RoomState>()((set, get) => ({
   socket: null, audioElement: audioEl,
   playlist: [], currentTrackIndex: 0, isPlaying: false, isSeeking: false,
   isAudioGraphConnected: false, roomCode: '', playlistTitle: '', users: [], username: '',
-  volume: 80, isLoading: true, error: null, isAdmin: false,
+  volume: 80, isLoading: false, error: null, isAdmin: false,
   equalizer: { bass: 0, mids: 0, treble: 0 },
   audioNodes: { context: null, source: null, bass: null, mids: null, treble: null },
   currentTime: 0, duration: 0, isConnecting: false, isDisconnected: false,
