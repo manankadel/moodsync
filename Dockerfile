@@ -1,24 +1,27 @@
 FROM python:3.11-slim
 
-# Install FFmpeg and Git
+# Install FFmpeg (Required for audio) and Git
 RUN apt-get update && \
     apt-get install -y ffmpeg git && \
     apt-get clean
 
 WORKDIR /app
 
-# Install dependencies
+# Copy requirements
 COPY requirements.txt .
+# Force fresh install
 RUN pip install --no-cache-dir --ignore-installed -r requirements.txt
 
-# Copy app code
+# Copy App
 COPY . .
 
-# Ensure upload directory exists
+# Permissions
 RUN mkdir -p uploads && chmod 777 uploads
 
-# Expose port
+# Expose Port
 EXPOSE 5001
 
-# --- FORCE EVENTLET WORKER ---
-CMD ["gunicorn", "--worker-class", "eventlet", "-w", "1", "--bind", "0.0.0.0:5001", "app:app"]
+# --- CRITICAL CONFIGURATION ---
+# 1. Use 'eventlet' worker
+# 2. Set timeout to 120s (prevents crash during download)
+CMD ["gunicorn", "--worker-class", "eventlet", "--timeout", "120", "-w", "1", "--bind", "0.0.0.0:5001", "app:app"]

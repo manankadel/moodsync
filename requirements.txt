@@ -5,7 +5,8 @@ python-dotenv==1.0.1
 redis==5.0.1
 eventlet==0.35.2
 gunicorn==21.2.0
-yt-dlp
-syncedlyrics
-google-api-python-client
+yt-dlp>=2024.03.10
+ytmusicapi==5.3.0
+syncedlyrics==0.9.0
 werkzeug==3.0.1
+ffmpeg-python==0.2.0
