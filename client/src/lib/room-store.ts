@@ -14,12 +14,23 @@ export interface Song {
 }
 interface User { name: string; isAdmin: boolean; }
 interface EqualizerSettings { bass: number; mids: number; treble: number; }
-interface AudioNodes { context: AudioContext | null; source: MediaElementAudioSourceNode | null; bass: BiquadFilterNode | null; mids: BiquadFilterNode | null; treble: BiquadFilterNode | null; }
-interface SyncState { isPlaying?: boolean; trackIndex?: number; volume?: number; equalizer?: EqualizerSettings; currentTime?: number; serverTimestamp?: number; }
-
-declare global { 
-    interface Window { webkitAudioContext: any; } 
+interface AudioNodes { 
+    context: AudioContext | null; 
+    source: MediaElementAudioSourceNode | null; 
+    bass: BiquadFilterNode | null; 
+    mids: BiquadFilterNode | null; 
+    treble: BiquadFilterNode | null; 
 }
+interface SyncState { 
+    isPlaying?: boolean; 
+    trackIndex?: number; 
+    volume?: number; 
+    equalizer?: EqualizerSettings; 
+    currentTime?: number; 
+    serverTimestamp?: number; 
+}
+
+declare global { interface Window { webkitAudioContext: any; } }
 
 interface RoomState {
   socket: Socket | null; audioElement: HTMLAudioElement | null;
@@ -33,7 +44,7 @@ interface RoomState {
   primePlayer: () => void;
   _emitStateUpdate: (overrideState?: Partial<SyncState>) => void;
   syncPlayerState: (state: SyncState) => void;
-  setRoomData: (data: { title: string | undefined; playlistTitle: string; playlist: Song[] }) => void;
+  setRoomData: (data: any) => void;
   selectTrack: (index: number) => void;
   playPause: () => void;
   nextTrack: () => void;
@@ -44,7 +55,7 @@ interface RoomState {
   setLoading: (loading: boolean) => void;
   setError: (error: string | null) => void;
   setIsSeeking: (seeking: boolean) => void;
-  updateMediaSession: () => void; 
+  updateMediaSession: () => void;
 }
 
 let audioEl: HTMLAudioElement | null = null;
@@ -70,28 +81,16 @@ export const useRoomStore = create<RoomState>()((set, get) => ({
   connect: (code, name) => {
     if (get().socket) return;
     set({ username: name, roomCode: code });
-    
-    // Allow polling to fix Render connection issues
-    const socket = io(API_URL, { 
-        transports: ['polling', 'websocket'], 
-        reconnection: true,
-        timeout: 20000,
-    });
+    const socket = io(API_URL, { transports: ['polling', 'websocket'], reconnection: true });
     set({ socket });
 
     socket.on('connect', () => {
-        console.log("✅ Socket connected");
         socket.emit('join_room', { room_code: code, username: name });
         set({ isDisconnected: false });
     });
-    
     socket.on('update_user_list', (users) => set({ users, isAdmin: users.find((u: User) => u.name === get().username)?.isAdmin ?? false }));
-    socket.on('load_current_state', (state) => get().syncPlayerState(state));
     socket.on('sync_player_state', (state) => get().syncPlayerState(state));
-    socket.on('refresh_playlist', (data) => {
-        get().setRoomData(data);
-        get().updateMediaSession();
-    });
+    socket.on('refresh_playlist', (data) => get().setRoomData(data));
     socket.on('disconnect', () => set({ isDisconnected: true }));
   },
 
@@ -104,74 +103,49 @@ export const useRoomStore = create<RoomState>()((set, get) => ({
   primePlayer: () => {
     const audio = get().audioElement;
     if (!audio || get().isAudioGraphConnected) return;
-
     try {
         const AudioContext = window.AudioContext || window.webkitAudioContext;
         const context = new AudioContext();
         if (context.state === 'suspended') context.resume();
-        
         const source = context.createMediaElementSource(audio);
         const bass = context.createBiquadFilter(); bass.type = "lowshelf"; bass.frequency.value = 250;
         const mids = context.createBiquadFilter(); mids.type = "peaking"; mids.frequency.value = 1000; mids.Q.value = 0.8;
         const treble = context.createBiquadFilter(); treble.type = "highshelf"; treble.frequency.value = 3000;
-        
         source.connect(bass).connect(mids).connect(treble).connect(context.destination);
         set({ audioNodes: { context, source, bass, mids, treble }, isAudioGraphConnected: true });
-        console.log("✅ Audio Graph Primed");
-
-        if ('wakeLock' in navigator) {
-            // @ts-ignore
-            navigator.wakeLock.request('screen').catch(() => {});
-        }
-
+        
         audio.ontimeupdate = () => set({ currentTime: audio.currentTime });
         audio.onloadedmetadata = () => {
             set({ duration: audio.duration });
             get().updateMediaSession();
         };
         audio.onended = () => { if(get().isAdmin) get().nextTrack(); };
-        // Sync state when audio actually starts playing/pausing to avoid loops
-        audio.onplay = () => set({ isPlaying: true });
-        audio.onpause = () => set({ isPlaying: false });
-
-    } catch (e) { console.error("Audio Prime Failed:", e); }
+        audio.onplay = () => { set({ isPlaying: true }); get().updateMediaSession(); };
+        audio.onpause = () => { set({ isPlaying: false }); get().updateMediaSession(); };
+        
+        // Initial unlock for iOS
+        audio.play().then(() => audio.pause()).catch(() => {});
+    } catch (e) { console.error("Could not prime audio.", e); }
   },
 
   updateMediaSession: () => {
-    if (!('mediaSession' in navigator)) return;
+    if (typeof navigator === 'undefined' || !('mediaSession' in navigator)) return;
     const { playlist, currentTrackIndex, isPlaying } = get();
     const track = playlist[currentTrackIndex];
     if (!track) return;
-
-    try {
-        navigator.mediaSession.metadata = new MediaMetadata({
-            title: track.name,
-            artist: track.artist,
-            artwork: [{ src: '/favicon.ico', sizes: '96x96', type: 'image/png' }]
-        });
-        navigator.mediaSession.playbackState = isPlaying ? "playing" : "paused";
-        
-        navigator.mediaSession.setActionHandler('play', () => get().isAdmin && get().playPause());
-        navigator.mediaSession.setActionHandler('pause', () => get().isAdmin && get().playPause());
-        navigator.mediaSession.setActionHandler('nexttrack', () => get().isAdmin && get().nextTrack());
-        navigator.mediaSession.setActionHandler('previoustrack', () => get().isAdmin && get().prevTrack());
-    } catch(e) {}
+    navigator.mediaSession.metadata = new MediaMetadata({
+      title: track.name, artist: track.artist,
+      artwork: [{ src: '/favicon.ico', sizes: '96x96', type: 'image/png' }]
+    });
+    navigator.mediaSession.playbackState = isPlaying ? "playing" : "paused";
   },
   
-  _emitStateUpdate: (overrideState?: Partial<SyncState>) => {
+  _emitStateUpdate: (overrideState) => {
     const state = get();
     if (!state.socket || !state.isAdmin) return;
     state.socket.emit('update_player_state', { 
         room_code: state.roomCode, 
-        state: { 
-            isPlaying: state.isPlaying, 
-            trackIndex: state.currentTrackIndex, 
-            currentTime: state.audioElement?.currentTime ?? 0, 
-            volume: state.volume, 
-            equalizer: state.equalizer, 
-            serverTimestamp: Date.now() / 1000, 
-            ...overrideState 
-        } 
+        state: { isPlaying: state.isPlaying, trackIndex: state.currentTrackIndex, currentTime: state.audioElement?.currentTime ?? 0, volume: state.volume, equalizer: state.equalizer, ...overrideState } 
     });
   },
 
@@ -179,56 +153,30 @@ export const useRoomStore = create<RoomState>()((set, get) => ({
     const { audioElement, currentTrackIndex, isPlaying, isAdmin, playlist } = get();
     if (!audioElement || isAdmin) return;
 
-    // 1. Sync Track
     if (state.trackIndex !== undefined && state.trackIndex !== currentTrackIndex) {
         const track = playlist[state.trackIndex];
-        if (track?.audioUrl) { 
-            audioElement.src = track.audioUrl; 
-            // Important: Don't call play() here. Wait for isPlaying check.
-        }
+        if (track?.audioUrl) { audioElement.src = track.audioUrl; audioElement.load(); }
         set({ currentTrackIndex: state.trackIndex });
-        get().updateMediaSession();
     }
-
-    // 2. Sync Time (Drift Correction)
-    if (state.currentTime !== undefined) {
-        const drift = Math.abs(state.currentTime - audioElement.currentTime);
-        if (drift > 2.0) audioElement.currentTime = state.currentTime; 
+    if (state.currentTime !== undefined && Math.abs(state.currentTime - audioElement.currentTime) > 3.0) {
+        audioElement.currentTime = state.currentTime;
     }
-
-    // 3. Sync Play/Pause (SAFE PLAY)
     if (state.isPlaying !== undefined && state.isPlaying !== isPlaying) {
         set({ isPlaying: state.isPlaying });
-        if (state.isPlaying) {
-            const playPromise = audioElement.play();
-            if (playPromise !== undefined) {
-                playPromise.catch(error => {
-                    console.log("Autoplay prevented or interrupted:", error);
-                });
-            }
-        } else {
-            audioElement.pause();
-        }
-        get().updateMediaSession();
+        state.isPlaying ? audioElement.play().catch(()=>{}) : audioElement.pause();
     }
+    if (state.equalizer) get().setEqualizer(state.equalizer);
   },
 
-  setRoomData: (data) => set({ playlistTitle: data.title, playlist: data.playlist, isLoading: false, error: null }),
+  setRoomData: (data) => set({ playlistTitle: data.title, playlist: data.playlist }),
 
   playPause: () => {
     if (!get().isAdmin) return;
     const { audioElement, isPlaying } = get();
-    // Optimistic UI update
-    set({ isPlaying: !isPlaying });
-    
-    if (!isPlaying) {
-        audioElement?.play().catch(console.error);
-    } else {
-        audioElement?.pause();
-    }
-    
-    get()._emitStateUpdate({ isPlaying: !isPlaying, currentTime: audioElement?.currentTime });
-    get().updateMediaSession();
+    const nextMode = !isPlaying;
+    set({ isPlaying: nextMode });
+    nextMode ? audioElement?.play().catch(e => console.log(e)) : audioElement?.pause();
+    get()._emitStateUpdate({ isPlaying: nextMode, currentTime: audioElement?.currentTime });
   },
   
   selectTrack: (index) => {
@@ -237,46 +185,38 @@ export const useRoomStore = create<RoomState>()((set, get) => ({
     const track = playlist[index];
     if (track?.audioUrl && audioElement) {
       audioElement.src = track.audioUrl;
-      audioElement.play().catch(console.error);
+      audioElement.play().catch(e => console.log(e));
       set({ currentTrackIndex: index, isPlaying: true });
       get()._emitStateUpdate({ trackIndex: index, currentTime: 0, isPlaying: true });
-      get().updateMediaSession();
     }
   },
 
   nextTrack: () => get().selectTrack((get().currentTrackIndex + 1) % get().playlist.length),
   prevTrack: () => get().selectTrack((get().currentTrackIndex - 1 + get().playlist.length) % get().playlist.length),
   
-  setVolume: (volume) => {
-    const { audioElement } = get();
-    set({ volume });
-    if (audioElement) audioElement.volume = volume / 100;
-    if(get().isAdmin) get()._emitStateUpdate({ volume });
+  setVolume: (v) => {
+    set({ volume: v });
+    if (get().audioElement) get().audioElement!.volume = v / 100;
   },
 
-  setEqualizer: (settings) => {
-    set({equalizer: settings})
+  setEqualizer: (s) => {
+    set({ equalizer: s });
     const { bass, mids, treble } = get().audioNodes;
     if (bass && mids && treble) {
-        bass.gain.value = settings.bass;
-        mids.gain.value = settings.mids;
-        treble.gain.value = settings.treble;
+        bass.gain.value = s.bass; mids.gain.value = s.mids; treble.gain.value = s.treble;
     }
-    get()._emitStateUpdate({ equalizer: settings });
+    if (get().isAdmin) get()._emitStateUpdate({ equalizer: s });
   },
 
-  uploadFile: async (file: File, title?: string, artist?: string) => {
+  uploadFile: async (file, title, artist) => {
       const state = get();
       const formData = new FormData();
       formData.append('file', file);
-      
       const res = await fetch(`${API_URL}/api/upload-local`, { method: 'POST', body: formData });
-      if (!res.ok) throw new Error(`Upload failed: ${await res.text()}`);
       const { audioUrl } = await res.json();
-      
       await fetch(`${API_URL}/api/room/${state.roomCode}/add-upload`, {
           method: 'POST', headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ title: title || file.name.replace(/\.[^/.]+$/, ''), artist: artist || 'Unknown Artist', audioUrl })
+          body: JSON.stringify({ title: title || file.name, artist: artist || 'Local', audioUrl })
       });
   },
 }));
