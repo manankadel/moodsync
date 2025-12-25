@@ -47,3 +47,14 @@ zope.event==5.1.1
 yt-dlp>=2024.12.01
 syncedlyrics==0.9.0
 beautifulsoup4==4.12.3
+flask==3.0.2
+flask-socketio==5.3.6
+flask-cors==4.0.0
+python-dotenv==1.0.1
+redis==5.0.1
+eventlet==0.35.2
+gunicorn==21.2.0
+yt-dlp
+syncedlyrics
+google-api-python-client
+werkzeug==3.0.1
