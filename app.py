@@ -1,4 +1,4 @@
-# --- CRITICAL FIX: MUST BE THE FIRST LINES ---
+# --- CRITICAL STARTUP ---
 import eventlet
 eventlet.monkey_patch()
 
@@ -59,7 +59,7 @@ def serve_file_stream(filename):
     path = os.path.join(os.path.abspath(UPLOAD_FOLDER), filename)
     if not os.path.exists(path):
         return jsonify({'error': 'File not found'}), 404
-    return send_file(path, conditional=True) # conditional=True handles Range requests automatically
+    return send_file(path, conditional=True)
 
 @app.route('/generate', methods=['POST'])
 def generate():
@@ -89,13 +89,11 @@ def upload_local():
 @app.route('/api/yt-search', methods=['POST'])
 def search_yt():
     q = request.json.get('query')
-    # 1. Try API
     if youtube_client:
         try:
             res = youtube_client.search().list(q=q, part="snippet", maxResults=5, type="video").execute()
             return jsonify({'results': [{'id': i['id']['videoId'], 'title': i['snippet']['title'], 'artist': i['snippet']['channelTitle'], 'thumbnail': i['snippet']['thumbnails']['high']['url']} for i in res['items']]})
         except: pass
-    # 2. Try Scraping (Might be blocked, but handled safely)
     try:
         with yt_dlp.YoutubeDL({'quiet': True, 'default_search': 'ytsearch5', 'noplaylist': True}) as ydl:
             info = ydl.extract_info(q, download=False)
@@ -117,7 +115,6 @@ def add_yt(room_code):
                 'outtmpl': path, 
                 'postprocessors': [{'key': 'FFmpegExtractAudio','preferredcodec': 'mp3'}], 
                 'quiet': True,
-                # Try to look like an iPhone to bypass blocks
                 'extractor_args': {'youtube': {'player_client': ['ios']}}
             }
             with yt_dlp.YoutubeDL(opts) as ydl: ydl.download([f"https://www.youtube.com/watch?v={v_id}"])
