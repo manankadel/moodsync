@@ -1,24 +1,27 @@
 FROM python:3.11-slim
 
-# Install FFmpeg (Required for audio processing) and Git
+# Install FFmpeg and Git
 RUN apt-get update && \
     apt-get install -y ffmpeg git && \
     apt-get clean
 
 WORKDIR /app
 
-# Copy requirements and force install
+# Upgrade pip first (Critical fix for package finding)
+RUN pip install --upgrade pip
+
+# Install dependencies
 COPY requirements.txt .
 RUN pip install --no-cache-dir --ignore-installed -r requirements.txt
 
-# Copy App Code
+# Copy App
 COPY . .
 
-# Create uploads folder with write permissions
+# Permissions
 RUN mkdir -p uploads && chmod 777 uploads
 
 # Expose Port
 EXPOSE 5001
 
-# Start Server using Eventlet (Fixes socket crashes)
+# Run with Eventlet
 CMD ["gunicorn", "--worker-class", "eventlet", "--timeout", "120", "-w", "1", "--bind", "0.0.0.0:5001", "app:app"]
