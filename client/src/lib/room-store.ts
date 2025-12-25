@@ -31,6 +31,7 @@ interface RoomState {
   currentTime: number; 
   duration: number; 
   isDisconnected: boolean;
+  statusMessage: string | null; // For "Downloading..." updates
   
   connect: (code: string, name: string) => void;
   disconnect: () => void;
@@ -46,8 +47,8 @@ interface RoomState {
   setLoading: (l: boolean) => void;
   setError: (e: string | null) => void;
   setIsSeeking: (s: boolean) => void;
-  updateMediaSession: () => void; // Placeholder for UI compatibility
-  _emitStateUpdate: (s: any) => void; // Internal use
+  updateMediaSession: () => void;
+  _emitStateUpdate: (s: any) => void;
 }
 
 export const useRoomStore = createWithEqualityFn<RoomState>()((set, get) => ({
@@ -56,7 +57,7 @@ export const useRoomStore = createWithEqualityFn<RoomState>()((set, get) => ({
   playlist: [], currentTrackIndex: 0, isPlaying: false, isSeeking: false,
   isAudioGraphConnected: false, roomCode: '', playlistTitle: '', users: [], username: '',
   volume: 80, isLoading: false, error: null, isAdmin: false,
-  currentTime: 0, duration: 0, isDisconnected: false,
+  currentTime: 0, duration: 0, isDisconnected: false, statusMessage: null,
 
   setLoading: (l) => set({ isLoading: l }),
   setError: (e) => set({ error: e, isLoading: false }),
@@ -65,7 +66,7 @@ export const useRoomStore = createWithEqualityFn<RoomState>()((set, get) => ({
   connect: (code, name) => {
     if (get().socket) return;
     set({ username: name, roomCode: code });
-    // Polling + WebSocket ensures connection works on restrictive networks
+    // Polling + WebSocket ensures connection works on restrictive networks like Render
     const socket = io(API_URL, { transports: ['polling', 'websocket'] });
     set({ socket });
 
@@ -73,9 +74,25 @@ export const useRoomStore = createWithEqualityFn<RoomState>()((set, get) => ({
         socket.emit('join_room', { room_code: code, username: name });
         set({ isDisconnected: false });
     });
-    socket.on('update_user_list', (users) => set({ users, isAdmin: users.find((u: any) => u.name === get().username)?.isAdmin ?? false }));
-    socket.on('sync_player_state', (s) => get().syncPlayerState(s));
-    socket.on('refresh_playlist', (d) => set({ playlist: d.playlist, playlistTitle: d.title }));
+    
+    socket.on('update_user_list', (users: any) => {
+        set({ users, isAdmin: users.find((u: any) => u.name === name)?.isAdmin ?? false });
+    });
+
+    socket.on('status_update', (data: any) => {
+        set({ statusMessage: data.message });
+        if(data.error) alert(data.message);
+        // Clear message after 3 seconds if it's an error
+        if(data.error) setTimeout(() => set({ statusMessage: null }), 3000);
+    });
+
+    socket.on('sync_player_state', (s: any) => get().syncPlayerState(s));
+    
+    socket.on('refresh_playlist', (d: any) => {
+        set({ playlist: d.playlist, playlistTitle: d.title });
+        if (d.current_state) get().syncPlayerState(d.current_state);
+    });
+    
     socket.on('disconnect', () => set({ isDisconnected: true }));
   },
 
@@ -90,38 +107,64 @@ export const useRoomStore = createWithEqualityFn<RoomState>()((set, get) => ({
     if (!audio) return;
     audio.crossOrigin = "anonymous";
     audio.ontimeupdate = () => set({ currentTime: audio.currentTime });
-    audio.onloadedmetadata = () => set({ duration: audio.duration });
+    audio.onloadedmetadata = () => {
+        set({ duration: audio.duration });
+        get().updateMediaSession();
+    };
     audio.onended = () => get().isAdmin && get().nextTrack();
     
-    // Unlock iOS Audio
-    audio.play().then(() => audio.pause()).catch(() => {});
+    // Silent play to unlock iOS Audio Context
+    audio.play().then(() => audio.pause()).catch((e: any) => {});
   },
 
-  syncPlayerState: (state) => {
+  syncPlayerState: (state: any) => {
     const { audioElement, currentTrackIndex, isPlaying, playlist } = get();
     if (!audioElement) return;
 
-    // Sync Track
+    // 1. Sync Track
     if (state.trackIndex !== undefined && state.trackIndex !== currentTrackIndex) {
         set({ currentTrackIndex: state.trackIndex });
         if (playlist[state.trackIndex]?.audioUrl) {
             audioElement.src = playlist[state.trackIndex].audioUrl!;
             audioElement.load();
         }
+        get().updateMediaSession();
     }
-    // Sync Time (Allow 2s drift)
-    if (state.currentTime !== undefined && Math.abs(audioElement.currentTime - state.currentTime) > 2) {
-        audioElement.currentTime = state.currentTime;
-    }
-    // Sync PlayState
-    if (state.isPlaying !== undefined && state.isPlaying !== isPlaying) {
-        set({ isPlaying: state.isPlaying });
-        if (state.isPlaying) {
-            audioElement.play().catch((e) => console.log("Auto-play prevented", e));
-        } else {
-            audioElement.pause();
+
+    // 2. Sync Play/Pause & Wall-Clock Time
+    if (state.isPlaying) {
+        set({ isPlaying: true });
+        
+        // WALL CLOCK SYNC: Calculate where we SHOULD be
+        if (state.startTimestamp) {
+            const serverNow = Date.now() / 1000; 
+            const correctTime = serverNow - state.startTimestamp;
+            
+            // Only jump if drift is > 0.5s to prevent stuttering
+            if (Math.abs(audioElement.currentTime - correctTime) > 0.5) {
+                audioElement.currentTime = correctTime;
+            }
+        }
+        
+        audioElement.play().catch((e: any) => console.log("Auto-play prevented", e));
+    } else {
+        set({ isPlaying: false });
+        audioElement.pause();
+        // If paused, sync to the pausedAt time
+        if (state.pausedAt !== undefined) {
+             if (Math.abs(audioElement.currentTime - state.pausedAt) > 0.5) {
+                 audioElement.currentTime = state.pausedAt;
+             }
         }
     }
+    
+    // 3. Volume
+    if (state.volume !== undefined) {
+        set({ volume: state.volume });
+        audioElement.volume = state.volume / 100;
+    }
+    
+    get().updateMediaSession();
   },
 
   setRoomData: (data) => set({ playlistTitle: data.title, playlist: data.playlist }),
@@ -129,7 +172,14 @@ export const useRoomStore = createWithEqualityFn<RoomState>()((set, get) => ({
   playPause: () => {
     const { isPlaying, isAdmin, audioElement } = get();
     if (!isAdmin || !audioElement) return;
-    get()._emitStateUpdate({ isPlaying: !isPlaying, currentTime: audioElement.currentTime });
+    
+    if (isPlaying) {
+        // Pausing: Record exactly where we stopped
+        get()._emitStateUpdate({ isPlaying: false, pausedAt: audioElement.currentTime });
+    } else {
+        // Playing: Send current position, server will calculate startTimestamp
+        get()._emitStateUpdate({ isPlaying: true, pausedAt: audioElement.currentTime });
+    }
   },
 
   selectTrack: (index) => {
@@ -143,6 +193,7 @@ export const useRoomStore = createWithEqualityFn<RoomState>()((set, get) => ({
   setVolume: (v) => {
     set({ volume: v });
     if (get().audioElement) get().audioElement!.volume = v / 100;
+    get()._emitStateUpdate({ volume: v });
   },
 
   uploadFile: async (file, title, artist) => {
@@ -160,6 +211,18 @@ export const useRoomStore = createWithEqualityFn<RoomState>()((set, get) => ({
       get().socket?.emit('update_player_state', { room_code: get().roomCode, state });
   },
   
-  updateMediaSession: () => {}, // Kept for API shape, can re-implement later
-  setEqualizer: () => {} // Kept for API shape
+  updateMediaSession: () => {
+      if (typeof navigator === 'undefined' || !('mediaSession' in navigator)) return;
+      const { playlist, currentTrackIndex, isPlaying } = get();
+      const track = playlist[currentTrackIndex];
+      if (!track) return;
+      navigator.mediaSession.metadata = new MediaMetadata({
+        title: track.name, artist: track.artist,
+        artwork: [{ src: '/favicon.ico', sizes: '96x96', type: 'image/png' }]
+      });
+      navigator.mediaSession.playbackState = isPlaying ? "playing" : "paused";
+  },
+  
+  // Kept for interface compatibility if used elsewhere
+  setEqualizer: () => {} 
 }));

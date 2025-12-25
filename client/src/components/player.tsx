@@ -15,7 +15,7 @@ interface PlayerProps {
 export default function Player({ title, artist, isPlaying, volume, duration, onPlayPause, onNext, onPrev, onVolumeChange }: PlayerProps) {
   const VolumeIcon = volume === 0 ? VolumeX : volume < 50 ? Volume1 : Volume2;
   const [showEqualizer, setShowEqualizer] = useState(false);
-  const { currentTime, isAdmin, isSeeking, setIsSeeking, _emitStateUpdate, audioElement } = useRoomStore();
+  const { currentTime, isAdmin, isSeeking, setIsSeeking, _emitStateUpdate, audioElement, statusMessage } = useRoomStore();
   const [seekValue, setSeekValue] = useState(0);
   const [isBuffering, setIsBuffering] = useState(false);
 
@@ -37,9 +37,9 @@ export default function Player({ title, artist, isPlaying, volume, duration, onP
   const handleSeekEnd = (e: React.MouseEvent<HTMLInputElement>) => {
     if (!isAdmin || !audioElement) return;
     const seekTime = (Number(e.currentTarget.value) / 100) * duration;
-    audioElement.currentTime = seekTime;
+    // For manual seeking, we update the timestamp on server
+    _emitStateUpdate({ currentTime: seekTime, isPlaying: true });
     setIsSeeking(false);
-    setTimeout(() => _emitStateUpdate({ currentTime: seekTime }), 150);
   };
   
   const formatTime = (s: number) => isNaN(s) || s < 0 ? '0:00' : `${Math.floor(s/60)}:${Math.floor(s%60).toString().padStart(2,'0')}`;
@@ -48,6 +48,16 @@ export default function Player({ title, artist, isPlaying, volume, duration, onP
     <motion.footer initial={{ y: 100 }} animate={{ y: 0 }} className="fixed bottom-0 left-0 right-0 z-50 h-auto sm:h-28 bg-black/80 backdrop-blur-xl border-t border-white/10 p-2 shadow-[0_-10px_40px_rgba(0,0,0,0.5)]">
       <div className="mx-auto max-w-screen-lg h-full flex flex-col sm:flex-row items-center justify-center relative">
         <BeatVisualizer />
+        
+        {/* STATUS MESSAGE OVERLAY */}
+        <AnimatePresence>
+            {statusMessage && (
+                <motion.div initial={{opacity:0, y: 10}} animate={{opacity:1, y:0}} exit={{opacity:0}} className="absolute -top-12 left-1/2 -translate-x-1/2 bg-cyan-600/90 text-white px-4 py-2 rounded-full text-xs font-bold shadow-lg flex items-center gap-2 z-50 whitespace-nowrap">
+                    <Loader2 size={12} className="animate-spin" /> {statusMessage}
+                </motion.div>
+            )}
+        </AnimatePresence>
+
         <div className="grid grid-cols-[1fr_auto_1fr] sm:grid-cols-[1fr_2fr_1fr] items-center gap-2 sm:gap-4 w-full relative z-10">
           <div className="flex items-center gap-2 sm:gap-4 min-w-0">
             <div className="h-12 w-12 sm:h-14 sm:w-14 rounded-xl bg-gradient-to-br from-gray-800 to-gray-900 flex-shrink-0 flex items-center justify-center text-xl sm:text-2xl shadow-inner border border-white/5">
@@ -60,8 +70,8 @@ export default function Player({ title, artist, isPlaying, volume, duration, onP
           </div>
           
           <div className="flex flex-col items-center gap-2">
-            {/* SYNC INDICATOR */}
-            {isBuffering && isPlaying && (
+            {/* BUFFERING INDICATOR */}
+            {isBuffering && isPlaying && !statusMessage && (
                 <span className="absolute -top-3 text-[10px] text-cyan-400 flex items-center gap-1 font-bold tracking-widest bg-black/50 px-2 rounded-full border border-cyan-500/20">
                     <Loader2 size={10} className="animate-spin" /> SYNCING
                 </span>
