@@ -19,7 +19,7 @@ export default function Player({ title, artist, isPlaying, volume, duration, onP
   const [seekValue, setSeekValue] = useState(0);
   const [isBuffering, setIsBuffering] = useState(false);
 
-  // Buffer Check
+  // Sync Buffering State
   useEffect(() => {
     if (!audioElement) return;
     const onWaiting = () => setIsBuffering(true);
@@ -51,7 +51,7 @@ export default function Player({ title, artist, isPlaying, volume, duration, onP
         <div className="grid grid-cols-[1fr_auto_1fr] sm:grid-cols-[1fr_2fr_1fr] items-center gap-2 sm:gap-4 w-full relative z-10">
           <div className="flex items-center gap-2 sm:gap-4 min-w-0">
             <div className="h-12 w-12 sm:h-14 sm:w-14 rounded-xl bg-gradient-to-br from-gray-800 to-gray-900 flex-shrink-0 flex items-center justify-center text-xl sm:text-2xl shadow-inner border border-white/5">
-                {isBuffering && isPlaying ? <Loader2 className="animate-spin text-cyan-400" /> : '🎵'}
+                🎵
             </div>
             <div className="min-w-0">
                 <p className="font-bold truncate text-sm sm:text-base text-white">{title}</p>
@@ -60,6 +60,13 @@ export default function Player({ title, artist, isPlaying, volume, duration, onP
           </div>
           
           <div className="flex flex-col items-center gap-2">
+            {/* SYNC INDICATOR */}
+            {isBuffering && isPlaying && (
+                <span className="absolute -top-3 text-[10px] text-cyan-400 flex items-center gap-1 font-bold tracking-widest bg-black/50 px-2 rounded-full border border-cyan-500/20">
+                    <Loader2 size={10} className="animate-spin" /> SYNCING
+                </span>
+            )}
+
             <div className="flex items-center gap-4 sm:gap-6">
               <button onClick={onPrev} disabled={!isAdmin} className="disabled:opacity-30 text-gray-400 hover:text-white transition-colors p-2 active:scale-95"><SkipBack size={24} /></button>
               <button onClick={onPlayPause} disabled={!isAdmin} className="h-12 w-12 sm:h-14 sm:w-14 flex items-center justify-center rounded-full bg-white text-black disabled:opacity-50 hover:scale-105 active:scale-95 transition-all shadow-lg shadow-white/10">

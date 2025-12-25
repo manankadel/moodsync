@@ -1,23 +1,71 @@
-import { create } from 'zustand';
 import { createWithEqualityFn } from 'zustand/traditional';
 import { io, Socket } from 'socket.io-client';
 
 const API_URL = process.env.NEXT_PUBLIC_API_URL || 'http://localhost:5001';
 
-export const useRoomStore = createWithEqualityFn<any>()((set, get) => ({
+export interface Song { 
+    name: string; 
+    artist: string; 
+    isUpload: boolean; 
+    audioUrl: string | null; 
+    albumArt: string | null; 
+    lyrics?: string | null;
+}
+
+interface RoomState {
+  socket: Socket | null; 
+  audioElement: HTMLAudioElement | null;
+  playlist: Song[]; 
+  currentTrackIndex: number; 
+  isPlaying: boolean; 
+  isSeeking: boolean;
+  isAudioGraphConnected: boolean; 
+  roomCode: string; 
+  playlistTitle: string; 
+  users: any[]; 
+  username: string;
+  volume: number; 
+  isLoading: boolean; 
+  error: string | null; 
+  isAdmin: boolean;
+  currentTime: number; 
+  duration: number; 
+  isDisconnected: boolean;
+  
+  connect: (code: string, name: string) => void;
+  disconnect: () => void;
+  primePlayer: () => void;
+  syncPlayerState: (state: any) => void;
+  setRoomData: (data: any) => void;
+  selectTrack: (index: number) => void;
+  playPause: () => void;
+  nextTrack: () => void;
+  prevTrack: () => void;
+  setVolume: (v: number) => void;
+  uploadFile: (file: File, title?: string, artist?: string) => Promise<any>;
+  setLoading: (l: boolean) => void;
+  setError: (e: string | null) => void;
+  setIsSeeking: (s: boolean) => void;
+  updateMediaSession: () => void; // Placeholder for UI compatibility
+  _emitStateUpdate: (s: any) => void; // Internal use
+}
+
+export const useRoomStore = createWithEqualityFn<RoomState>()((set, get) => ({
   socket: null,
   audioElement: (typeof window !== 'undefined') ? new Audio() : null,
-  playlist: [], currentTrackIndex: 0, isPlaying: false,
-  roomCode: '', playlistTitle: '', users: [], username: '',
+  playlist: [], currentTrackIndex: 0, isPlaying: false, isSeeking: false,
+  isAudioGraphConnected: false, roomCode: '', playlistTitle: '', users: [], username: '',
   volume: 80, isLoading: false, error: null, isAdmin: false,
   currentTime: 0, duration: 0, isDisconnected: false,
 
-  setLoading: (l: boolean) => set({ isLoading: l }),
-  setError: (e: string) => set({ error: e, isLoading: false }),
+  setLoading: (l) => set({ isLoading: l }),
+  setError: (e) => set({ error: e, isLoading: false }),
+  setIsSeeking: (s) => set({ isSeeking: s }),
 
-  connect: (code: string, name: string) => {
+  connect: (code, name) => {
     if (get().socket) return;
     set({ username: name, roomCode: code });
+    // Polling + WebSocket ensures connection works on restrictive networks
     const socket = io(API_URL, { transports: ['polling', 'websocket'] });
     set({ socket });
 
@@ -25,10 +73,16 @@ export const useRoomStore = createWithEqualityFn<any>()((set, get) => ({
         socket.emit('join_room', { room_code: code, username: name });
         set({ isDisconnected: false });
     });
-    socket.on('update_user_list', (users: any) => set({ users, isAdmin: users.find((u: any) => u.name === get().username)?.isAdmin ?? false }));
-    socket.on('sync_player_state', (s: any) => get().syncPlayerState(s));
-    socket.on('refresh_playlist', (d: any) => set({ playlist: d.playlist, playlistTitle: d.title }));
+    socket.on('update_user_list', (users) => set({ users, isAdmin: users.find((u: any) => u.name === get().username)?.isAdmin ?? false }));
+    socket.on('sync_player_state', (s) => get().syncPlayerState(s));
+    socket.on('refresh_playlist', (d) => set({ playlist: d.playlist, playlistTitle: d.title }));
     socket.on('disconnect', () => set({ isDisconnected: true }));
+  },
+
+  disconnect: () => {
+    get().socket?.disconnect();
+    get().audioElement?.pause();
+    set({ socket: null });
   },
 
   primePlayer: () => {
@@ -38,11 +92,12 @@ export const useRoomStore = createWithEqualityFn<any>()((set, get) => ({
     audio.ontimeupdate = () => set({ currentTime: audio.currentTime });
     audio.onloadedmetadata = () => set({ duration: audio.duration });
     audio.onended = () => get().isAdmin && get().nextTrack();
-    // Silent play to unlock iOS
+    
+    // Unlock iOS Audio
     audio.play().then(() => audio.pause()).catch(() => {});
   },
 
-  syncPlayerState: (state: any) => {
+  syncPlayerState: (state) => {
     const { audioElement, currentTrackIndex, isPlaying, playlist } = get();
     if (!audioElement) return;
 
@@ -50,11 +105,11 @@ export const useRoomStore = createWithEqualityFn<any>()((set, get) => ({
     if (state.trackIndex !== undefined && state.trackIndex !== currentTrackIndex) {
         set({ currentTrackIndex: state.trackIndex });
         if (playlist[state.trackIndex]?.audioUrl) {
-            audioElement.src = playlist[state.trackIndex].audioUrl;
+            audioElement.src = playlist[state.trackIndex].audioUrl!;
             audioElement.load();
         }
     }
-    // Sync Time
+    // Sync Time (Allow 2s drift)
     if (state.currentTime !== undefined && Math.abs(audioElement.currentTime - state.currentTime) > 2) {
         audioElement.currentTime = state.currentTime;
     }
@@ -62,34 +117,35 @@ export const useRoomStore = createWithEqualityFn<any>()((set, get) => ({
     if (state.isPlaying !== undefined && state.isPlaying !== isPlaying) {
         set({ isPlaying: state.isPlaying });
         if (state.isPlaying) {
-            const p = audioElement.play();
-            if (p) p.catch((e: any) => console.log("Play interrupted", e));
+            audioElement.play().catch((e) => console.log("Auto-play prevented", e));
         } else {
             audioElement.pause();
         }
     }
   },
 
+  setRoomData: (data) => set({ playlistTitle: data.title, playlist: data.playlist }),
+
   playPause: () => {
-    const { isPlaying, isAdmin } = get();
-    if (!isAdmin) return;
-    get()._emit({ isPlaying: !isPlaying, currentTime: get().audioElement.currentTime });
+    const { isPlaying, isAdmin, audioElement } = get();
+    if (!isAdmin || !audioElement) return;
+    get()._emitStateUpdate({ isPlaying: !isPlaying, currentTime: audioElement.currentTime });
   },
 
-  selectTrack: (index: number) => {
+  selectTrack: (index) => {
     if (!get().isAdmin) return;
-    get()._emit({ trackIndex: index, isPlaying: true, currentTime: 0 });
+    get()._emitStateUpdate({ trackIndex: index, isPlaying: true, currentTime: 0 });
   },
 
   nextTrack: () => get().selectTrack((get().currentTrackIndex + 1) % get().playlist.length),
   prevTrack: () => get().selectTrack((get().currentTrackIndex - 1 + get().playlist.length) % get().playlist.length),
   
-  setVolume: (v: number) => {
+  setVolume: (v) => {
     set({ volume: v });
-    if (get().audioElement) get().audioElement.volume = v / 100;
+    if (get().audioElement) get().audioElement!.volume = v / 100;
   },
 
-  uploadFile: async (file: File, title: string, artist: string) => {
+  uploadFile: async (file, title, artist) => {
       const fd = new FormData();
       fd.append('file', file);
       const res = await fetch(`${API_URL}/api/upload-local`, { method: 'POST', body: fd });
@@ -100,7 +156,10 @@ export const useRoomStore = createWithEqualityFn<any>()((set, get) => ({
       });
   },
 
-  _emit: (state: any) => {
+  _emitStateUpdate: (state) => {
       get().socket?.emit('update_player_state', { room_code: get().roomCode, state });
-  }
+  },
+  
+  updateMediaSession: () => {}, // Kept for API shape, can re-implement later
+  setEqualizer: () => {} // Kept for API shape
 }));
