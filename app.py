@@ -52,22 +52,22 @@ def serve_file(filename):
     response = send_from_directory(UPLOAD_FOLDER, filename)
     response.headers['Access-Control-Allow-Origin'] = '*'
     response.headers['Accept-Ranges'] = 'bytes'
+    response.headers['Cache-Control'] = 'public, max-age=31536000'
     return response
 
 @app.route('/generate', methods=['POST'])
 def generate():
-    if not r: return jsonify({'error': 'DB Error'}), 500
+    if not r: return jsonify({'error': 'Server DB Error'}), 500
     while True:
         code = ''.join(random.choices(string.ascii_uppercase + string.digits, k=6))
         if not r.exists(f"room:{code}"): break
     
     data = {
-        'playlist': [], 
-        'title': "Sonic Space", 
-        'users': {}, 
+        'playlist': [], 'title': "Sonic Space", 'users': {}, 'admin_sid': None,
         'current_state': {
             'isPlaying': False, 'trackIndex': 0, 'volume': 80, 
-            'startTimestamp': 0, 'pausedAt': 0
+            'startTimestamp': 0, 'pausedAt': 0,
+            'isCollaborative': False # Default: Admin only
         }
     }
     safe_set(f"room:{code}", json.dumps(data))
@@ -75,9 +75,9 @@ def generate():
 
 @app.route('/api/room/<code_in>')
 def get_room(code_in):
-    if not r: return jsonify({'error': 'DB Error'}), 500
+    if not r: return jsonify({'error': 'Server DB Error'}), 500
     data = safe_get(f"room:{code_in.upper()}")
-    resp = json.loads(data) if data else {'error': 'Not Found'}
+    resp = json.loads(data) if data else {'error': 'Room Not Found'}
     if 'error' not in resp: resp['serverTime'] = time.time()
     return jsonify(resp)
 
@@ -97,23 +97,39 @@ def search_yt():
     try:
         results = ytmusic.search(q, filter="songs", limit=5)
         return jsonify({'results': [{
-            'id': i['videoId'], 
-            'title': i['title'], 
-            'artist': i['artists'][0]['name'], 
-            'thumbnail': i['thumbnails'][-1]['url']
+            'id': i['videoId'], 'title': i['title'], 
+            'artist': i['artists'][0]['name'] if 'artists' in i else 'Unknown', 
+            'thumbnail': i['thumbnails'][-1]['url'] if 'thumbnails' in i else None
         } for i in results if 'videoId' in i]})
-    except:
+    except Exception as e:
         return jsonify({'results': [], 'error': 'Search failed'})
+
+# --- SECURE ADD ROUTES ---
+def check_permission(room_code, sid):
+    data = safe_get(f"room:{room_code}")
+    if not data: return False, None
+    rd = json.loads(data)
+    # Allow if Admin OR Collaborative Mode is ON
+    if rd.get('admin_sid') == sid or rd['current_state'].get('isCollaborative'):
+        return True, rd
+    return False, None
 
 @app.route('/api/room/<code_in>/add-yt', methods=['POST'])
 def add_yt(code_in):
-    room_code = code_in.upper()
-    socketio.emit('status_update', {'message': f"Downloading..."}, to=room_code)
+    room = code_in.upper()
+    data = request.json
+    sid = data.get('sid') # Client must send their Socket ID
+    
+    allowed, rd = check_permission(room, sid)
+    if not allowed:
+        return jsonify({'error': 'Permission denied. Only Admin can add songs.'}), 403
+
+    socketio.emit('status_update', {'message': f"Downloading {data['title']}..."}, to=room)
     try:
-        data = request.json
         vid = data['id']
         filename = f"{vid}.mp3"
         path = os.path.join(UPLOAD_FOLDER, filename)
+        
         if not os.path.exists(path):
             opts = {
                 'format': 'bestaudio/best', 'outtmpl': path, 
@@ -122,55 +138,98 @@ def add_yt(code_in):
                 'extractor_args': {'youtube': {'player_client': ['ios']}}
             }
             with yt_dlp.YoutubeDL(opts) as ydl: ydl.download([f"https://www.youtube.com/watch?v={vid}"])
-        add_track(room_code, data['title'], data['artist'], get_file_url(filename), data['thumbnail'])
-        socketio.emit('status_update', {'message': None}, to=room_code) 
+        
+        # Get Lyrics
+        lyrics = None
+        try: lyrics = syncedlyrics.search(f"{data['title']} {data['artist']}")
+        except: pass
+
+        add_track_logic(room, rd, data['title'], data['artist'], get_file_url(filename), data['thumbnail'], lyrics)
+        socketio.emit('status_update', {'message': None}, to=room)
         return jsonify({'success': True})
-    except Exception as e:
-        socketio.emit('status_update', {'message': "Download failed", 'error': True}, to=room_code)
-        return jsonify({'error': 'Download blocked'}), 500
+    except:
+        socketio.emit('status_update', {'message': "Download failed", 'error': True}, to=room)
+        return jsonify({'error': 'Download failed'}), 500
 
 @app.route('/api/room/<code_in>/add-upload', methods=['POST'])
 def add_upload_route(code_in):
+    room = code_in.upper()
     data = request.json
-    add_track(code_in.upper(), data['title'], data['artist'], data['audioUrl'], None)
+    sid = data.get('sid')
+    
+    allowed, rd = check_permission(room, sid)
+    if not allowed: return jsonify({'error': 'Permission denied'}), 403
+
+    add_track_logic(room, rd, data['title'], data['artist'], data['audioUrl'], None, None)
     return jsonify({'success': True})
 
-def add_track(room_code, title, artist, url, art):
+def add_track_logic(room_code, rd, title, artist, url, art, lyrics):
     key = f"room:{room_code}"
-    if not r: return
+    # Re-lock to ensure atomic update
     with r.lock(f"lock:{key}", timeout=5):
-        rd = json.loads(safe_get(key))
-        rd['playlist'].append({'name': title, 'artist': artist, 'audioUrl': url, 'albumArt': art, 'lyrics': None})
-        if len(rd['playlist']) == 1:
-            rd['current_state']['isPlaying'] = True
-            rd['current_state']['startTimestamp'] = time.time()
-            rd['current_state']['serverTime'] = time.time()
-        safe_set(key, json.dumps(rd))
-        socketio.emit('refresh_playlist', rd, to=room_code)
-        if len(rd['playlist']) == 1: socketio.emit('sync_player_state', rd['current_state'], to=room_code)
+        # Re-fetch latest state inside lock
+        fresh_rd = json.loads(safe_get(key))
+        fresh_rd['playlist'].append({'name': title, 'artist': artist, 'audioUrl': url, 'albumArt': art, 'lyrics': lyrics})
+        
+        if len(fresh_rd['playlist']) == 1:
+            fresh_rd['current_state']['isPlaying'] = True
+            fresh_rd['current_state']['startTimestamp'] = time.time()
+            fresh_rd['current_state']['serverTime'] = time.time()
+            
+        safe_set(key, json.dumps(fresh_rd))
+        socketio.emit('refresh_playlist', fresh_rd, to=room_code)
+        if len(fresh_rd['playlist']) == 1: 
+            socketio.emit('sync_player_state', fresh_rd['current_state'], to=room_code)
+
+# --- SOCKET HANDLERS ---
 
 @socketio.on('join_room')
 def on_join(data):
     room = data['room_code'].upper()
-    join_room(room)
-    if not r: return
-    rd = json.loads(safe_get(f"room:{room}"))
+    username = data.get('username', 'Guest')
     sid = request.sid
-    if not rd.get('admin_sid'): rd['admin_sid'] = sid
-    rd['users'][sid] = {'name': data.get('username'), 'isAdmin': rd['admin_sid'] == sid}
-    safe_set(f"room:{room}", json.dumps(rd))
-    emit('load_current_state', rd['current_state'])
-    emit('update_user_list', list(rd['users'].values()), to=room)
+    join_room(room)
+    
+    if not r: return
+    key = f"room:{room}"
+    
+    with r.lock(f"lock:{key}", timeout=5):
+        rd_json = safe_get(key)
+        if not rd_json: return
+        rd = json.loads(rd_json)
+        
+        is_admin = False
+        if not rd.get('admin_sid'):
+            rd['admin_sid'] = sid
+            is_admin = True
+        elif rd['admin_sid'] == sid:
+            is_admin = True
+            
+        rd['users'][sid] = {'name': username, 'isAdmin': is_admin}
+        safe_set(key, json.dumps(rd))
+        r.set(f"sid:{sid}", room, ex=86400)
+        
+        emit('role_update', {'isAdmin': is_admin, 'sid': sid})
+        emit('load_current_state', rd['current_state'])
+        emit('update_user_list', list(rd['users'].values()), to=room)
 
 @socketio.on('update_player_state')
 def on_update(data):
-    if not r: return
     room = data['room_code'].upper()
-    rd = json.loads(safe_get(f"room:{room}"))
+    sid = request.sid
+    if not r: return
+    key = f"room:{room}"
+    
+    rd_json = safe_get(key)
+    if not rd_json: return
+    rd = json.loads(rd_json)
+    
+    # SECURITY: Only Admin can control playback
+    if rd.get('admin_sid') != sid: return
+
     new_state = data['state']
     
-    # === CRITICAL SYNC LOGIC ===
-    # 1. Update Start Timestamp
+    # Wall Clock Sync Logic
     if new_state.get('isPlaying'):
         if not rd['current_state']['isPlaying']: # Resume
             paused_at = new_state.get('pausedAt', rd['current_state'].get('pausedAt', 0))
@@ -178,16 +237,63 @@ def on_update(data):
         elif 'currentTime' in new_state: # Seek
             new_state['startTimestamp'] = time.time() - new_state['currentTime']
     
-    # 2. Save Paused Position
     if new_state.get('isPlaying') is False:
         new_state['pausedAt'] = new_state.get('currentTime', 0)
 
-    # 3. Inject Server Time for Client Calibration
     new_state['serverTime'] = time.time()
-
     rd['current_state'].update(new_state)
-    safe_set(f"room:{room}", json.dumps(rd))
+    safe_set(key, json.dumps(rd))
     emit('sync_player_state', rd['current_state'], to=room, include_self=False)
+
+@socketio.on('toggle_settings')
+def on_toggle_settings(data):
+    room = data['room_code'].upper()
+    sid = request.sid
+    if not r: return
+    key = f"room:{room}"
+    
+    rd = json.loads(safe_get(key))
+    if rd.get('admin_sid') != sid: return # Security check
+    
+    # Toggle Feature
+    setting = data.get('setting')
+    value = data.get('value')
+    
+    if setting == 'isCollaborative':
+        rd['current_state']['isCollaborative'] = value
+        
+    safe_set(key, json.dumps(rd))
+    # Broadcast new state to everyone (so guests see "Add" buttons appear)
+    emit('sync_player_state', rd['current_state'], to=room)
+
+@socketio.on('disconnect')
+def on_disconnect():
+    sid = request.sid
+    if not r: return
+    room = r.get(f"sid:{sid}")
+    if not room: return
+    r.delete(f"sid:{sid}")
+    
+    key = f"room:{room}"
+    with r.lock(f"lock:{key}", timeout=5):
+        rd_json = safe_get(key)
+        if not rd_json: return
+        rd = json.loads(rd_json)
+        
+        if sid in rd['users']:
+            was_admin = rd['users'][sid]['isAdmin']
+            del rd['users'][sid]
+            
+            if was_admin and rd['users']:
+                new_admin = next(iter(rd['users']))
+                rd['admin_sid'] = new_admin
+                rd['users'][new_admin]['isAdmin'] = True
+                emit('role_update', {'isAdmin': True, 'sid': new_admin}, to=new_admin)
+            elif not rd['users']:
+                rd['admin_sid'] = None
+            
+            safe_set(key, json.dumps(rd))
+            emit('update_user_list', list(rd['users'].values()), to=room)
 
 if __name__ == '__main__':
     socketio.run(app, host='0.0.0.0', port=5001)

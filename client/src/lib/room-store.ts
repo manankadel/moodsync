@@ -4,38 +4,24 @@ import { io, Socket } from 'socket.io-client';
 const API_URL = process.env.NEXT_PUBLIC_API_URL || 'http://localhost:5001';
 
 export interface Song { 
-    name: string; 
-    artist: string; 
-    isUpload: boolean; 
-    audioUrl: string | null; 
-    albumArt: string | null; 
-    lyrics?: string | null;
+    name: string; artist: string; isUpload: boolean; 
+    audioUrl: string | null; albumArt: string | null; lyrics?: string | null;
 }
 
-// Strictly define the State Interface
 interface RoomState {
   socket: Socket | null; 
   audioElement: HTMLAudioElement | null;
-  playlist: Song[]; 
-  currentTrackIndex: number; 
-  isPlaying: boolean; 
-  isSeeking: boolean; // <--- The missing property
-  isAudioGraphConnected: boolean; 
-  roomCode: string; 
-  playlistTitle: string; 
-  users: any[]; 
-  username: string;
-  volume: number; 
-  isLoading: boolean; 
-  error: string | null; 
-  isAdmin: boolean;
-  currentTime: number; 
-  duration: number; 
-  isDisconnected: boolean;
+  playlist: Song[]; currentTrackIndex: number; isPlaying: boolean; 
+  roomCode: string; playlistTitle: string; 
+  users: any[]; username: string; isAdmin: boolean;
+  volume: number; isLoading: boolean; error: string | null;
+  currentTime: number; duration: number; isDisconnected: boolean;
   statusMessage: string | null;
-  clockOffset: number; // Difference between Server time and Local time
+  clockOffset: number; 
+  isSeeking: boolean;
+  isCollaborative: boolean; // NEW
+  needsInteraction: boolean; // NEW: Triggers "Tap to Join"
   
-  // Actions
   connect: (code: string, name: string) => void;
   disconnect: () => void;
   primePlayer: () => void;
@@ -47,9 +33,11 @@ interface RoomState {
   prevTrack: () => void;
   setVolume: (v: number) => void;
   uploadFile: (file: File, title?: string, artist?: string) => Promise<any>;
+  toggleCollaborative: (val: boolean) => void;
   setLoading: (l: boolean) => void;
   setError: (e: string | null) => void;
   setIsSeeking: (s: boolean) => void;
+  setNeedsInteraction: (n: boolean) => void;
   _emitStateUpdate: (s: any) => void;
   updateMediaSession: () => void;
 }
@@ -61,17 +49,17 @@ export const useRoomStore = createWithEqualityFn<RoomState>()((set, get) => ({
   isAudioGraphConnected: false, roomCode: '', playlistTitle: '', users: [], username: '',
   volume: 80, isLoading: false, error: null, isAdmin: false,
   currentTime: 0, duration: 0, isDisconnected: false, 
-  statusMessage: null,
-  clockOffset: 0,
+  statusMessage: null, clockOffset: 0, 
+  isCollaborative: false, needsInteraction: false,
 
   setLoading: (l) => set({ isLoading: l }),
   setError: (e) => set({ error: e, isLoading: false }),
   setIsSeeking: (s) => set({ isSeeking: s }),
+  setNeedsInteraction: (n) => set({ needsInteraction: n }),
 
   connect: (code, name) => {
     if (get().socket) return;
     set({ username: name, roomCode: code });
-    // Use polling+websocket for max reliability on Render
     const socket = io(API_URL, { transports: ['polling', 'websocket'] });
     set({ socket });
 
@@ -80,7 +68,11 @@ export const useRoomStore = createWithEqualityFn<RoomState>()((set, get) => ({
         set({ isDisconnected: false });
     });
     
-    socket.on('update_user_list', (users: any) => set({ users, isAdmin: users.find((u: any) => u.name === name)?.isAdmin ?? false }));
+    socket.on('role_update', (data: { isAdmin: boolean }) => {
+        set({ isAdmin: data.isAdmin });
+    });
+    
+    socket.on('update_user_list', (users: any[]) => set({ users }));
     
     socket.on('status_update', (data: any) => {
         set({ statusMessage: data.message });
@@ -114,60 +106,58 @@ export const useRoomStore = createWithEqualityFn<RoomState>()((set, get) => ({
     };
     audio.onended = () => get().isAdmin && get().nextTrack();
     
-    // Unlock iOS Audio
-    audio.play().then(() => audio.pause()).catch((e: any) => {});
+    // Attempt silent unlock
+    audio.play().then(() => {
+        audio.pause();
+        set({ needsInteraction: false });
+    }).catch(() => {
+        set({ needsInteraction: true });
+    });
   },
 
   setRoomData: (data) => {
-      // CALIBRATE CLOCK: Calculate offset between Server and Client
       if (data.serverTime) {
-          const latency = 0.2; // Assume 200ms latency
+          const latency = 0.2; 
           const offset = (data.serverTime * 1000) - Date.now() + (latency * 1000);
           set({ clockOffset: offset, playlistTitle: data.title, playlist: data.playlist });
-      } else {
-          set({ playlistTitle: data.title, playlist: data.playlist });
+      }
+      if (data.current_state) {
+          set({ isCollaborative: data.current_state.isCollaborative });
       }
   },
 
   syncPlayerState: (state: any) => {
-    const { audioElement, currentTrackIndex, isPlaying, playlist } = get();
+    const { audioElement, currentTrackIndex, isPlaying } = get();
     if (!audioElement) return;
 
-    // 1. Recalculate Clock Sync
-    if (state.serverTime) {
-        const offset = (state.serverTime * 1000) - Date.now();
-        set({ clockOffset: offset });
-    }
+    if (state.isCollaborative !== undefined) set({ isCollaborative: state.isCollaborative });
+    if (state.serverTime) set({ clockOffset: (state.serverTime * 1000) - Date.now() });
 
-    // 2. Sync Track
     if (state.trackIndex !== undefined && state.trackIndex !== currentTrackIndex) {
         set({ currentTrackIndex: state.trackIndex });
-        if (playlist[state.trackIndex]?.audioUrl) {
-            audioElement.src = playlist[state.trackIndex].audioUrl!;
+        if (get().playlist[state.trackIndex]?.audioUrl) {
+            audioElement.src = get().playlist[state.trackIndex].audioUrl!;
             audioElement.load();
         }
         get().updateMediaSession();
     }
 
-    // 3. Sync Play/Pause & Wall-Clock Time
     if (state.isPlaying) {
         set({ isPlaying: true });
-        
-        // === PRECISE SYNC LOGIC ===
         if (state.startTimestamp) {
             const serverNow = (Date.now() + get().clockOffset) / 1000;
             const targetTime = serverNow - state.startTimestamp;
-            
-            // Correction: Only jump if we drift > 0.3s
             if (Math.abs(audioElement.currentTime - targetTime) > 0.3) {
-                // Ensure target is valid
                 if (targetTime >= 0 && targetTime < audioElement.duration) {
                     audioElement.currentTime = targetTime;
                 }
             }
         }
-        
-        audioElement.play().catch((e: any) => console.log("Autoplay blocked", e));
+        // Critical: Handle Browser Auto-Play Policy
+        audioElement.play().catch((e: any) => {
+            console.log("Autoplay prevented:", e);
+            set({ needsInteraction: true }); // Show "Tap to Join" overlay
+        });
     } else {
         set({ isPlaying: false });
         audioElement.pause();
@@ -178,26 +168,18 @@ export const useRoomStore = createWithEqualityFn<RoomState>()((set, get) => ({
         }
     }
     
-    // 4. Volume
     if (state.volume !== undefined) {
         set({ volume: state.volume });
         audioElement.volume = state.volume / 100;
     }
-    
     get().updateMediaSession();
   },
 
   playPause: () => {
     const { isPlaying, isAdmin, audioElement } = get();
     if (!isAdmin || !audioElement) return;
-    
-    if (isPlaying) {
-        // Pausing: Record exact position
-        get()._emitStateUpdate({ isPlaying: false, pausedAt: audioElement.currentTime });
-    } else {
-        // Playing: Server calculates new startTimestamp based on pausedAt
-        get()._emitStateUpdate({ isPlaying: true, pausedAt: audioElement.currentTime });
-    }
+    if (isPlaying) get()._emitStateUpdate({ isPlaying: false, pausedAt: audioElement.currentTime });
+    else get()._emitStateUpdate({ isPlaying: true, pausedAt: audioElement.currentTime });
   },
 
   selectTrack: (index) => {
@@ -211,7 +193,12 @@ export const useRoomStore = createWithEqualityFn<RoomState>()((set, get) => ({
   setVolume: (v) => {
     set({ volume: v });
     if (get().audioElement) get().audioElement!.volume = v / 100;
-    get()._emitStateUpdate({ volume: v });
+    // Don't emit volume, keep it local preference
+  },
+
+  toggleCollaborative: (val: boolean) => {
+      if (!get().isAdmin) return;
+      get().socket?.emit('toggle_settings', { room_code: get().roomCode, setting: 'isCollaborative', value: val });
   },
 
   uploadFile: async (file, title, artist) => {
@@ -219,9 +206,13 @@ export const useRoomStore = createWithEqualityFn<RoomState>()((set, get) => ({
       fd.append('file', file);
       const res = await fetch(`${API_URL}/api/upload-local`, { method: 'POST', body: fd });
       const { audioUrl } = await res.json();
+      
+      // SEND SOCKET ID for permission check
+      const sid = get().socket?.id;
+      
       await fetch(`${API_URL}/api/room/${get().roomCode}/add-upload`, {
           method: 'POST', headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ title: title || file.name, artist: artist || 'Local', audioUrl })
+          body: JSON.stringify({ title: title || file.name, artist: artist || 'Local', audioUrl, sid })
       });
   },
 
