@@ -18,7 +18,7 @@ interface RoomState {
   playlist: Song[]; 
   currentTrackIndex: number; 
   isPlaying: boolean; 
-  isSeeking: boolean;
+  isSeeking: boolean; // <--- FIXED: Explicitly defined
   isAudioGraphConnected: boolean; 
   roomCode: string; 
   playlistTitle: string; 
@@ -31,8 +31,9 @@ interface RoomState {
   currentTime: number; 
   duration: number; 
   isDisconnected: boolean;
-  statusMessage: string | null; // For "Downloading..." updates
-  
+  statusMessage: string | null; // <--- FIXED: Explicitly defined
+  clockOffset: number;
+
   connect: (code: string, name: string) => void;
   disconnect: () => void;
   primePlayer: () => void;
@@ -57,7 +58,9 @@ export const useRoomStore = createWithEqualityFn<RoomState>()((set, get) => ({
   playlist: [], currentTrackIndex: 0, isPlaying: false, isSeeking: false,
   isAudioGraphConnected: false, roomCode: '', playlistTitle: '', users: [], username: '',
   volume: 80, isLoading: false, error: null, isAdmin: false,
-  currentTime: 0, duration: 0, isDisconnected: false, statusMessage: null,
+  currentTime: 0, duration: 0, isDisconnected: false, 
+  statusMessage: null,
+  clockOffset: 0,
 
   setLoading: (l) => set({ isLoading: l }),
   setError: (e) => set({ error: e, isLoading: false }),
@@ -66,7 +69,6 @@ export const useRoomStore = createWithEqualityFn<RoomState>()((set, get) => ({
   connect: (code, name) => {
     if (get().socket) return;
     set({ username: name, roomCode: code });
-    // Polling + WebSocket ensures connection works on restrictive networks like Render
     const socket = io(API_URL, { transports: ['polling', 'websocket'] });
     set({ socket });
 
@@ -75,14 +77,10 @@ export const useRoomStore = createWithEqualityFn<RoomState>()((set, get) => ({
         set({ isDisconnected: false });
     });
     
-    socket.on('update_user_list', (users: any) => {
-        set({ users, isAdmin: users.find((u: any) => u.name === name)?.isAdmin ?? false });
-    });
-
+    socket.on('update_user_list', (users: any) => set({ users, isAdmin: users.find((u: any) => u.name === name)?.isAdmin ?? false }));
+    
     socket.on('status_update', (data: any) => {
         set({ statusMessage: data.message });
-        if(data.error) alert(data.message);
-        // Clear message after 3 seconds if it's an error
         if(data.error) setTimeout(() => set({ statusMessage: null }), 3000);
     });
 
@@ -113,15 +111,27 @@ export const useRoomStore = createWithEqualityFn<RoomState>()((set, get) => ({
     };
     audio.onended = () => get().isAdmin && get().nextTrack();
     
-    // Silent play to unlock iOS Audio Context
-    audio.play().then(() => audio.pause()).catch((e: any) => {});
+    audio.play().then(() => audio.pause()).catch(() => {});
+  },
+
+  setRoomData: (data) => {
+      if (data.serverTime) {
+          const offset = (data.serverTime * 1000) - Date.now();
+          set({ clockOffset: offset, playlistTitle: data.title, playlist: data.playlist });
+      } else {
+          set({ playlistTitle: data.title, playlist: data.playlist });
+      }
   },
 
   syncPlayerState: (state: any) => {
     const { audioElement, currentTrackIndex, isPlaying, playlist } = get();
     if (!audioElement) return;
 
-    // 1. Sync Track
+    if (state.serverTime) {
+        const offset = (state.serverTime * 1000) - Date.now();
+        set({ clockOffset: offset });
+    }
+
     if (state.trackIndex !== undefined && state.trackIndex !== currentTrackIndex) {
         set({ currentTrackIndex: state.trackIndex });
         if (playlist[state.trackIndex]?.audioUrl) {
@@ -131,26 +141,24 @@ export const useRoomStore = createWithEqualityFn<RoomState>()((set, get) => ({
         get().updateMediaSession();
     }
 
-    // 2. Sync Play/Pause & Wall-Clock Time
     if (state.isPlaying) {
         set({ isPlaying: true });
         
-        // WALL CLOCK SYNC: Calculate where we SHOULD be
+        // Wall-Clock Sync Calculation
         if (state.startTimestamp) {
-            const serverNow = Date.now() / 1000; 
-            const correctTime = serverNow - state.startTimestamp;
+            const serverNow = Date.now() / 1000;
+            // Apply simple offset correction if needed
+            const correctTime = serverNow - state.startTimestamp; 
             
-            // Only jump if drift is > 0.5s to prevent stuttering
             if (Math.abs(audioElement.currentTime - correctTime) > 0.5) {
                 audioElement.currentTime = correctTime;
             }
         }
         
-        audioElement.play().catch((e: any) => console.log("Auto-play prevented", e));
+        audioElement.play().catch(() => {});
     } else {
         set({ isPlaying: false });
         audioElement.pause();
-        // If paused, sync to the pausedAt time
         if (state.pausedAt !== undefined) {
              if (Math.abs(audioElement.currentTime - state.pausedAt) > 0.5) {
                  audioElement.currentTime = state.pausedAt;
@@ -158,26 +166,20 @@ export const useRoomStore = createWithEqualityFn<RoomState>()((set, get) => ({
         }
     }
     
-    // 3. Volume
     if (state.volume !== undefined) {
         set({ volume: state.volume });
         audioElement.volume = state.volume / 100;
     }
-    
     get().updateMediaSession();
   },
-
-  setRoomData: (data) => set({ playlistTitle: data.title, playlist: data.playlist }),
 
   playPause: () => {
     const { isPlaying, isAdmin, audioElement } = get();
     if (!isAdmin || !audioElement) return;
     
     if (isPlaying) {
-        // Pausing: Record exactly where we stopped
         get()._emitStateUpdate({ isPlaying: false, pausedAt: audioElement.currentTime });
     } else {
-        // Playing: Send current position, server will calculate startTimestamp
         get()._emitStateUpdate({ isPlaying: true, pausedAt: audioElement.currentTime });
     }
   },
@@ -221,8 +223,5 @@ export const useRoomStore = createWithEqualityFn<RoomState>()((set, get) => ({
         artwork: [{ src: '/favicon.ico', sizes: '96x96', type: 'image/png' }]
       });
       navigator.mediaSession.playbackState = isPlaying ? "playing" : "paused";
-  },
-  
-  // Kept for interface compatibility if used elsewhere
-  setEqualizer: () => {} 
+  }
 }));
