@@ -4,43 +4,68 @@ import { io, Socket } from 'socket.io-client';
 const API_URL = process.env.NEXT_PUBLIC_API_URL || 'http://localhost:5001';
 
 export interface Song { 
-    name: string; artist: string; isUpload: boolean; 
-    audioUrl: string | null; albumArt: string | null; lyrics?: string | null;
+    name: string; 
+    artist: string; 
+    isUpload: boolean; 
+    audioUrl: string | null; 
+    albumArt: string | null; 
+    lyrics?: string | null;
+}
+
+interface AudioNodes {
+    context: AudioContext | null;
+    source: MediaElementAudioSourceNode | null;
+    bass: BiquadFilterNode | null;
+    mids: BiquadFilterNode | null;
+    treble: BiquadFilterNode | null;
 }
 
 interface RoomState {
-  socket: Socket | null; 
-  audioElement: HTMLAudioElement | null;
-  playlist: Song[]; currentTrackIndex: number; isPlaying: boolean; 
-  roomCode: string; playlistTitle: string; 
-  users: any[]; username: string; isAdmin: boolean;
-  volume: number; isLoading: boolean; error: string | null;
-  currentTime: number; duration: number; isDisconnected: boolean;
-  statusMessage: string | null;
-  clockOffset: number; 
-  isSeeking: boolean;
-  isCollaborative: boolean;
-  needsInteraction: boolean;
-  userId: string; // The Persistent Badge
-  
-  connect: (code: string, name: string) => void;
-  disconnect: () => void;
-  primePlayer: () => void;
-  syncPlayerState: (state: any) => void;
-  setRoomData: (data: any) => void;
-  selectTrack: (index: number) => void;
-  playPause: () => void;
-  nextTrack: () => void;
-  prevTrack: () => void;
-  setVolume: (v: number) => void;
-  uploadFile: (file: File, title?: string, artist?: string) => Promise<any>;
-  toggleCollaborative: (val: boolean) => void;
-  setLoading: (l: boolean) => void;
-  setError: (e: string | null) => void;
-  setIsSeeking: (s: boolean) => void;
-  setNeedsInteraction: (n: boolean) => void;
-  _emitStateUpdate: (s: any) => void;
-  updateMediaSession: () => void;
+    socket: Socket | null; 
+    audioElement: HTMLAudioElement | null;
+    playlist: Song[]; 
+    currentTrackIndex: number; 
+    isPlaying: boolean; 
+    roomCode: string; 
+    playlistTitle: string; 
+    users: any[]; 
+    username: string; 
+    isAdmin: boolean;
+    volume: number; 
+    isLoading: boolean; 
+    error: string | null;
+    currentTime: number; 
+    duration: number; 
+    isDisconnected: boolean;
+    statusMessage: string | null;
+    clockOffset: number;
+    lastSyncTime: number;
+    isSeeking: boolean;
+    isCollaborative: boolean;
+    needsInteraction: boolean;
+    userId: string;
+    audioNodes: AudioNodes;
+    equalizer: { bass: number; mids: number; treble: number };
+    
+    connect: (code: string, name: string) => void;
+    disconnect: () => void;
+    primePlayer: () => void;
+    syncPlayerState: (state: any) => void;
+    setRoomData: (data: any) => void;
+    selectTrack: (index: number) => void;
+    playPause: () => void;
+    nextTrack: () => void;
+    prevTrack: () => void;
+    setVolume: (v: number) => void;
+    uploadFile: (file: File, title?: string, artist?: string) => Promise<any>;
+    toggleCollaborative: (val: boolean) => void;
+    setLoading: (l: boolean) => void;
+    setError: (e: string | null) => void;
+    setIsSeeking: (s: boolean) => void;
+    setNeedsInteraction: (n: boolean) => void;
+    setEqualizer: (eq: { bass: number; mids: number; treble: number }) => void;
+    _emitStateUpdate: (s: any) => void;
+    updateMediaSession: () => void;
 }
 
 const getUserId = () => {
@@ -54,181 +79,382 @@ const getUserId = () => {
 };
 
 export const useRoomStore = createWithEqualityFn<RoomState>()((set, get) => ({
-  socket: null,
-  audioElement: (typeof window !== 'undefined') ? new Audio() : null,
-  playlist: [], currentTrackIndex: 0, isPlaying: false, isSeeking: false,
-  isAudioGraphConnected: false, roomCode: '', playlistTitle: '', users: [], username: '',
-  volume: 80, isLoading: false, error: null, isAdmin: false,
-  currentTime: 0, duration: 0, isDisconnected: false, 
-  statusMessage: null, clockOffset: 0, 
-  isCollaborative: false, needsInteraction: false,
-  userId: getUserId(),
+    socket: null,
+    audioElement: (typeof window !== 'undefined') ? new Audio() : null,
+    playlist: [], 
+    currentTrackIndex: 0, 
+    isPlaying: false, 
+    isSeeking: false,
+    roomCode: '', 
+    playlistTitle: '', 
+    users: [], 
+    username: '',
+    volume: 80, 
+    isLoading: false, 
+    error: null, 
+    isAdmin: false,
+    currentTime: 0, 
+    duration: 0, 
+    isDisconnected: false, 
+    statusMessage: null, 
+    clockOffset: 0,
+    lastSyncTime: 0,
+    isCollaborative: false, 
+    needsInteraction: false,
+    userId: getUserId(),
+    audioNodes: {
+        context: null,
+        source: null,
+        bass: null,
+        mids: null,
+        treble: null,
+    },
+    equalizer: { bass: 0, mids: 0, treble: 0 },
 
-  setLoading: (l) => set({ isLoading: l }),
-  setError: (e) => set({ error: e, isLoading: false }),
-  setIsSeeking: (s) => set({ isSeeking: s }),
-  setNeedsInteraction: (n) => set({ needsInteraction: n }),
+    setLoading: (l) => set({ isLoading: l }),
+    setError: (e) => set({ error: e, isLoading: false }),
+    setIsSeeking: (s) => set({ isSeeking: s }),
+    setNeedsInteraction: (n) => set({ needsInteraction: n }),
+    setEqualizer: (eq) => set({ equalizer: eq }),
 
-  connect: (code, name) => {
-    if (get().socket) return;
-    set({ username: name, roomCode: code });
-    const socket = io(API_URL, { transports: ['polling', 'websocket'] });
-    set({ socket });
+    connect: (code, name) => {
+        if (get().socket) return;
+        set({ username: name, roomCode: code });
+        
+        const socket = io(API_URL, { 
+            transports: ['polling', 'websocket'],
+            reconnection: true,
+            reconnectionDelay: 1000,
+            reconnectionDelayMax: 5000,
+            reconnectionAttempts: 5
+        });
+        
+        set({ socket });
 
-    socket.on('connect', () => {
-        // Send UUID (Badge) to prove who we are
-        socket.emit('join_room', { room_code: code, username: name, uuid: get().userId });
-        set({ isDisconnected: false });
-    });
-    
-    socket.on('role_update', (data: { isAdmin: boolean }) => set({ isAdmin: data.isAdmin }));
-    
-    socket.on('update_user_list', (users: any[]) => set({ users }));
-    
-    socket.on('status_update', (data: any) => {
-        set({ statusMessage: data.message });
-        if(data.error) setTimeout(() => set({ statusMessage: null }), 3000);
-    });
+        socket.on('connect', () => {
+            socket.emit('join_room', { 
+                room_code: code, 
+                username: name, 
+                uuid: get().userId 
+            });
+            set({ isDisconnected: false });
+        });
+        
+        socket.on('role_update', (data: { isAdmin: boolean }) => {
+            set({ isAdmin: data.isAdmin });
+        });
+        
+        socket.on('update_user_list', (users: any[]) => {
+            set({ users });
+        });
+        
+        socket.on('status_update', (data: any) => {
+            set({ statusMessage: data.message });
+            if (data.error) {
+                setTimeout(() => set({ statusMessage: null }), 3000);
+            }
+        });
 
-    socket.on('sync_player_state', (s: any) => get().syncPlayerState(s));
-    
-    socket.on('refresh_playlist', (d: any) => {
-        set({ playlist: d.playlist, playlistTitle: d.title });
-        if (d.current_state) get().syncPlayerState(d.current_state);
-    });
-    
-    socket.on('disconnect', () => set({ isDisconnected: true }));
-  },
+        socket.on('sync_player_state', (s: any) => {
+            get().syncPlayerState(s);
+        });
 
-  disconnect: () => {
-    get().socket?.disconnect();
-    get().audioElement?.pause();
-    set({ socket: null });
-  },
+        socket.on('sync_heartbeat', (s: any) => {
+            get().syncPlayerState(s);
+        });
+        
+        socket.on('refresh_playlist', (d: any) => {
+            set({ playlist: d.playlist, playlistTitle: d.title });
+            if (d.current_state) {
+                get().syncPlayerState(d.current_state);
+            }
+        });
+        
+        socket.on('disconnect', () => {
+            set({ isDisconnected: true });
+        });
 
-  primePlayer: () => {
-    const audio = get().audioElement;
-    if (!audio) return;
-    audio.crossOrigin = "anonymous";
-    audio.ontimeupdate = () => set({ currentTime: audio.currentTime });
-    audio.onloadedmetadata = () => {
-        set({ duration: audio.duration });
-        get().updateMediaSession();
-    };
-    audio.onended = () => get().isAdmin && get().nextTrack();
-    audio.play().then(() => {
-        audio.pause();
-        set({ needsInteraction: false });
-    }).catch(() => set({ needsInteraction: true }));
-  },
+        socket.on('load_current_state', (state: any) => {
+            get().syncPlayerState(state);
+        });
+    },
 
-  setRoomData: (data) => {
-      if (data.serverTime) {
-          const latency = 0.2; 
-          const offset = (data.serverTime * 1000) - Date.now() + (latency * 1000);
-          set({ clockOffset: offset, playlistTitle: data.title, playlist: data.playlist });
-      }
-      if (data.current_state) set({ isCollaborative: data.current_state.isCollaborative });
-  },
+    disconnect: () => {
+        get().socket?.disconnect();
+        get().audioElement?.pause();
+        set({ socket: null });
+    },
 
-  syncPlayerState: (state: any) => {
-    const { audioElement, currentTrackIndex, isPlaying } = get();
-    if (!audioElement) return;
+    primePlayer: () => {
+        const audio = get().audioElement;
+        if (!audio) return;
+        
+        audio.crossOrigin = "anonymous";
+        
+        audio.ontimeupdate = () => {
+            set({ currentTime: audio.currentTime });
+        };
+        
+        audio.onloadedmetadata = () => {
+            set({ duration: audio.duration });
+            get().updateMediaSession();
+        };
+        
+        audio.onended = () => {
+            if (get().isAdmin) {
+                get().nextTrack();
+            }
+        };
 
-    if (state.isCollaborative !== undefined) set({ isCollaborative: state.isCollaborative });
-    if (state.serverTime) set({ clockOffset: (state.serverTime * 1000) - Date.now() });
+        // Initialize audio context for visualization
+        if (typeof window !== 'undefined' && window.AudioContext) {
+            const audioContext = new (window.AudioContext || (window as any).webkitAudioContext)();
+            
+            if (audioContext.state === 'suspended') {
+                document.addEventListener('click', () => {
+                    audioContext.resume().catch(() => {});
+                }, { once: true });
+            }
 
-    if (state.trackIndex !== undefined && state.trackIndex !== currentTrackIndex) {
-        set({ currentTrackIndex: state.trackIndex });
-        if (get().playlist[state.trackIndex]?.audioUrl) {
-            audioElement.src = get().playlist[state.trackIndex].audioUrl!;
-            audioElement.load();
+            try {
+                const source = audioContext.createMediaElementSource(audio);
+                const bass = audioContext.createBiquadFilter();
+                const mids = audioContext.createBiquadFilter();
+                const treble = audioContext.createBiquadFilter();
+
+                bass.type = 'lowshelf';
+                bass.frequency.value = 200;
+                
+                mids.type = 'peaking';
+                mids.frequency.value = 3000;
+                mids.Q.value = 1;
+                
+                treble.type = 'highshelf';
+                treble.frequency.value = 3000;
+
+                source.connect(bass);
+                bass.connect(mids);
+                mids.connect(treble);
+                treble.connect(audioContext.destination);
+
+                set({
+                    audioNodes: {
+                        context: audioContext,
+                        source,
+                        bass,
+                        mids,
+                        treble,
+                    },
+                });
+            } catch (e) {
+                console.error("Audio nodes setup error:", e);
+            }
         }
-        get().updateMediaSession();
-    }
 
-    if (state.isPlaying) {
-        set({ isPlaying: true });
-        if (state.startTimestamp) {
-            const serverNow = (Date.now() + get().clockOffset) / 1000;
-            const targetTime = serverNow - state.startTimestamp;
-            if (Math.abs(audioElement.currentTime - targetTime) > 0.3) {
-                if (targetTime >= 0 && targetTime < audioElement.duration) {
-                    audioElement.currentTime = targetTime;
+        audio.play()
+            .then(() => {
+                audio.pause();
+                set({ needsInteraction: false });
+            })
+            .catch(() => {
+                set({ needsInteraction: true });
+            });
+    },
+
+    setRoomData: (data) => {
+        if (data.serverTime) {
+            const latency = (Date.now() - performance.now()) / 1000;
+            const offset = (data.serverTime * 1000) - Date.now();
+            set({ 
+                clockOffset: offset, 
+                playlistTitle: data.title, 
+                playlist: data.playlist,
+                lastSyncTime: Date.now()
+            });
+        }
+        if (data.current_state) {
+            set({ isCollaborative: data.current_state.isCollaborative });
+        }
+    },
+
+    syncPlayerState: (state: any) => {
+        const { audioElement, currentTrackIndex, isPlaying, clockOffset } = get();
+        if (!audioElement) return;
+
+        // Update collaborative setting
+        if (state.isCollaborative !== undefined) {
+            set({ isCollaborative: state.isCollaborative });
+        }
+
+        // Recalibrate clock offset
+        if (state.serverTime) {
+            const newOffset = (state.serverTime * 1000) - Date.now();
+            set({ 
+                clockOffset: newOffset,
+                lastSyncTime: Date.now()
+            });
+        }
+
+        // Track index change
+        if (state.trackIndex !== undefined && state.trackIndex !== currentTrackIndex) {
+            set({ currentTrackIndex: state.trackIndex });
+            if (get().playlist[state.trackIndex]?.audioUrl) {
+                audioElement.src = get().playlist[state.trackIndex].audioUrl!;
+                audioElement.load();
+            }
+            get().updateMediaSession();
+        }
+
+        // Playback sync logic
+        if (state.isPlaying === true) {
+            set({ isPlaying: true });
+            
+            if (state.startTimestamp !== undefined) {
+                const serverNow = (Date.now() + get().clockOffset) / 1000;
+                const expectedTime = serverNow - state.startTimestamp;
+                
+                // Only correct if drift is significant (> 500ms)
+                if (Math.abs(audioElement.currentTime - expectedTime) > 0.5) {
+                    if (expectedTime >= 0 && expectedTime < (audioElement.duration || Infinity)) {
+                        audioElement.currentTime = expectedTime;
+                        console.log(`[SYNC] Corrected drift: ${(audioElement.currentTime - expectedTime).toFixed(3)}s`);
+                    }
+                }
+            }
+            
+            audioElement.play().catch(() => {
+                set({ needsInteraction: true });
+            });
+        } else if (state.isPlaying === false) {
+            set({ isPlaying: false });
+            audioElement.pause();
+            
+            if (state.pausedAt !== undefined) {
+                if (Math.abs(audioElement.currentTime - state.pausedAt) > 0.1) {
+                    audioElement.currentTime = state.pausedAt;
                 }
             }
         }
-        audioElement.play().catch(() => set({ needsInteraction: true }));
-    } else {
-        set({ isPlaying: false });
-        audioElement.pause();
-        if (state.pausedAt !== undefined) {
-             if (Math.abs(audioElement.currentTime - state.pausedAt) > 0.1) {
-                 audioElement.currentTime = state.pausedAt;
-             }
+        
+        // Volume sync
+        if (state.volume !== undefined) {
+            set({ volume: state.volume });
+            audioElement.volume = state.volume / 100;
         }
-    }
+
+        get().updateMediaSession();
+    },
+
+    playPause: () => {
+        const { isPlaying, isAdmin, audioElement } = get();
+        if (!isAdmin || !audioElement) return;
+        
+        if (isPlaying) {
+            get()._emitStateUpdate({ 
+                isPlaying: false, 
+                pausedAt: audioElement.currentTime 
+            });
+        } else {
+            get()._emitStateUpdate({ 
+                isPlaying: true, 
+                currentTime: audioElement.currentTime 
+            });
+        }
+    },
+
+    selectTrack: (index: number) => {
+        if (!get().isAdmin) return;
+        get()._emitStateUpdate({ 
+            trackIndex: index, 
+            isPlaying: true, 
+            currentTime: 0 
+        });
+    },
+
+    nextTrack: () => {
+        const { playlist, currentTrackIndex } = get();
+        if (playlist.length === 0) return;
+        get().selectTrack((currentTrackIndex + 1) % playlist.length);
+    },
+
+    prevTrack: () => {
+        const { playlist, currentTrackIndex } = get();
+        if (playlist.length === 0) return;
+        get().selectTrack((currentTrackIndex - 1 + playlist.length) % playlist.length);
+    },
     
-    if (state.volume !== undefined) {
-        set({ volume: state.volume });
-        audioElement.volume = state.volume / 100;
+    setVolume: (v) => {
+        set({ volume: v });
+        if (get().audioElement) {
+            get().audioElement!.volume = v / 100;
+        }
+    },
+
+    toggleCollaborative: (val: boolean) => {
+        if (!get().isAdmin) return;
+        get().socket?.emit('toggle_settings', { 
+            room_code: get().roomCode, 
+            value: val 
+        });
+    },
+
+    uploadFile: async (file, title, artist) => {
+        const fd = new FormData();
+        fd.append('file', file);
+        
+        const res = await fetch(`${API_URL}/api/upload-local`, { 
+            method: 'POST', 
+            body: fd 
+        });
+        
+        if (!res.ok) {
+            throw new Error('Upload failed');
+        }
+        
+        const { audioUrl } = await res.json();
+        const uuid = get().userId;
+        
+        const uploadRes = await fetch(`${API_URL}/api/room/${get().roomCode}/add-upload`, {
+            method: 'POST', 
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ 
+                title: title || file.name, 
+                artist: artist || 'Local', 
+                audioUrl, 
+                uuid 
+            })
+        });
+
+        if (!uploadRes.ok) {
+            throw new Error('Failed to add track');
+        }
+    },
+
+    _emitStateUpdate: (state) => {
+        get().socket?.emit('update_player_state', { 
+            room_code: get().roomCode, 
+            state 
+        });
+    },
+    
+    updateMediaSession: () => {
+        if (typeof navigator === 'undefined' || !('mediaSession' in navigator)) return;
+        
+        const { playlist, currentTrackIndex, isPlaying } = get();
+        const track = playlist[currentTrackIndex];
+        
+        if (!track) return;
+        
+        navigator.mediaSession.metadata = new MediaMetadata({
+            title: track.name, 
+            artist: track.artist,
+            artwork: [{ 
+                src: '/favicon.ico', 
+                sizes: '96x96', 
+                type: 'image/png' 
+            }]
+        });
+        
+        navigator.mediaSession.playbackState = isPlaying ? "playing" : "paused";
     }
-    get().updateMediaSession();
-  },
-
-  playPause: () => {
-    const { isPlaying, isAdmin, audioElement } = get();
-    if (!isAdmin || !audioElement) return;
-    if (isPlaying) get()._emitStateUpdate({ isPlaying: false, pausedAt: audioElement.currentTime });
-    else get()._emitStateUpdate({ isPlaying: true, pausedAt: audioElement.currentTime });
-  },
-
-  selectTrack: (index: number) => {
-    if (!get().isAdmin) return;
-    get()._emitStateUpdate({ trackIndex: index, isPlaying: true, currentTime: 0 });
-  },
-
-  nextTrack: () => get().selectTrack((get().currentTrackIndex + 1) % get().playlist.length),
-  prevTrack: () => get().selectTrack((get().currentTrackIndex - 1 + get().playlist.length) % get().playlist.length),
-  
-  setVolume: (v) => {
-    set({ volume: v });
-    if (get().audioElement) get().audioElement!.volume = v / 100;
-  },
-
-  toggleCollaborative: (val: boolean) => {
-      if (!get().isAdmin) return;
-      get().socket?.emit('toggle_settings', { room_code: get().roomCode, setting: 'isCollaborative', value: val });
-  },
-
-  uploadFile: async (file, title, artist) => {
-      const fd = new FormData();
-      fd.append('file', file);
-      const res = await fetch(`${API_URL}/api/upload-local`, { method: 'POST', body: fd });
-      const { audioUrl } = await res.json();
-      
-      // SEND UUID (The Badge) instead of SID (The Wire)
-      const uuid = get().userId;
-      
-      await fetch(`${API_URL}/api/room/${get().roomCode}/add-upload`, {
-          method: 'POST', headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ title: title || file.name, artist: artist || 'Local', audioUrl, uuid })
-      });
-  },
-
-  _emitStateUpdate: (state) => {
-      get().socket?.emit('update_player_state', { room_code: get().roomCode, state });
-  },
-  
-  updateMediaSession: () => {
-      if (typeof navigator === 'undefined' || !('mediaSession' in navigator)) return;
-      const { playlist, currentTrackIndex, isPlaying } = get();
-      const track = playlist[currentTrackIndex];
-      if (!track) return;
-      navigator.mediaSession.metadata = new MediaMetadata({
-        title: track.name, artist: track.artist,
-        artwork: [{ src: '/favicon.ico', sizes: '96x96', type: 'image/png' }]
-      });
-      navigator.mediaSession.playbackState = isPlaying ? "playing" : "paused";
-  }
 }));
