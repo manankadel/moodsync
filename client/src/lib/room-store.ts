@@ -12,13 +12,14 @@ export interface Song {
     lyrics?: string | null;
 }
 
+// Strictly define the State Interface
 interface RoomState {
   socket: Socket | null; 
   audioElement: HTMLAudioElement | null;
   playlist: Song[]; 
   currentTrackIndex: number; 
   isPlaying: boolean; 
-  isSeeking: boolean; // <--- FIXED: Explicitly defined
+  isSeeking: boolean; // <--- The missing property
   isAudioGraphConnected: boolean; 
   roomCode: string; 
   playlistTitle: string; 
@@ -31,9 +32,10 @@ interface RoomState {
   currentTime: number; 
   duration: number; 
   isDisconnected: boolean;
-  statusMessage: string | null; // <--- FIXED: Explicitly defined
-  clockOffset: number;
-
+  statusMessage: string | null;
+  clockOffset: number; // Difference between Server time and Local time
+  
+  // Actions
   connect: (code: string, name: string) => void;
   disconnect: () => void;
   primePlayer: () => void;
@@ -48,8 +50,8 @@ interface RoomState {
   setLoading: (l: boolean) => void;
   setError: (e: string | null) => void;
   setIsSeeking: (s: boolean) => void;
-  updateMediaSession: () => void;
   _emitStateUpdate: (s: any) => void;
+  updateMediaSession: () => void;
 }
 
 export const useRoomStore = createWithEqualityFn<RoomState>()((set, get) => ({
@@ -69,6 +71,7 @@ export const useRoomStore = createWithEqualityFn<RoomState>()((set, get) => ({
   connect: (code, name) => {
     if (get().socket) return;
     set({ username: name, roomCode: code });
+    // Use polling+websocket for max reliability on Render
     const socket = io(API_URL, { transports: ['polling', 'websocket'] });
     set({ socket });
 
@@ -111,12 +114,15 @@ export const useRoomStore = createWithEqualityFn<RoomState>()((set, get) => ({
     };
     audio.onended = () => get().isAdmin && get().nextTrack();
     
-    audio.play().then(() => audio.pause()).catch(() => {});
+    // Unlock iOS Audio
+    audio.play().then(() => audio.pause()).catch((e: any) => {});
   },
 
   setRoomData: (data) => {
+      // CALIBRATE CLOCK: Calculate offset between Server and Client
       if (data.serverTime) {
-          const offset = (data.serverTime * 1000) - Date.now();
+          const latency = 0.2; // Assume 200ms latency
+          const offset = (data.serverTime * 1000) - Date.now() + (latency * 1000);
           set({ clockOffset: offset, playlistTitle: data.title, playlist: data.playlist });
       } else {
           set({ playlistTitle: data.title, playlist: data.playlist });
@@ -127,11 +133,13 @@ export const useRoomStore = createWithEqualityFn<RoomState>()((set, get) => ({
     const { audioElement, currentTrackIndex, isPlaying, playlist } = get();
     if (!audioElement) return;
 
+    // 1. Recalculate Clock Sync
     if (state.serverTime) {
         const offset = (state.serverTime * 1000) - Date.now();
         set({ clockOffset: offset });
     }
 
+    // 2. Sync Track
     if (state.trackIndex !== undefined && state.trackIndex !== currentTrackIndex) {
         set({ currentTrackIndex: state.trackIndex });
         if (playlist[state.trackIndex]?.audioUrl) {
@@ -141,35 +149,41 @@ export const useRoomStore = createWithEqualityFn<RoomState>()((set, get) => ({
         get().updateMediaSession();
     }
 
+    // 3. Sync Play/Pause & Wall-Clock Time
     if (state.isPlaying) {
         set({ isPlaying: true });
         
-        // Wall-Clock Sync Calculation
+        // === PRECISE SYNC LOGIC ===
         if (state.startTimestamp) {
-            const serverNow = Date.now() / 1000;
-            // Apply simple offset correction if needed
-            const correctTime = serverNow - state.startTimestamp; 
+            const serverNow = (Date.now() + get().clockOffset) / 1000;
+            const targetTime = serverNow - state.startTimestamp;
             
-            if (Math.abs(audioElement.currentTime - correctTime) > 0.5) {
-                audioElement.currentTime = correctTime;
+            // Correction: Only jump if we drift > 0.3s
+            if (Math.abs(audioElement.currentTime - targetTime) > 0.3) {
+                // Ensure target is valid
+                if (targetTime >= 0 && targetTime < audioElement.duration) {
+                    audioElement.currentTime = targetTime;
+                }
             }
         }
         
-        audioElement.play().catch(() => {});
+        audioElement.play().catch((e: any) => console.log("Autoplay blocked", e));
     } else {
         set({ isPlaying: false });
         audioElement.pause();
         if (state.pausedAt !== undefined) {
-             if (Math.abs(audioElement.currentTime - state.pausedAt) > 0.5) {
+             if (Math.abs(audioElement.currentTime - state.pausedAt) > 0.1) {
                  audioElement.currentTime = state.pausedAt;
              }
         }
     }
     
+    // 4. Volume
     if (state.volume !== undefined) {
         set({ volume: state.volume });
         audioElement.volume = state.volume / 100;
     }
+    
     get().updateMediaSession();
   },
 
@@ -178,8 +192,10 @@ export const useRoomStore = createWithEqualityFn<RoomState>()((set, get) => ({
     if (!isAdmin || !audioElement) return;
     
     if (isPlaying) {
+        // Pausing: Record exact position
         get()._emitStateUpdate({ isPlaying: false, pausedAt: audioElement.currentTime });
     } else {
+        // Playing: Server calculates new startTimestamp based on pausedAt
         get()._emitStateUpdate({ isPlaying: true, pausedAt: audioElement.currentTime });
     }
   },

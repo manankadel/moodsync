@@ -78,7 +78,6 @@ def get_room(code_in):
     if not r: return jsonify({'error': 'DB Error'}), 500
     data = safe_get(f"room:{code_in.upper()}")
     resp = json.loads(data) if data else {'error': 'Not Found'}
-    # Send server time for initial offset calc
     if 'error' not in resp: resp['serverTime'] = time.time()
     return jsonify(resp)
 
@@ -110,13 +109,11 @@ def search_yt():
 def add_yt(code_in):
     room_code = code_in.upper()
     socketio.emit('status_update', {'message': f"Downloading..."}, to=room_code)
-    
     try:
         data = request.json
         vid = data['id']
         filename = f"{vid}.mp3"
         path = os.path.join(UPLOAD_FOLDER, filename)
-        
         if not os.path.exists(path):
             opts = {
                 'format': 'bestaudio/best', 'outtmpl': path, 
@@ -125,7 +122,6 @@ def add_yt(code_in):
                 'extractor_args': {'youtube': {'player_client': ['ios']}}
             }
             with yt_dlp.YoutubeDL(opts) as ydl: ydl.download([f"https://www.youtube.com/watch?v={vid}"])
-        
         add_track(room_code, data['title'], data['artist'], get_file_url(filename), data['thumbnail'])
         socketio.emit('status_update', {'message': None}, to=room_code) 
         return jsonify({'success': True})
@@ -145,13 +141,10 @@ def add_track(room_code, title, artist, url, art):
     with r.lock(f"lock:{key}", timeout=5):
         rd = json.loads(safe_get(key))
         rd['playlist'].append({'name': title, 'artist': artist, 'audioUrl': url, 'albumArt': art, 'lyrics': None})
-        
-        # Auto-play if first
         if len(rd['playlist']) == 1:
             rd['current_state']['isPlaying'] = True
             rd['current_state']['startTimestamp'] = time.time()
             rd['current_state']['serverTime'] = time.time()
-            
         safe_set(key, json.dumps(rd))
         socketio.emit('refresh_playlist', rd, to=room_code)
         if len(rd['playlist']) == 1: socketio.emit('sync_player_state', rd['current_state'], to=room_code)
@@ -176,26 +169,23 @@ def on_update(data):
     rd = json.loads(safe_get(f"room:{room}"))
     new_state = data['state']
     
-    # === PRECISE START TIMESTAMP LOGIC ===
-    # If playing, calculate exactly when the song 'started' relative to server time
+    # === CRITICAL SYNC LOGIC ===
+    # 1. Update Start Timestamp
     if new_state.get('isPlaying'):
-        if not rd['current_state']['isPlaying']:
-            # Resuming from Pause
+        if not rd['current_state']['isPlaying']: # Resume
             paused_at = new_state.get('pausedAt', rd['current_state'].get('pausedAt', 0))
             new_state['startTimestamp'] = time.time() - paused_at
-        elif 'currentTime' in new_state:
-            # Seeking
+        elif 'currentTime' in new_state: # Seek
             new_state['startTimestamp'] = time.time() - new_state['currentTime']
     
-    # If pausing, save the position
+    # 2. Save Paused Position
     if new_state.get('isPlaying') is False:
         new_state['pausedAt'] = new_state.get('currentTime', 0)
 
+    # 3. Inject Server Time for Client Calibration
+    new_state['serverTime'] = time.time()
+
     rd['current_state'].update(new_state)
-    
-    # Inject current Server Time so clients can sync clocks
-    rd['current_state']['serverTime'] = time.time()
-    
     safe_set(f"room:{room}", json.dumps(rd))
     emit('sync_player_state', rd['current_state'], to=room, include_self=False)
 

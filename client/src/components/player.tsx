@@ -15,7 +15,10 @@ interface PlayerProps {
 export default function Player({ title, artist, isPlaying, volume, duration, onPlayPause, onNext, onPrev, onVolumeChange }: PlayerProps) {
   const VolumeIcon = volume === 0 ? VolumeX : volume < 50 ? Volume1 : Volume2;
   const [showEqualizer, setShowEqualizer] = useState(false);
+  
+  // Explicitly destructure isSeeking from the store to fix TS error
   const { currentTime, isAdmin, isSeeking, setIsSeeking, _emitStateUpdate, audioElement, statusMessage } = useRoomStore();
+  
   const [seekValue, setSeekValue] = useState(0);
   const [isBuffering, setIsBuffering] = useState(false);
 
@@ -32,12 +35,19 @@ export default function Player({ title, artist, isPlaying, volume, duration, onP
     };
   }, [audioElement]);
 
-  useEffect(() => { if (!isSeeking) setSeekValue(duration > 0 ? (currentTime / duration) * 100 : 0) }, [currentTime, duration, isSeeking]);
+  // Update slider only if user isn't dragging it
+  useEffect(() => { 
+      if (!isSeeking) {
+          setSeekValue(duration > 0 ? (currentTime / duration) * 100 : 0);
+      }
+  }, [currentTime, duration, isSeeking]);
 
   const handleSeekEnd = (e: React.MouseEvent<HTMLInputElement>) => {
     if (!isAdmin || !audioElement) return;
     const seekTime = (Number(e.currentTarget.value) / 100) * duration;
-    // For manual seeking, we update the timestamp on server
+    
+    // Optimistic update + Server emit
+    audioElement.currentTime = seekTime;
     _emitStateUpdate({ currentTime: seekTime, isPlaying: true });
     setIsSeeking(false);
   };
