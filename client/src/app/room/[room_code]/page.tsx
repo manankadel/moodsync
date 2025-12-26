@@ -57,19 +57,71 @@ const SettingsModal = ({ onClose }: { onClose: () => void }) => {
 
 // CRITICAL FOR SYNC: This overlay appears if browser blocks audio
 const InteractionOverlay = () => {
-    const { needsInteraction, setNeedsInteraction, audioElement } = useRoomStore();
+    const { needsInteraction, setNeedsInteraction, audioElement, playlist, currentTrackIndex } = useRoomStore();
+    const [isAttempting, setIsAttempting] = useState(false);
+    
     if (!needsInteraction) return null;
     
-    const handleUnlock = () => {
-        audioElement?.play().then(() => setNeedsInteraction(false)).catch(() => {});
+    const handleUnlock = async () => {
+        if (isAttempting || !audioElement) return;
+        
+        setIsAttempting(true);
+        
+        try {
+            // Check if audio has a valid source
+            if (!audioElement.src || audioElement.src === '') {
+                console.log('[TAP] No audio source yet, attempting to play context');
+                // Just unlock the audio context
+                const ctx = audioElement.play();
+                if (ctx instanceof Promise) {
+                    await ctx.then(() => {
+                        console.log('[TAP] Audio context unlocked');
+                        audioElement.pause();
+                        setNeedsInteraction(false);
+                    }).catch((err) => {
+                        console.error('[TAP] Play failed:', err);
+                        // Still dismiss the overlay - audio will play when track loads
+                        setNeedsInteraction(false);
+                    });
+                } else {
+                    audioElement.pause();
+                    setNeedsInteraction(false);
+                }
+            } else {
+                // Audio source exists, try to play
+                console.log('[TAP] Attempting to play audio from:', audioElement.src);
+                await audioElement.play().then(() => {
+                    console.log('[TAP] Audio playing successfully');
+                    setNeedsInteraction(false);
+                    audioElement.pause(); // Pause until admin controls
+                }).catch((err) => {
+                    console.error('[TAP] Play failed:', err);
+                    setNeedsInteraction(false);
+                });
+            }
+        } catch (error) {
+            console.error('[TAP] Error during unlock:', error);
+            setNeedsInteraction(false);
+        } finally {
+            setIsAttempting(false);
+        }
     };
 
     return (
-        <motion.div initial={{ opacity: 0 }} animate={{ opacity: 1 }} className="fixed inset-0 z-[70] bg-black/80 backdrop-blur-sm flex flex-col items-center justify-center p-4 text-center">
-            <motion.button whileTap={{ scale: 0.95 }} onClick={handleUnlock} className="flex flex-col items-center gap-4">
+        <motion.div 
+            initial={{ opacity: 0 }} 
+            animate={{ opacity: 1 }} 
+            className="fixed inset-0 z-[70] bg-black/80 backdrop-blur-sm flex flex-col items-center justify-center p-4 text-center"
+        >
+            <motion.button 
+                onClick={handleUnlock}
+                disabled={isAttempting}
+                className="flex flex-col items-center gap-4 cursor-pointer active:scale-95 transition-transform disabled:opacity-50"
+            >
                 <PlayCircle size={80} className="text-cyan-400 animate-pulse" />
                 <h2 className="text-2xl font-bold text-white">Tap to Join Session</h2>
                 <p className="text-gray-400">Audio playback needs your permission</p>
+                {isAttempting && <Loader2 size={24} className="text-cyan-400 animate-spin" />}
             </motion.button>
         </motion.div>
     );
