@@ -21,6 +21,7 @@ interface RoomState {
   isSeeking: boolean;
   isCollaborative: boolean;
   needsInteraction: boolean;
+  userId: string; // The Persistent Badge
   
   connect: (code: string, name: string) => void;
   disconnect: () => void;
@@ -42,6 +43,16 @@ interface RoomState {
   updateMediaSession: () => void;
 }
 
+const getUserId = () => {
+    if (typeof window === 'undefined') return '';
+    let id = localStorage.getItem('moodsync_uid');
+    if (!id) {
+        id = Math.random().toString(36).substring(2) + Date.now().toString(36);
+        localStorage.setItem('moodsync_uid', id);
+    }
+    return id;
+};
+
 export const useRoomStore = createWithEqualityFn<RoomState>()((set, get) => ({
   socket: null,
   audioElement: (typeof window !== 'undefined') ? new Audio() : null,
@@ -51,6 +62,7 @@ export const useRoomStore = createWithEqualityFn<RoomState>()((set, get) => ({
   currentTime: 0, duration: 0, isDisconnected: false, 
   statusMessage: null, clockOffset: 0, 
   isCollaborative: false, needsInteraction: false,
+  userId: getUserId(),
 
   setLoading: (l) => set({ isLoading: l }),
   setError: (e) => set({ error: e, isLoading: false }),
@@ -64,7 +76,8 @@ export const useRoomStore = createWithEqualityFn<RoomState>()((set, get) => ({
     set({ socket });
 
     socket.on('connect', () => {
-        socket.emit('join_room', { room_code: code, username: name });
+        // Send UUID (Badge) to prove who we are
+        socket.emit('join_room', { room_code: code, username: name, uuid: get().userId });
         set({ isDisconnected: false });
     });
     
@@ -194,12 +207,12 @@ export const useRoomStore = createWithEqualityFn<RoomState>()((set, get) => ({
       const res = await fetch(`${API_URL}/api/upload-local`, { method: 'POST', body: fd });
       const { audioUrl } = await res.json();
       
-      // SEND SOCKET ID for verification
-      const sid = get().socket?.id;
+      // SEND UUID (The Badge) instead of SID (The Wire)
+      const uuid = get().userId;
       
       await fetch(`${API_URL}/api/room/${get().roomCode}/add-upload`, {
           method: 'POST', headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ title: title || file.name, artist: artist || 'Local', audioUrl, sid })
+          body: JSON.stringify({ title: title || file.name, artist: artist || 'Local', audioUrl, uuid })
       });
   },
 

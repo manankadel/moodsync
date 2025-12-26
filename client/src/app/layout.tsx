@@ -1,4 +1,3 @@
-/* client/src/app/layout.tsx */
 import type { Metadata, Viewport } from "next";
 import { Sora } from "next/font/google";
 import "./globals.css";
@@ -34,6 +33,10 @@ export default function RootLayout({
 }>) {
   return (
     <html lang="en">
+      <head>
+          {/* Replaces the deprecated meta tag */}
+          <meta name="mobile-web-app-capable" content="yes" />
+      </head>
       <body className={sora.className}>{children}</body>
     </html>
   );

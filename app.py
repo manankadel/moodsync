@@ -62,7 +62,9 @@ def generate():
         if not r.exists(f"room:{code}"): break
     
     data = {
-        'playlist': [], 'title': "Sonic Space", 'users': {}, 'admin_sid': None,
+        'playlist': [], 'title': "Sonic Space", 'users': {}, 
+        'admin_uuid': None, # PERSISTENT ID
+        'admin_sid': None,  # TRANSIENT ID
         'current_state': {'isPlaying': False, 'trackIndex': 0, 'volume': 80, 'startTimestamp': 0, 'pausedAt': 0, 'isCollaborative': False}
     }
     safe_set(f"room:{code}", json.dumps(data))
@@ -99,20 +101,13 @@ def search_yt():
     except:
         return jsonify({'results': [], 'error': 'Search failed'})
 
-def check_permission(room, sid):
+def check_permission(room, uuid):
     data = safe_get(f"room:{room}")
     if not data: return False, None
     rd = json.loads(data)
     
-    logger.info(f"Checking perm: Request SID={sid}, Admin SID={rd.get('admin_sid')}")
-    
-    # If room has no admin (fresh restart), assign this guy
-    if not rd.get('admin_sid') and sid:
-        rd['admin_sid'] = sid
-        safe_set(f"room:{room}", json.dumps(rd))
-        return True, rd
-
-    if rd.get('admin_sid') == sid or rd['current_state'].get('isCollaborative'):
+    # Check UUID (The Badge) instead of SID (The Wire)
+    if rd.get('admin_uuid') == uuid or rd['current_state'].get('isCollaborative'):
         return True, rd
     return False, None
 
@@ -120,9 +115,9 @@ def check_permission(room, sid):
 def add_yt(code_in):
     room = code_in.upper()
     data = request.json
-    sid = data.get('sid')
+    uuid = data.get('uuid')
     
-    allowed, rd = check_permission(room, sid)
+    allowed, rd = check_permission(room, uuid)
     if not allowed: return jsonify({'error': 'Permission Denied'}), 403
 
     socketio.emit('status_update', {'message': f"Downloading {data['title']}..."}, to=room)
@@ -141,19 +136,19 @@ def add_yt(code_in):
             with yt_dlp.YoutubeDL(opts) as ydl: ydl.download([f"https://www.youtube.com/watch?v={vid}"])
         
         add_track_logic(room, rd, data['title'], data['artist'], get_file_url(filename), data['thumbnail'], None)
-        socketio.emit('status_update', {'message': None}, to=room)
+        socketio.emit('status_update', {'message': None}, to=room) 
         return jsonify({'success': True})
     except:
         socketio.emit('status_update', {'message': "Download failed", 'error': True}, to=room)
-        return jsonify({'error': 'Download failed'}), 500
+        return jsonify({'error': 'Download blocked'}), 500
 
 @app.route('/api/room/<code_in>/add-upload', methods=['POST'])
 def add_upload_route(code_in):
     room = code_in.upper()
     data = request.json
-    sid = data.get('sid')
+    uuid = data.get('uuid')
     
-    allowed, rd = check_permission(room, sid)
+    allowed, rd = check_permission(room, uuid)
     if not allowed: return jsonify({'error': 'Permission Denied'}), 403
 
     add_track_logic(room, rd, data['title'], data['artist'], data['audioUrl'], None, None)
@@ -164,41 +159,50 @@ def add_track_logic(room_code, rd, title, artist, url, art, lyrics):
     with r.lock(f"lock:{key}", timeout=5):
         fresh_rd = json.loads(safe_get(key))
         fresh_rd['playlist'].append({'name': title, 'artist': artist, 'audioUrl': url, 'albumArt': art, 'lyrics': lyrics})
+        
         if len(fresh_rd['playlist']) == 1:
             fresh_rd['current_state']['isPlaying'] = True
             fresh_rd['current_state']['startTimestamp'] = time.time()
             fresh_rd['current_state']['serverTime'] = time.time()
+            
         safe_set(key, json.dumps(fresh_rd))
         socketio.emit('refresh_playlist', fresh_rd, to=room_code)
         if len(fresh_rd['playlist']) == 1: socketio.emit('sync_player_state', fresh_rd['current_state'], to=room_code)
 
+# --- SOCKET HANDLERS ---
+
 @socketio.on('join_room')
 def on_join(data):
     room = data['room_code'].upper()
-    join_room(room)
+    username = data.get('username', 'Guest')
+    uuid = data.get('uuid') # Client Badge
     sid = request.sid
-    if not r: return
+    join_room(room)
     
+    if not r: return
     key = f"room:{room}"
+    
     with r.lock(f"lock:{key}", timeout=5):
         rd = json.loads(safe_get(key) or '{}')
         if not rd: return
         
         is_admin = False
-        if not rd.get('admin_sid'):
+        # Claim Admin if empty OR if UUID matches existing admin
+        if not rd.get('admin_uuid'):
+            rd['admin_uuid'] = uuid
             rd['admin_sid'] = sid
             is_admin = True
-        elif rd['admin_sid'] == sid:
+        elif rd['admin_uuid'] == uuid:
+            rd['admin_sid'] = sid # Update new socket
             is_admin = True
             
-        rd['users'][sid] = {'name': data.get('username'), 'isAdmin': is_admin}
+        rd['users'][sid] = {'name': username, 'isAdmin': is_admin, 'uuid': uuid}
         safe_set(key, json.dumps(rd))
         r.set(f"sid:{sid}", room, ex=86400)
         
         emit('role_update', {'isAdmin': is_admin}, to=sid)
         emit('load_current_state', rd['current_state'])
         
-        # Broadcast user list with SIDs so client can identify self
         user_list = [{'sid': k, **v} for k, v in rd['users'].items()]
         emit('update_user_list', user_list, to=room)
 
@@ -209,9 +213,11 @@ def on_update(data):
     key = f"room:{room}"
     rd = json.loads(safe_get(key))
     
+    # Check Admin by SID (Fastest)
     if rd.get('admin_sid') != sid: return
 
     new_state = data['state']
+    
     if new_state.get('isPlaying'):
         if not rd['current_state']['isPlaying']:
             paused_at = new_state.get('pausedAt', rd['current_state'].get('pausedAt', 0))
@@ -254,15 +260,9 @@ def on_disconnect():
         rd = json.loads(data)
         
         if sid in rd['users']:
-            was_admin = rd['users'][sid]['isAdmin']
             del rd['users'][sid]
-            if was_admin and rd['users']:
-                new_admin = next(iter(rd['users']))
-                rd['admin_sid'] = new_admin
-                rd['users'][new_admin]['isAdmin'] = True
-                emit('role_update', {'isAdmin': True}, to=new_admin)
-            elif not rd['users']:
-                rd['admin_sid'] = None
+            # We don't remove admin_uuid immediately on disconnect to allow refresh/reconnect
+            # Only if room becomes empty we might want to clear, but Redis TTL handles that
             
             safe_set(key, json.dumps(rd))
             user_list = [{'sid': k, **v} for k, v in rd['users'].items()]
