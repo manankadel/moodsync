@@ -19,8 +19,8 @@ interface RoomState {
   statusMessage: string | null;
   clockOffset: number; 
   isSeeking: boolean;
-  isCollaborative: boolean; // NEW
-  needsInteraction: boolean; // NEW: Triggers "Tap to Join"
+  isCollaborative: boolean;
+  needsInteraction: boolean;
   
   connect: (code: string, name: string) => void;
   disconnect: () => void;
@@ -68,11 +68,12 @@ export const useRoomStore = createWithEqualityFn<RoomState>()((set, get) => ({
         set({ isDisconnected: false });
     });
     
-    socket.on('role_update', (data: { isAdmin: boolean }) => {
-        set({ isAdmin: data.isAdmin });
+    // === ID-BASED ADMIN CHECK ===
+    socket.on('update_user_list', (users: any[]) => {
+        const mySid = socket.id;
+        const me = users.find(u => u.sid === mySid);
+        set({ users, isAdmin: me ? me.isAdmin : false });
     });
-    
-    socket.on('update_user_list', (users: any[]) => set({ users }));
     
     socket.on('status_update', (data: any) => {
         set({ statusMessage: data.message });
@@ -106,13 +107,10 @@ export const useRoomStore = createWithEqualityFn<RoomState>()((set, get) => ({
     };
     audio.onended = () => get().isAdmin && get().nextTrack();
     
-    // Attempt silent unlock
     audio.play().then(() => {
         audio.pause();
         set({ needsInteraction: false });
-    }).catch(() => {
-        set({ needsInteraction: true });
-    });
+    }).catch(() => set({ needsInteraction: true }));
   },
 
   setRoomData: (data) => {
@@ -121,9 +119,7 @@ export const useRoomStore = createWithEqualityFn<RoomState>()((set, get) => ({
           const offset = (data.serverTime * 1000) - Date.now() + (latency * 1000);
           set({ clockOffset: offset, playlistTitle: data.title, playlist: data.playlist });
       }
-      if (data.current_state) {
-          set({ isCollaborative: data.current_state.isCollaborative });
-      }
+      if (data.current_state) set({ isCollaborative: data.current_state.isCollaborative });
   },
 
   syncPlayerState: (state: any) => {
@@ -153,11 +149,7 @@ export const useRoomStore = createWithEqualityFn<RoomState>()((set, get) => ({
                 }
             }
         }
-        // Critical: Handle Browser Auto-Play Policy
-        audioElement.play().catch((e: any) => {
-            console.log("Autoplay prevented:", e);
-            set({ needsInteraction: true }); // Show "Tap to Join" overlay
-        });
+        audioElement.play().catch(() => set({ needsInteraction: true }));
     } else {
         set({ isPlaying: false });
         audioElement.pause();
@@ -182,7 +174,7 @@ export const useRoomStore = createWithEqualityFn<RoomState>()((set, get) => ({
     else get()._emitStateUpdate({ isPlaying: true, pausedAt: audioElement.currentTime });
   },
 
-  selectTrack: (index) => {
+  selectTrack: (index: number) => {
     if (!get().isAdmin) return;
     get()._emitStateUpdate({ trackIndex: index, isPlaying: true, currentTime: 0 });
   },
@@ -193,7 +185,6 @@ export const useRoomStore = createWithEqualityFn<RoomState>()((set, get) => ({
   setVolume: (v) => {
     set({ volume: v });
     if (get().audioElement) get().audioElement!.volume = v / 100;
-    // Don't emit volume, keep it local preference
   },
 
   toggleCollaborative: (val: boolean) => {
@@ -207,7 +198,7 @@ export const useRoomStore = createWithEqualityFn<RoomState>()((set, get) => ({
       const res = await fetch(`${API_URL}/api/upload-local`, { method: 'POST', body: fd });
       const { audioUrl } = await res.json();
       
-      // SEND SOCKET ID for permission check
+      // SEND SID to pass the backend check
       const sid = get().socket?.id;
       
       await fetch(`${API_URL}/api/room/${get().roomCode}/add-upload`, {
