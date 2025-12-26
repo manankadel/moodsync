@@ -68,12 +68,9 @@ export const useRoomStore = createWithEqualityFn<RoomState>()((set, get) => ({
         set({ isDisconnected: false });
     });
     
-    // === ID-BASED ADMIN CHECK ===
-    socket.on('update_user_list', (users: any[]) => {
-        const mySid = socket.id;
-        const me = users.find(u => u.sid === mySid);
-        set({ users, isAdmin: me ? me.isAdmin : false });
-    });
+    socket.on('role_update', (data: { isAdmin: boolean }) => set({ isAdmin: data.isAdmin }));
+    
+    socket.on('update_user_list', (users: any[]) => set({ users }));
     
     socket.on('status_update', (data: any) => {
         set({ statusMessage: data.message });
@@ -106,7 +103,6 @@ export const useRoomStore = createWithEqualityFn<RoomState>()((set, get) => ({
         get().updateMediaSession();
     };
     audio.onended = () => get().isAdmin && get().nextTrack();
-    
     audio.play().then(() => {
         audio.pause();
         set({ needsInteraction: false });
@@ -198,7 +194,7 @@ export const useRoomStore = createWithEqualityFn<RoomState>()((set, get) => ({
       const res = await fetch(`${API_URL}/api/upload-local`, { method: 'POST', body: fd });
       const { audioUrl } = await res.json();
       
-      // SEND SID to pass the backend check
+      // SEND SOCKET ID for verification
       const sid = get().socket?.id;
       
       await fetch(`${API_URL}/api/room/${get().roomCode}/add-upload`, {
