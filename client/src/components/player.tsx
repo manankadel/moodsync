@@ -1,3 +1,7 @@
+// FILE 3: player.tsx
+// Location: /path/to/moodsync/client/src/components/player.tsx
+// Copy ALL of this and replace your current player.tsx
+
 "use client";
 import { useState, useEffect } from "react";
 import { motion, AnimatePresence } from "framer-motion";
@@ -34,7 +38,6 @@ export default function Player({
     const [isBuffering, setIsBuffering] = useState(false);
     const [driftWarning, setDriftWarning] = useState<string | null>(null);
 
-    // Sync buffering state
     useEffect(() => {
         if (!audioElement) return;
         
@@ -53,14 +56,12 @@ export default function Player({
         };
     }, [audioElement]);
 
-    // Update slider only if user isn't dragging
     useEffect(() => { 
         if (!isSeeking) {
             setSeekValue(duration > 0 ? (currentTime / duration) * 100 : 0);
         }
     }, [currentTime, duration, isSeeking]);
 
-    // Drift detection monitor
     useEffect(() => {
         if (!isPlaying || !audioElement) {
             setDriftWarning(null);
@@ -70,7 +71,6 @@ export default function Player({
         const driftCheck = setInterval(() => {
             const timeSinceLastSync = Date.now() - lastSyncTime;
             
-            // If no sync in > 2 seconds, show warning
             if (timeSinceLastSync > 2000) {
                 setDriftWarning('Syncing...');
             } else {
@@ -86,7 +86,6 @@ export default function Player({
         
         const seekTime = (Number(e.currentTarget.value) / 100) * duration;
         
-        // Optimistic update
         audioElement.currentTime = seekTime;
         _emitStateUpdate({ 
             currentTime: seekTime, 
@@ -112,7 +111,6 @@ export default function Player({
             <div className="mx-auto max-w-screen-lg h-full flex flex-col sm:flex-row items-center justify-center relative">
                 <BeatVisualizer />
                 
-                {/* STATUS MESSAGE OVERLAY */}
                 <AnimatePresence>
                     {statusMessage && (
                         <motion.div 
@@ -126,7 +124,6 @@ export default function Player({
                     )}
                 </AnimatePresence>
 
-                {/* DRIFT WARNING */}
                 <AnimatePresence>
                     {driftWarning && (
                         <motion.div 
@@ -141,7 +138,6 @@ export default function Player({
                 </AnimatePresence>
 
                 <div className="grid grid-cols-[1fr_auto_1fr] sm:grid-cols-[1fr_2fr_1fr] items-center gap-2 sm:gap-4 w-full relative z-10">
-                    {/* Track Info */}
                     <div className="flex items-center gap-2 sm:gap-4 min-w-0">
                         <div className="h-12 w-12 sm:h-14 sm:w-14 rounded-xl bg-gradient-to-br from-gray-800 to-gray-900 flex-shrink-0 flex items-center justify-center text-xl sm:text-2xl shadow-inner border border-white/5">
                             🎵
@@ -152,9 +148,7 @@ export default function Player({
                         </div>
                     </div>
                     
-                    {/* Player Controls */}
                     <div className="flex flex-col items-center gap-2">
-                        {/* BUFFERING INDICATOR */}
                         {isBuffering && isPlaying && !statusMessage && (
                             <span className="absolute -top-3 text-[10px] text-cyan-400 flex items-center gap-1 font-bold tracking-widest bg-black/50 px-2 rounded-full border border-cyan-500/20">
                                 <Loader2 size={10} className="animate-spin" /> BUFFERING
@@ -191,7 +185,6 @@ export default function Player({
                             </button>
                         </div>
 
-                        {/* Seek Bar */}
                         <div className="w-full flex items-center gap-3 text-xs text-gray-400 max-w-xs sm:max-w-sm lg:max-w-md font-mono">
                             <span className='hidden sm:inline w-10 text-right'>{formatTime(currentTime)}</span>
                             <input 
@@ -209,7 +202,6 @@ export default function Player({
                         </div>
                     </div>
 
-                    {/* Volume & EQ */}
                     <div className="relative flex items-center justify-end gap-2">
                         <AnimatePresence>
                             {showEqualizer && <Equalizer />}

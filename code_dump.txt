@@ -62,9 +62,9 @@ CMD ["gunicorn", "--worker-class", "eventlet", "--timeout", "120", "-w", "1", "-
 import eventlet
 eventlet.monkey_patch()
 
-import os, random, string, logging, time, json
+import os, random, string, logging, time, json, threading
 from flask import Flask, jsonify, request, send_from_directory
-from flask_socketio import SocketIO, join_room, emit
+from flask_socketio import SocketIO, join_room, emit, rooms
 from flask_cors import CORS
 import redis
 import yt_dlp
@@ -81,7 +81,7 @@ app.wsgi_app = ProxyFix(app.wsgi_app, x_for=1, x_proto=1, x_host=1, x_prefix=1)
 app.config['MAX_CONTENT_LENGTH'] = 100 * 1024 * 1024
 
 CORS(app, resources={r"/*": {"origins": "*"}})
-socketio = SocketIO(app, cors_allowed_origins="*", async_mode='eventlet', ping_timeout=60)
+socketio = SocketIO(app, cors_allowed_origins="*", async_mode='eventlet', ping_timeout=60, ping_interval=25)
 
 UPLOAD_FOLDER = os.path.abspath('uploads')
 os.makedirs(UPLOAD_FOLDER, exist_ok=True)
@@ -99,7 +99,9 @@ except:
     logger.error("❌ Redis Offline")
     r = None
 
-def safe_get(key): return r.get(key) if r else None
+def safe_get(key): 
+    return r.get(key) if r else None
+
 def safe_set(key, val): 
     if r: r.set(key, val, ex=86400)
 
@@ -117,26 +119,44 @@ def serve_file(filename):
 
 @app.route('/generate', methods=['POST'])
 def generate():
-    if not r: return jsonify({'error': 'DB Error'}), 500
+    if not r: 
+        return jsonify({'error': 'DB Error'}), 500
+    
     while True:
         code = ''.join(random.choices(string.ascii_uppercase + string.digits, k=6))
-        if not r.exists(f"room:{code}"): break
+        if not r.exists(f"room:{code}"): 
+            break
     
     data = {
-        'playlist': [], 'title': "Sonic Space", 'users': {}, 
-        'admin_uuid': None, # PERSISTENT ID
-        'admin_sid': None,  # TRANSIENT ID
-        'current_state': {'isPlaying': False, 'trackIndex': 0, 'volume': 80, 'startTimestamp': 0, 'pausedAt': 0, 'isCollaborative': False}
+        'playlist': [], 
+        'title': "Sonic Space", 
+        'users': {}, 
+        'admin_uuid': None,
+        'admin_sid': None,
+        'current_state': {
+            'isPlaying': False, 
+            'trackIndex': 0, 
+            'volume': 80, 
+            'startTimestamp': 0,
+            'pausedAt': 0, 
+            'isCollaborative': False,
+            'serverTime': time.time()
+        }
     }
     safe_set(f"room:{code}", json.dumps(data))
     return jsonify({'room_code': code})
 
 @app.route('/api/room/<code_in>')
 def get_room(code_in):
-    if not r: return jsonify({'error': 'DB Error'}), 500
+    if not r: 
+        return jsonify({'error': 'DB Error'}), 500
+    
     data = safe_get(f"room:{code_in.upper()}")
     resp = json.loads(data) if data else {'error': 'Not Found'}
-    if 'error' not in resp: resp['serverTime'] = time.time()
+    
+    if 'error' not in resp: 
+        resp['serverTime'] = time.time()
+    
     return jsonify(resp)
 
 @app.route('/api/upload-local', methods=['POST'])
@@ -155,7 +175,8 @@ def search_yt():
     try:
         results = ytmusic.search(q, filter="songs", limit=5)
         return jsonify({'results': [{
-            'id': i['videoId'], 'title': i['title'], 
+            'id': i['videoId'], 
+            'title': i['title'], 
             'artist': i['artists'][0]['name'] if 'artists' in i else 'Unknown', 
             'thumbnail': i['thumbnails'][-1]['url'] if 'thumbnails' in i else None
         } for i in results if 'videoId' in i]})
@@ -164,12 +185,14 @@ def search_yt():
 
 def check_permission(room, uuid):
     data = safe_get(f"room:{room}")
-    if not data: return False, None
+    if not data: 
+        return False, None
+    
     rd = json.loads(data)
     
-    # Check UUID (The Badge) instead of SID (The Wire)
     if rd.get('admin_uuid') == uuid or rd['current_state'].get('isCollaborative'):
         return True, rd
+    
     return False, None
 
 @app.route('/api/room/<code_in>/add-yt', methods=['POST'])
@@ -179,7 +202,8 @@ def add_yt(code_in):
     uuid = data.get('uuid')
     
     allowed, rd = check_permission(room, uuid)
-    if not allowed: return jsonify({'error': 'Permission Denied'}), 403
+    if not allowed: 
+        return jsonify({'error': 'Permission Denied'}), 403
 
     socketio.emit('status_update', {'message': f"Downloading {data['title']}..."}, to=room)
     try:
@@ -189,12 +213,15 @@ def add_yt(code_in):
         
         if not os.path.exists(path):
             opts = {
-                'format': 'bestaudio/best', 'outtmpl': path, 
-                'postprocessors': [{'key': 'FFmpegExtractAudio','preferredcodec': 'mp3'}],
-                'quiet': True, 'nocheckcertificate': True,
+                'format': 'bestaudio/best', 
+                'outtmpl': path, 
+                'postprocessors': [{'key': 'FFmpegExtractAudio', 'preferredcodec': 'mp3'}],
+                'quiet': True, 
+                'nocheckcertificate': True,
                 'extractor_args': {'youtube': {'player_client': ['ios']}}
             }
-            with yt_dlp.YoutubeDL(opts) as ydl: ydl.download([f"https://www.youtube.com/watch?v={vid}"])
+            with yt_dlp.YoutubeDL(opts) as ydl: 
+                ydl.download([f"https://www.youtube.com/watch?v={vid}"])
         
         add_track_logic(room, rd, data['title'], data['artist'], get_file_url(filename), data['thumbnail'], None)
         socketio.emit('status_update', {'message': None}, to=room) 
@@ -210,25 +237,34 @@ def add_upload_route(code_in):
     uuid = data.get('uuid')
     
     allowed, rd = check_permission(room, uuid)
-    if not allowed: return jsonify({'error': 'Permission Denied'}), 403
+    if not allowed: 
+        return jsonify({'error': 'Permission Denied'}), 403
 
     add_track_logic(room, rd, data['title'], data['artist'], data['audioUrl'], None, None)
     return jsonify({'success': True})
 
 def add_track_logic(room_code, rd, title, artist, url, art, lyrics):
     key = f"room:{room_code}"
+    
     with r.lock(f"lock:{key}", timeout=5):
         fresh_rd = json.loads(safe_get(key))
-        fresh_rd['playlist'].append({'name': title, 'artist': artist, 'audioUrl': url, 'albumArt': art, 'lyrics': lyrics})
+        fresh_rd['playlist'].append({
+            'name': title, 
+            'artist': artist, 
+            'audioUrl': url, 
+            'albumArt': art, 
+            'lyrics': lyrics
+        })
         
         if len(fresh_rd['playlist']) == 1:
             fresh_rd['current_state']['isPlaying'] = True
             fresh_rd['current_state']['startTimestamp'] = time.time()
             fresh_rd['current_state']['serverTime'] = time.time()
-            
+        
         safe_set(key, json.dumps(fresh_rd))
         socketio.emit('refresh_playlist', fresh_rd, to=room_code)
-        if len(fresh_rd['playlist']) == 1: socketio.emit('sync_player_state', fresh_rd['current_state'], to=room_code)
+        if len(fresh_rd['playlist']) == 1: 
+            socketio.emit('sync_player_state', fresh_rd['current_state'], to=room_code)
 
 # --- SOCKET HANDLERS ---
 
@@ -236,33 +272,37 @@ def add_track_logic(room_code, rd, title, artist, url, art, lyrics):
 def on_join(data):
     room = data['room_code'].upper()
     username = data.get('username', 'Guest')
-    uuid = data.get('uuid') # Client Badge
+    uuid = data.get('uuid')
     sid = request.sid
     join_room(room)
     
-    if not r: return
+    if not r: 
+        return
+    
     key = f"room:{room}"
     
     with r.lock(f"lock:{key}", timeout=5):
         rd = json.loads(safe_get(key) or '{}')
-        if not rd: return
+        if not rd: 
+            return
         
         is_admin = False
-        # Claim Admin if empty OR if UUID matches existing admin
+        
         if not rd.get('admin_uuid'):
             rd['admin_uuid'] = uuid
             rd['admin_sid'] = sid
             is_admin = True
         elif rd['admin_uuid'] == uuid:
-            rd['admin_sid'] = sid # Update new socket
+            rd['admin_sid'] = sid
             is_admin = True
-            
+        
         rd['users'][sid] = {'name': username, 'isAdmin': is_admin, 'uuid': uuid}
+        rd['current_state']['serverTime'] = time.time()
         safe_set(key, json.dumps(rd))
         r.set(f"sid:{sid}", room, ex=86400)
         
         emit('role_update', {'isAdmin': is_admin}, to=sid)
-        emit('load_current_state', rd['current_state'])
+        emit('load_current_state', rd['current_state'], to=sid)
         
         user_list = [{'sid': k, **v} for k, v in rd['users'].items()]
         emit('update_user_list', user_list, to=room)
@@ -274,8 +314,8 @@ def on_update(data):
     key = f"room:{room}"
     rd = json.loads(safe_get(key))
     
-    # Check Admin by SID (Fastest)
-    if rd.get('admin_sid') != sid: return
+    if rd.get('admin_sid') != sid: 
+        return
 
     new_state = data['state']
     
@@ -303,31 +343,75 @@ def on_toggle(data):
     
     if rd.get('admin_sid') == sid:
         rd['current_state']['isCollaborative'] = data['value']
+        rd['current_state']['serverTime'] = time.time()
         safe_set(key, json.dumps(rd))
         emit('sync_player_state', rd['current_state'], to=room)
 
 @socketio.on('disconnect')
 def on_disconnect():
     sid = request.sid
-    if not r: return
+    if not r: 
+        return
+    
     room = r.get(f"sid:{sid}")
-    if not room: return
+    if not room: 
+        return
+    
     r.delete(f"sid:{sid}")
     
     key = f"room:{room}"
     with r.lock(f"lock:{key}", timeout=5):
         data = safe_get(key)
-        if not data: return
+        if not data: 
+            return
+        
         rd = json.loads(data)
         
         if sid in rd['users']:
             del rd['users'][sid]
-            # We don't remove admin_uuid immediately on disconnect to allow refresh/reconnect
-            # Only if room becomes empty we might want to clear, but Redis TTL handles that
-            
             safe_set(key, json.dumps(rd))
             user_list = [{'sid': k, **v} for k, v in rd['users'].items()]
             emit('update_user_list', user_list, to=room)
+
+# --- HEARTBEAT SYNC LOOP ---
+def sync_heartbeat():
+    """Emit sync pulses to all active rooms every 300ms"""
+    while True:
+        try:
+            eventlet.sleep(0.3)
+            
+            if not r:
+                continue
+            
+            cursor = 0
+            while True:
+                cursor, keys = r.scan(cursor, match='room:*', count=100)
+                
+                for key in keys:
+                    try:
+                        data = safe_get(key)
+                        if not data:
+                            continue
+                        
+                        rd = json.loads(data)
+                        room_code = key.split(':')[1]
+                        
+                        state = rd.get('current_state', {})
+                        state['serverTime'] = time.time()
+                        
+                        socketio.emit('sync_heartbeat', state, to=room_code, skip_sid=None)
+                    except Exception as e:
+                        logger.error(f"Heartbeat error for {key}: {e}")
+                
+                if cursor == 0:
+                    break
+        except Exception as e:
+            logger.error(f"Heartbeat thread error: {e}")
+            eventlet.sleep(1)
+
+# Start heartbeat in background thread
+heartbeat_thread = threading.Thread(target=sync_heartbeat, daemon=True)
+heartbeat_thread.start()
 
 if __name__ == '__main__':
     socketio.run(app, host='0.0.0.0', port=5001)
@@ -564,19 +648,71 @@ const SettingsModal = ({ onClose }: { onClose: () => void }) => {
 
 // CRITICAL FOR SYNC: This overlay appears if browser blocks audio
 const InteractionOverlay = () => {
-    const { needsInteraction, setNeedsInteraction, audioElement } = useRoomStore();
+    const { needsInteraction, setNeedsInteraction, audioElement, playlist, currentTrackIndex } = useRoomStore();
+    const [isAttempting, setIsAttempting] = useState(false);
+    
     if (!needsInteraction) return null;
     
-    const handleUnlock = () => {
-        audioElement?.play().then(() => setNeedsInteraction(false)).catch(() => {});
+    const handleUnlock = async () => {
+        if (isAttempting || !audioElement) return;
+        
+        setIsAttempting(true);
+        
+        try {
+            // Check if audio has a valid source
+            if (!audioElement.src || audioElement.src === '') {
+                console.log('[TAP] No audio source yet, attempting to play context');
+                // Just unlock the audio context
+                const ctx = audioElement.play();
+                if (ctx instanceof Promise) {
+                    await ctx.then(() => {
+                        console.log('[TAP] Audio context unlocked');
+                        audioElement.pause();
+                        setNeedsInteraction(false);
+                    }).catch((err) => {
+                        console.error('[TAP] Play failed:', err);
+                        // Still dismiss the overlay - audio will play when track loads
+                        setNeedsInteraction(false);
+                    });
+                } else {
+                    audioElement.pause();
+                    setNeedsInteraction(false);
+                }
+            } else {
+                // Audio source exists, try to play
+                console.log('[TAP] Attempting to play audio from:', audioElement.src);
+                await audioElement.play().then(() => {
+                    console.log('[TAP] Audio playing successfully');
+                    setNeedsInteraction(false);
+                    audioElement.pause(); // Pause until admin controls
+                }).catch((err) => {
+                    console.error('[TAP] Play failed:', err);
+                    setNeedsInteraction(false);
+                });
+            }
+        } catch (error) {
+            console.error('[TAP] Error during unlock:', error);
+            setNeedsInteraction(false);
+        } finally {
+            setIsAttempting(false);
+        }
     };
 
     return (
-        <motion.div initial={{ opacity: 0 }} animate={{ opacity: 1 }} className="fixed inset-0 z-[70] bg-black/80 backdrop-blur-sm flex flex-col items-center justify-center p-4 text-center">
-            <motion.button whileTap={{ scale: 0.95 }} onClick={handleUnlock} className="flex flex-col items-center gap-4">
+        <motion.div 
+            initial={{ opacity: 0 }} 
+            animate={{ opacity: 1 }} 
+            className="fixed inset-0 z-[70] bg-black/80 backdrop-blur-sm flex flex-col items-center justify-center p-4 text-center"
+        >
+            <motion.button 
+                onClick={handleUnlock}
+                disabled={isAttempting}
+                className="flex flex-col items-center gap-4 cursor-pointer active:scale-95 transition-transform disabled:opacity-50"
+            >
                 <PlayCircle size={80} className="text-cyan-400 animate-pulse" />
                 <h2 className="text-2xl font-bold text-white">Tap to Join Session</h2>
                 <p className="text-gray-400">Audio playback needs your permission</p>
+                {isAttempting && <Loader2 size={24} className="text-cyan-400 animate-spin" />}
             </motion.button>
         </motion.div>
     );
@@ -1652,112 +1788,239 @@ import Equalizer from "./Equalizer";
 import { useRoomStore } from '@/lib/room-store';
 
 interface PlayerProps {
-  title: string; artist: string; isPlaying: boolean;
-  volume: number; duration: number;
-  onPlayPause: () => void; onNext: () => void; onPrev: () => void; onVolumeChange: (v: number) => void;
+    title: string;
+    artist: string;
+    isPlaying: boolean;
+    volume: number;
+    duration: number;
+    onPlayPause: () => void;
+    onNext: () => void;
+    onPrev: () => void;
+    onVolumeChange: (v: number) => void;
 }
 
-export default function Player({ title, artist, isPlaying, volume, duration, onPlayPause, onNext, onPrev, onVolumeChange }: PlayerProps) {
-  const VolumeIcon = volume === 0 ? VolumeX : volume < 50 ? Volume1 : Volume2;
-  const [showEqualizer, setShowEqualizer] = useState(false);
-  
-  // Explicitly destructure isSeeking from the store to fix TS error
-  const { currentTime, isAdmin, isSeeking, setIsSeeking, _emitStateUpdate, audioElement, statusMessage } = useRoomStore();
-  
-  const [seekValue, setSeekValue] = useState(0);
-  const [isBuffering, setIsBuffering] = useState(false);
-
-  // Sync Buffering State
-  useEffect(() => {
-    if (!audioElement) return;
-    const onWaiting = () => setIsBuffering(true);
-    const onPlaying = () => setIsBuffering(false);
-    audioElement.addEventListener('waiting', onWaiting);
-    audioElement.addEventListener('playing', onPlaying);
-    return () => {
-        audioElement.removeEventListener('waiting', onWaiting);
-        audioElement.removeEventListener('playing', onPlaying);
-    };
-  }, [audioElement]);
-
-  // Update slider only if user isn't dragging it
-  useEffect(() => { 
-      if (!isSeeking) {
-          setSeekValue(duration > 0 ? (currentTime / duration) * 100 : 0);
-      }
-  }, [currentTime, duration, isSeeking]);
-
-  const handleSeekEnd = (e: React.MouseEvent<HTMLInputElement>) => {
-    if (!isAdmin || !audioElement) return;
-    const seekTime = (Number(e.currentTarget.value) / 100) * duration;
+export default function Player({ 
+    title, artist, isPlaying, volume, duration, 
+    onPlayPause, onNext, onPrev, onVolumeChange 
+}: PlayerProps) {
+    const VolumeIcon = volume === 0 ? VolumeX : volume < 50 ? Volume1 : Volume2;
+    const [showEqualizer, setShowEqualizer] = useState(false);
     
-    // Optimistic update + Server emit
-    audioElement.currentTime = seekTime;
-    _emitStateUpdate({ currentTime: seekTime, isPlaying: true });
-    setIsSeeking(false);
-  };
-  
-  const formatTime = (s: number) => isNaN(s) || s < 0 ? '0:00' : `${Math.floor(s/60)}:${Math.floor(s%60).toString().padStart(2,'0')}`;
+    const { 
+        currentTime, isAdmin, isSeeking, setIsSeeking, _emitStateUpdate, 
+        audioElement, statusMessage, clockOffset, lastSyncTime
+    } = useRoomStore();
+    
+    const [seekValue, setSeekValue] = useState(0);
+    const [isBuffering, setIsBuffering] = useState(false);
+    const [driftWarning, setDriftWarning] = useState<string | null>(null);
 
-  return (
-    <motion.footer initial={{ y: 100 }} animate={{ y: 0 }} className="fixed bottom-0 left-0 right-0 z-50 h-auto sm:h-28 bg-black/80 backdrop-blur-xl border-t border-white/10 p-2 shadow-[0_-10px_40px_rgba(0,0,0,0.5)]">
-      <div className="mx-auto max-w-screen-lg h-full flex flex-col sm:flex-row items-center justify-center relative">
-        <BeatVisualizer />
+    // Sync buffering state
+    useEffect(() => {
+        if (!audioElement) return;
         
-        {/* STATUS MESSAGE OVERLAY */}
-        <AnimatePresence>
-            {statusMessage && (
-                <motion.div initial={{opacity:0, y: 10}} animate={{opacity:1, y:0}} exit={{opacity:0}} className="absolute -top-12 left-1/2 -translate-x-1/2 bg-cyan-600/90 text-white px-4 py-2 rounded-full text-xs font-bold shadow-lg flex items-center gap-2 z-50 whitespace-nowrap">
-                    <Loader2 size={12} className="animate-spin" /> {statusMessage}
-                </motion.div>
-            )}
-        </AnimatePresence>
+        const onWaiting = () => setIsBuffering(true);
+        const onPlaying = () => setIsBuffering(false);
+        const onCanPlay = () => setIsBuffering(false);
+        
+        audioElement.addEventListener('waiting', onWaiting);
+        audioElement.addEventListener('playing', onPlaying);
+        audioElement.addEventListener('canplay', onCanPlay);
+        
+        return () => {
+            audioElement.removeEventListener('waiting', onWaiting);
+            audioElement.removeEventListener('playing', onPlaying);
+            audioElement.removeEventListener('canplay', onCanPlay);
+        };
+    }, [audioElement]);
 
-        <div className="grid grid-cols-[1fr_auto_1fr] sm:grid-cols-[1fr_2fr_1fr] items-center gap-2 sm:gap-4 w-full relative z-10">
-          <div className="flex items-center gap-2 sm:gap-4 min-w-0">
-            <div className="h-12 w-12 sm:h-14 sm:w-14 rounded-xl bg-gradient-to-br from-gray-800 to-gray-900 flex-shrink-0 flex items-center justify-center text-xl sm:text-2xl shadow-inner border border-white/5">
-                🎵
-            </div>
-            <div className="min-w-0">
-                <p className="font-bold truncate text-sm sm:text-base text-white">{title}</p>
-                <p className="font-medium text-xs sm:text-sm text-gray-400 truncate">{artist}</p>
-            </div>
-          </div>
-          
-          <div className="flex flex-col items-center gap-2">
-            {/* BUFFERING INDICATOR */}
-            {isBuffering && isPlaying && !statusMessage && (
-                <span className="absolute -top-3 text-[10px] text-cyan-400 flex items-center gap-1 font-bold tracking-widest bg-black/50 px-2 rounded-full border border-cyan-500/20">
-                    <Loader2 size={10} className="animate-spin" /> SYNCING
-                </span>
-            )}
+    // Update slider only if user isn't dragging
+    useEffect(() => { 
+        if (!isSeeking) {
+            setSeekValue(duration > 0 ? (currentTime / duration) * 100 : 0);
+        }
+    }, [currentTime, duration, isSeeking]);
 
-            <div className="flex items-center gap-4 sm:gap-6">
-              <button onClick={onPrev} disabled={!isAdmin} className="disabled:opacity-30 text-gray-400 hover:text-white transition-colors p-2 active:scale-95"><SkipBack size={24} /></button>
-              <button onClick={onPlayPause} disabled={!isAdmin} className="h-12 w-12 sm:h-14 sm:w-14 flex items-center justify-center rounded-full bg-white text-black disabled:opacity-50 hover:scale-105 active:scale-95 transition-all shadow-lg shadow-white/10">
-                {isPlaying ? <Pause fill="black" /> : <Play fill="black" className="translate-x-0.5"/>}
-              </button>
-              <button onClick={onNext} disabled={!isAdmin} className="disabled:opacity-30 text-gray-400 hover:text-white transition-colors p-2 active:scale-95"><SkipForward size={24} /></button>
-            </div>
-            <div className="w-full flex items-center gap-3 text-xs text-gray-400 max-w-xs sm:max-w-sm lg:max-w-md font-mono">
-              <span className='hidden sm:inline w-10 text-right'>{formatTime(currentTime)}</span>
-              <input type="range" min="0" max="100" value={seekValue} disabled={!isAdmin || duration === 0} onMouseDown={() => isAdmin && setIsSeeking(true)} onMouseUp={handleSeekEnd} onChange={e=>setSeekValue(Number(e.target.value))} className="w-full h-1 bg-gray-700 rounded-full appearance-none cursor-pointer accent-cyan-400 hover:accent-cyan-300"/>
-              <span className='hidden sm:inline w-10'>{formatTime(duration)}</span>
-            </div>
-          </div>
+    // Drift detection monitor
+    useEffect(() => {
+        if (!isPlaying || !audioElement) {
+            setDriftWarning(null);
+            return;
+        }
 
-          <div className="relative flex items-center justify-end gap-2">
-            <AnimatePresence>{showEqualizer && <Equalizer />}</AnimatePresence>
-            <button onClick={() => setShowEqualizer(!showEqualizer)} className={`p-2 rounded-full transition-colors ${showEqualizer ? 'text-cyan-400 bg-white/10' : 'text-gray-400 hover:text-white'}`}><SlidersHorizontal size={20} /></button>
-            <div className="items-center gap-2 hidden sm:flex group">
-              <VolumeIcon size={20} className="text-gray-400 group-hover:text-white transition-colors" />
-              <input type="range" min="0" max="100" value={volume} onChange={(e) => onVolumeChange(Number(e.target.value))} className="w-20 h-1 bg-gray-700 rounded-full appearance-none accent-white cursor-pointer" />
+        const driftCheck = setInterval(() => {
+            const timeSinceLastSync = Date.now() - lastSyncTime;
+            
+            // If no sync in > 2 seconds, show warning
+            if (timeSinceLastSync > 2000) {
+                setDriftWarning('Syncing...');
+            } else {
+                setDriftWarning(null);
+            }
+        }, 500);
+
+        return () => clearInterval(driftCheck);
+    }, [isPlaying, audioElement, lastSyncTime]);
+
+    const handleSeekEnd = (e: React.MouseEvent<HTMLInputElement>) => {
+        if (!isAdmin || !audioElement) return;
+        
+        const seekTime = (Number(e.currentTarget.value) / 100) * duration;
+        
+        // Optimistic update
+        audioElement.currentTime = seekTime;
+        _emitStateUpdate({ 
+            currentTime: seekTime, 
+            isPlaying: true,
+            startTimestamp: (Date.now() + clockOffset) / 1000 - seekTime
+        });
+        setIsSeeking(false);
+    };
+    
+    const formatTime = (s: number) => {
+        if (isNaN(s) || s < 0) return '0:00';
+        const mins = Math.floor(s / 60);
+        const secs = Math.floor(s % 60).toString().padStart(2, '0');
+        return `${mins}:${secs}`;
+    };
+
+    return (
+        <motion.footer 
+            initial={{ y: 100 }} 
+            animate={{ y: 0 }} 
+            className="fixed bottom-0 left-0 right-0 z-50 h-auto sm:h-28 bg-black/80 backdrop-blur-xl border-t border-white/10 p-2 shadow-[0_-10px_40px_rgba(0,0,0,0.5)]"
+        >
+            <div className="mx-auto max-w-screen-lg h-full flex flex-col sm:flex-row items-center justify-center relative">
+                <BeatVisualizer />
+                
+                {/* STATUS MESSAGE OVERLAY */}
+                <AnimatePresence>
+                    {statusMessage && (
+                        <motion.div 
+                            initial={{opacity: 0, y: 10}} 
+                            animate={{opacity: 1, y: 0}} 
+                            exit={{opacity: 0}} 
+                            className="absolute -top-12 left-1/2 -translate-x-1/2 bg-cyan-600/90 text-white px-4 py-2 rounded-full text-xs font-bold shadow-lg flex items-center gap-2 z-50 whitespace-nowrap"
+                        >
+                            <Loader2 size={12} className="animate-spin" /> {statusMessage}
+                        </motion.div>
+                    )}
+                </AnimatePresence>
+
+                {/* DRIFT WARNING */}
+                <AnimatePresence>
+                    {driftWarning && (
+                        <motion.div 
+                            initial={{opacity: 0, y: 10}} 
+                            animate={{opacity: 1, y: 0}} 
+                            exit={{opacity: 0}} 
+                            className="absolute -top-12 right-1/2 translate-x-1/2 bg-amber-600/90 text-white px-3 py-1 rounded-full text-[10px] font-bold shadow-lg flex items-center gap-1 z-40 whitespace-nowrap"
+                        >
+                            <div className="w-1.5 h-1.5 bg-white rounded-full animate-pulse" /> {driftWarning}
+                        </motion.div>
+                    )}
+                </AnimatePresence>
+
+                <div className="grid grid-cols-[1fr_auto_1fr] sm:grid-cols-[1fr_2fr_1fr] items-center gap-2 sm:gap-4 w-full relative z-10">
+                    {/* Track Info */}
+                    <div className="flex items-center gap-2 sm:gap-4 min-w-0">
+                        <div className="h-12 w-12 sm:h-14 sm:w-14 rounded-xl bg-gradient-to-br from-gray-800 to-gray-900 flex-shrink-0 flex items-center justify-center text-xl sm:text-2xl shadow-inner border border-white/5">
+                            🎵
+                        </div>
+                        <div className="min-w-0">
+                            <p className="font-bold truncate text-sm sm:text-base text-white">{title}</p>
+                            <p className="font-medium text-xs sm:text-sm text-gray-400 truncate">{artist}</p>
+                        </div>
+                    </div>
+                    
+                    {/* Player Controls */}
+                    <div className="flex flex-col items-center gap-2">
+                        {/* BUFFERING INDICATOR */}
+                        {isBuffering && isPlaying && !statusMessage && (
+                            <span className="absolute -top-3 text-[10px] text-cyan-400 flex items-center gap-1 font-bold tracking-widest bg-black/50 px-2 rounded-full border border-cyan-500/20">
+                                <Loader2 size={10} className="animate-spin" /> BUFFERING
+                            </span>
+                        )}
+
+                        <div className="flex items-center gap-4 sm:gap-6">
+                            <button 
+                                onClick={onPrev} 
+                                disabled={!isAdmin} 
+                                className="disabled:opacity-30 text-gray-400 hover:text-white transition-colors p-2 active:scale-95"
+                            >
+                                <SkipBack size={24} />
+                            </button>
+                            
+                            <button 
+                                onClick={onPlayPause} 
+                                disabled={!isAdmin} 
+                                className="h-12 w-12 sm:h-14 sm:w-14 flex items-center justify-center rounded-full bg-white text-black disabled:opacity-50 hover:scale-105 active:scale-95 transition-all shadow-lg shadow-white/10"
+                            >
+                                {isPlaying ? (
+                                    <Pause fill="black" size={24} />
+                                ) : (
+                                    <Play fill="black" className="translate-x-0.5" size={24} />
+                                )}
+                            </button>
+                            
+                            <button 
+                                onClick={onNext} 
+                                disabled={!isAdmin} 
+                                className="disabled:opacity-30 text-gray-400 hover:text-white transition-colors p-2 active:scale-95"
+                            >
+                                <SkipForward size={24} />
+                            </button>
+                        </div>
+
+                        {/* Seek Bar */}
+                        <div className="w-full flex items-center gap-3 text-xs text-gray-400 max-w-xs sm:max-w-sm lg:max-w-md font-mono">
+                            <span className='hidden sm:inline w-10 text-right'>{formatTime(currentTime)}</span>
+                            <input 
+                                type="range" 
+                                min="0" 
+                                max="100" 
+                                value={seekValue} 
+                                disabled={!isAdmin || duration === 0} 
+                                onMouseDown={() => isAdmin && setIsSeeking(true)} 
+                                onMouseUp={handleSeekEnd} 
+                                onChange={e => setSeekValue(Number(e.target.value))} 
+                                className="w-full h-1 bg-gray-700 rounded-full appearance-none cursor-pointer accent-cyan-400 hover:accent-cyan-300"
+                            />
+                            <span className='hidden sm:inline w-10'>{formatTime(duration)}</span>
+                        </div>
+                    </div>
+
+                    {/* Volume & EQ */}
+                    <div className="relative flex items-center justify-end gap-2">
+                        <AnimatePresence>
+                            {showEqualizer && <Equalizer />}
+                        </AnimatePresence>
+                        
+                        <button 
+                            onClick={() => setShowEqualizer(!showEqualizer)} 
+                            className={`p-2 rounded-full transition-colors ${
+                                showEqualizer ? 'text-cyan-400 bg-white/10' : 'text-gray-400 hover:text-white'
+                            }`}
+                        >
+                            <SlidersHorizontal size={20} />
+                        </button>
+                        
+                        <div className="items-center gap-2 hidden sm:flex group">
+                            <VolumeIcon size={20} className="text-gray-400 group-hover:text-white transition-colors" />
+                            <input 
+                                type="range" 
+                                min="0" 
+                                max="100" 
+                                value={volume} 
+                                onChange={(e) => onVolumeChange(Number(e.target.value))} 
+                                className="w-20 h-1 bg-gray-700 rounded-full appearance-none accent-white cursor-pointer" 
+                            />
+                        </div>
+                    </div>
+                </div>
             </div>
-          </div>
-        </div>
-      </div>
-    </motion.footer>
-  );
+        </motion.footer>
+    );
 }
 
 ### ./client/src/components/ui/WaveButton.tsx ###
@@ -1996,43 +2259,68 @@ import { io, Socket } from 'socket.io-client';
 const API_URL = process.env.NEXT_PUBLIC_API_URL || 'http://localhost:5001';
 
 export interface Song { 
-    name: string; artist: string; isUpload: boolean; 
-    audioUrl: string | null; albumArt: string | null; lyrics?: string | null;
+    name: string; 
+    artist: string; 
+    isUpload: boolean; 
+    audioUrl: string | null; 
+    albumArt: string | null; 
+    lyrics?: string | null;
+}
+
+interface AudioNodes {
+    context: AudioContext | null;
+    source: MediaElementAudioSourceNode | null;
+    bass: BiquadFilterNode | null;
+    mids: BiquadFilterNode | null;
+    treble: BiquadFilterNode | null;
 }
 
 interface RoomState {
-  socket: Socket | null; 
-  audioElement: HTMLAudioElement | null;
-  playlist: Song[]; currentTrackIndex: number; isPlaying: boolean; 
-  roomCode: string; playlistTitle: string; 
-  users: any[]; username: string; isAdmin: boolean;
-  volume: number; isLoading: boolean; error: string | null;
-  currentTime: number; duration: number; isDisconnected: boolean;
-  statusMessage: string | null;
-  clockOffset: number; 
-  isSeeking: boolean;
-  isCollaborative: boolean;
-  needsInteraction: boolean;
-  userId: string; // The Persistent Badge
-  
-  connect: (code: string, name: string) => void;
-  disconnect: () => void;
-  primePlayer: () => void;
-  syncPlayerState: (state: any) => void;
-  setRoomData: (data: any) => void;
-  selectTrack: (index: number) => void;
-  playPause: () => void;
-  nextTrack: () => void;
-  prevTrack: () => void;
-  setVolume: (v: number) => void;
-  uploadFile: (file: File, title?: string, artist?: string) => Promise<any>;
-  toggleCollaborative: (val: boolean) => void;
-  setLoading: (l: boolean) => void;
-  setError: (e: string | null) => void;
-  setIsSeeking: (s: boolean) => void;
-  setNeedsInteraction: (n: boolean) => void;
-  _emitStateUpdate: (s: any) => void;
-  updateMediaSession: () => void;
+    socket: Socket | null; 
+    audioElement: HTMLAudioElement | null;
+    playlist: Song[]; 
+    currentTrackIndex: number; 
+    isPlaying: boolean; 
+    roomCode: string; 
+    playlistTitle: string; 
+    users: any[]; 
+    username: string; 
+    isAdmin: boolean;
+    volume: number; 
+    isLoading: boolean; 
+    error: string | null;
+    currentTime: number; 
+    duration: number; 
+    isDisconnected: boolean;
+    statusMessage: string | null;
+    clockOffset: number;
+    lastSyncTime: number;
+    isSeeking: boolean;
+    isCollaborative: boolean;
+    needsInteraction: boolean;
+    userId: string;
+    audioNodes: AudioNodes;
+    equalizer: { bass: number; mids: number; treble: number };
+    
+    connect: (code: string, name: string) => void;
+    disconnect: () => void;
+    primePlayer: () => void;
+    syncPlayerState: (state: any) => void;
+    setRoomData: (data: any) => void;
+    selectTrack: (index: number) => void;
+    playPause: () => void;
+    nextTrack: () => void;
+    prevTrack: () => void;
+    setVolume: (v: number) => void;
+    uploadFile: (file: File, title?: string, artist?: string) => Promise<any>;
+    toggleCollaborative: (val: boolean) => void;
+    setLoading: (l: boolean) => void;
+    setError: (e: string | null) => void;
+    setIsSeeking: (s: boolean) => void;
+    setNeedsInteraction: (n: boolean) => void;
+    setEqualizer: (eq: { bass: number; mids: number; treble: number }) => void;
+    _emitStateUpdate: (s: any) => void;
+    updateMediaSession: () => void;
 }
 
 const getUserId = () => {
@@ -2046,183 +2334,384 @@ const getUserId = () => {
 };
 
 export const useRoomStore = createWithEqualityFn<RoomState>()((set, get) => ({
-  socket: null,
-  audioElement: (typeof window !== 'undefined') ? new Audio() : null,
-  playlist: [], currentTrackIndex: 0, isPlaying: false, isSeeking: false,
-  isAudioGraphConnected: false, roomCode: '', playlistTitle: '', users: [], username: '',
-  volume: 80, isLoading: false, error: null, isAdmin: false,
-  currentTime: 0, duration: 0, isDisconnected: false, 
-  statusMessage: null, clockOffset: 0, 
-  isCollaborative: false, needsInteraction: false,
-  userId: getUserId(),
+    socket: null,
+    audioElement: (typeof window !== 'undefined') ? new Audio() : null,
+    playlist: [], 
+    currentTrackIndex: 0, 
+    isPlaying: false, 
+    isSeeking: false,
+    roomCode: '', 
+    playlistTitle: '', 
+    users: [], 
+    username: '',
+    volume: 80, 
+    isLoading: false, 
+    error: null, 
+    isAdmin: false,
+    currentTime: 0, 
+    duration: 0, 
+    isDisconnected: false, 
+    statusMessage: null, 
+    clockOffset: 0,
+    lastSyncTime: 0,
+    isCollaborative: false, 
+    needsInteraction: false,
+    userId: getUserId(),
+    audioNodes: {
+        context: null,
+        source: null,
+        bass: null,
+        mids: null,
+        treble: null,
+    },
+    equalizer: { bass: 0, mids: 0, treble: 0 },
 
-  setLoading: (l) => set({ isLoading: l }),
-  setError: (e) => set({ error: e, isLoading: false }),
-  setIsSeeking: (s) => set({ isSeeking: s }),
-  setNeedsInteraction: (n) => set({ needsInteraction: n }),
+    setLoading: (l) => set({ isLoading: l }),
+    setError: (e) => set({ error: e, isLoading: false }),
+    setIsSeeking: (s) => set({ isSeeking: s }),
+    setNeedsInteraction: (n) => set({ needsInteraction: n }),
+    setEqualizer: (eq) => set({ equalizer: eq }),
 
-  connect: (code, name) => {
-    if (get().socket) return;
-    set({ username: name, roomCode: code });
-    const socket = io(API_URL, { transports: ['polling', 'websocket'] });
-    set({ socket });
+    connect: (code, name) => {
+        if (get().socket) return;
+        set({ username: name, roomCode: code });
+        
+        const socket = io(API_URL, { 
+            transports: ['polling', 'websocket'],
+            reconnection: true,
+            reconnectionDelay: 1000,
+            reconnectionDelayMax: 5000,
+            reconnectionAttempts: 5
+        });
+        
+        set({ socket });
 
-    socket.on('connect', () => {
-        // Send UUID (Badge) to prove who we are
-        socket.emit('join_room', { room_code: code, username: name, uuid: get().userId });
-        set({ isDisconnected: false });
-    });
-    
-    socket.on('role_update', (data: { isAdmin: boolean }) => set({ isAdmin: data.isAdmin }));
-    
-    socket.on('update_user_list', (users: any[]) => set({ users }));
-    
-    socket.on('status_update', (data: any) => {
-        set({ statusMessage: data.message });
-        if(data.error) setTimeout(() => set({ statusMessage: null }), 3000);
-    });
+        socket.on('connect', () => {
+            socket.emit('join_room', { 
+                room_code: code, 
+                username: name, 
+                uuid: get().userId 
+            });
+            set({ isDisconnected: false });
+        });
+        
+        socket.on('role_update', (data: { isAdmin: boolean }) => {
+            set({ isAdmin: data.isAdmin });
+        });
+        
+        socket.on('update_user_list', (users: any[]) => {
+            set({ users });
+        });
+        
+        socket.on('status_update', (data: any) => {
+            set({ statusMessage: data.message });
+            if (data.error) {
+                setTimeout(() => set({ statusMessage: null }), 3000);
+            }
+        });
 
-    socket.on('sync_player_state', (s: any) => get().syncPlayerState(s));
-    
-    socket.on('refresh_playlist', (d: any) => {
-        set({ playlist: d.playlist, playlistTitle: d.title });
-        if (d.current_state) get().syncPlayerState(d.current_state);
-    });
-    
-    socket.on('disconnect', () => set({ isDisconnected: true }));
-  },
+        socket.on('sync_player_state', (s: any) => {
+            get().syncPlayerState(s);
+        });
 
-  disconnect: () => {
-    get().socket?.disconnect();
-    get().audioElement?.pause();
-    set({ socket: null });
-  },
+        socket.on('sync_heartbeat', (s: any) => {
+            get().syncPlayerState(s);
+        });
+        
+        socket.on('refresh_playlist', (d: any) => {
+            set({ playlist: d.playlist, playlistTitle: d.title });
+            if (d.current_state) {
+                get().syncPlayerState(d.current_state);
+            }
+        });
+        
+        socket.on('disconnect', () => {
+            set({ isDisconnected: true });
+        });
 
-  primePlayer: () => {
-    const audio = get().audioElement;
-    if (!audio) return;
-    audio.crossOrigin = "anonymous";
-    audio.ontimeupdate = () => set({ currentTime: audio.currentTime });
-    audio.onloadedmetadata = () => {
-        set({ duration: audio.duration });
-        get().updateMediaSession();
-    };
-    audio.onended = () => get().isAdmin && get().nextTrack();
-    audio.play().then(() => {
-        audio.pause();
-        set({ needsInteraction: false });
-    }).catch(() => set({ needsInteraction: true }));
-  },
+        socket.on('load_current_state', (state: any) => {
+            get().syncPlayerState(state);
+        });
+    },
 
-  setRoomData: (data) => {
-      if (data.serverTime) {
-          const latency = 0.2; 
-          const offset = (data.serverTime * 1000) - Date.now() + (latency * 1000);
-          set({ clockOffset: offset, playlistTitle: data.title, playlist: data.playlist });
-      }
-      if (data.current_state) set({ isCollaborative: data.current_state.isCollaborative });
-  },
+    disconnect: () => {
+        get().socket?.disconnect();
+        get().audioElement?.pause();
+        set({ socket: null });
+    },
 
-  syncPlayerState: (state: any) => {
-    const { audioElement, currentTrackIndex, isPlaying } = get();
-    if (!audioElement) return;
+    primePlayer: () => {
+        const audio = get().audioElement;
+        if (!audio) return;
+        
+        audio.crossOrigin = "anonymous";
+        
+        audio.ontimeupdate = () => {
+            set({ currentTime: audio.currentTime });
+        };
+        
+        audio.onloadedmetadata = () => {
+            set({ duration: audio.duration });
+            get().updateMediaSession();
+        };
+        
+        audio.onended = () => {
+            if (get().isAdmin) {
+                get().nextTrack();
+            }
+        };
 
-    if (state.isCollaborative !== undefined) set({ isCollaborative: state.isCollaborative });
-    if (state.serverTime) set({ clockOffset: (state.serverTime * 1000) - Date.now() });
+        // Initialize audio context for visualization
+        if (typeof window !== 'undefined' && window.AudioContext) {
+            const audioContext = new (window.AudioContext || (window as any).webkitAudioContext)();
+            
+            if (audioContext.state === 'suspended') {
+                document.addEventListener('click', () => {
+                    audioContext.resume().catch(() => {});
+                }, { once: true });
+            }
 
-    if (state.trackIndex !== undefined && state.trackIndex !== currentTrackIndex) {
-        set({ currentTrackIndex: state.trackIndex });
-        if (get().playlist[state.trackIndex]?.audioUrl) {
-            audioElement.src = get().playlist[state.trackIndex].audioUrl!;
-            audioElement.load();
+            try {
+                const source = audioContext.createMediaElementSource(audio);
+                const bass = audioContext.createBiquadFilter();
+                const mids = audioContext.createBiquadFilter();
+                const treble = audioContext.createBiquadFilter();
+
+                bass.type = 'lowshelf';
+                bass.frequency.value = 200;
+                
+                mids.type = 'peaking';
+                mids.frequency.value = 3000;
+                mids.Q.value = 1;
+                
+                treble.type = 'highshelf';
+                treble.frequency.value = 3000;
+
+                source.connect(bass);
+                bass.connect(mids);
+                mids.connect(treble);
+                treble.connect(audioContext.destination);
+
+                set({
+                    audioNodes: {
+                        context: audioContext,
+                        source,
+                        bass,
+                        mids,
+                        treble,
+                    },
+                });
+            } catch (e) {
+                console.error("Audio nodes setup error:", e);
+            }
         }
-        get().updateMediaSession();
-    }
 
-    if (state.isPlaying) {
-        set({ isPlaying: true });
-        if (state.startTimestamp) {
-            const serverNow = (Date.now() + get().clockOffset) / 1000;
-            const targetTime = serverNow - state.startTimestamp;
-            if (Math.abs(audioElement.currentTime - targetTime) > 0.3) {
-                if (targetTime >= 0 && targetTime < audioElement.duration) {
-                    audioElement.currentTime = targetTime;
+        audio.play()
+            .then(() => {
+                audio.pause();
+                set({ needsInteraction: false });
+            })
+            .catch(() => {
+                set({ needsInteraction: true });
+            });
+    },
+
+    setRoomData: (data) => {
+        if (data.serverTime) {
+            const latency = (Date.now() - performance.now()) / 1000;
+            const offset = (data.serverTime * 1000) - Date.now();
+            set({ 
+                clockOffset: offset, 
+                playlistTitle: data.title, 
+                playlist: data.playlist,
+                lastSyncTime: Date.now()
+            });
+        }
+        if (data.current_state) {
+            set({ isCollaborative: data.current_state.isCollaborative });
+        }
+    },
+
+    syncPlayerState: (state: any) => {
+        const { audioElement, currentTrackIndex, isPlaying, clockOffset } = get();
+        if (!audioElement) return;
+
+        // Update collaborative setting
+        if (state.isCollaborative !== undefined) {
+            set({ isCollaborative: state.isCollaborative });
+        }
+
+        // Recalibrate clock offset
+        if (state.serverTime) {
+            const newOffset = (state.serverTime * 1000) - Date.now();
+            set({ 
+                clockOffset: newOffset,
+                lastSyncTime: Date.now()
+            });
+        }
+
+        // Track index change
+        if (state.trackIndex !== undefined && state.trackIndex !== currentTrackIndex) {
+            set({ currentTrackIndex: state.trackIndex });
+            if (get().playlist[state.trackIndex]?.audioUrl) {
+                audioElement.src = get().playlist[state.trackIndex].audioUrl!;
+                audioElement.load();
+            }
+            get().updateMediaSession();
+        }
+
+        // Playback sync logic
+        if (state.isPlaying === true) {
+            set({ isPlaying: true });
+            
+            if (state.startTimestamp !== undefined) {
+                const serverNow = (Date.now() + get().clockOffset) / 1000;
+                const expectedTime = serverNow - state.startTimestamp;
+                
+                // Only correct if drift is significant (> 500ms)
+                if (Math.abs(audioElement.currentTime - expectedTime) > 0.5) {
+                    if (expectedTime >= 0 && expectedTime < (audioElement.duration || Infinity)) {
+                        audioElement.currentTime = expectedTime;
+                        console.log(`[SYNC] Corrected drift: ${(audioElement.currentTime - expectedTime).toFixed(3)}s`);
+                    }
+                }
+            }
+            
+            audioElement.play().catch(() => {
+                set({ needsInteraction: true });
+            });
+        } else if (state.isPlaying === false) {
+            set({ isPlaying: false });
+            audioElement.pause();
+            
+            if (state.pausedAt !== undefined) {
+                if (Math.abs(audioElement.currentTime - state.pausedAt) > 0.1) {
+                    audioElement.currentTime = state.pausedAt;
                 }
             }
         }
-        audioElement.play().catch(() => set({ needsInteraction: true }));
-    } else {
-        set({ isPlaying: false });
-        audioElement.pause();
-        if (state.pausedAt !== undefined) {
-             if (Math.abs(audioElement.currentTime - state.pausedAt) > 0.1) {
-                 audioElement.currentTime = state.pausedAt;
-             }
+        
+        // Volume sync
+        if (state.volume !== undefined) {
+            set({ volume: state.volume });
+            audioElement.volume = state.volume / 100;
         }
-    }
+
+        get().updateMediaSession();
+    },
+
+    playPause: () => {
+        const { isPlaying, isAdmin, audioElement } = get();
+        if (!isAdmin || !audioElement) return;
+        
+        if (isPlaying) {
+            get()._emitStateUpdate({ 
+                isPlaying: false, 
+                pausedAt: audioElement.currentTime 
+            });
+        } else {
+            get()._emitStateUpdate({ 
+                isPlaying: true, 
+                currentTime: audioElement.currentTime 
+            });
+        }
+    },
+
+    selectTrack: (index: number) => {
+        if (!get().isAdmin) return;
+        get()._emitStateUpdate({ 
+            trackIndex: index, 
+            isPlaying: true, 
+            currentTime: 0 
+        });
+    },
+
+    nextTrack: () => {
+        const { playlist, currentTrackIndex } = get();
+        if (playlist.length === 0) return;
+        get().selectTrack((currentTrackIndex + 1) % playlist.length);
+    },
+
+    prevTrack: () => {
+        const { playlist, currentTrackIndex } = get();
+        if (playlist.length === 0) return;
+        get().selectTrack((currentTrackIndex - 1 + playlist.length) % playlist.length);
+    },
     
-    if (state.volume !== undefined) {
-        set({ volume: state.volume });
-        audioElement.volume = state.volume / 100;
+    setVolume: (v) => {
+        set({ volume: v });
+        if (get().audioElement) {
+            get().audioElement!.volume = v / 100;
+        }
+    },
+
+    toggleCollaborative: (val: boolean) => {
+        if (!get().isAdmin) return;
+        get().socket?.emit('toggle_settings', { 
+            room_code: get().roomCode, 
+            value: val 
+        });
+    },
+
+    uploadFile: async (file, title, artist) => {
+        const fd = new FormData();
+        fd.append('file', file);
+        
+        const res = await fetch(`${API_URL}/api/upload-local`, { 
+            method: 'POST', 
+            body: fd 
+        });
+        
+        if (!res.ok) {
+            throw new Error('Upload failed');
+        }
+        
+        const { audioUrl } = await res.json();
+        const uuid = get().userId;
+        
+        const uploadRes = await fetch(`${API_URL}/api/room/${get().roomCode}/add-upload`, {
+            method: 'POST', 
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ 
+                title: title || file.name, 
+                artist: artist || 'Local', 
+                audioUrl, 
+                uuid 
+            })
+        });
+
+        if (!uploadRes.ok) {
+            throw new Error('Failed to add track');
+        }
+    },
+
+    _emitStateUpdate: (state) => {
+        get().socket?.emit('update_player_state', { 
+            room_code: get().roomCode, 
+            state 
+        });
+    },
+    
+    updateMediaSession: () => {
+        if (typeof navigator === 'undefined' || !('mediaSession' in navigator)) return;
+        
+        const { playlist, currentTrackIndex, isPlaying } = get();
+        const track = playlist[currentTrackIndex];
+        
+        if (!track) return;
+        
+        navigator.mediaSession.metadata = new MediaMetadata({
+            title: track.name, 
+            artist: track.artist,
+            artwork: [{ 
+                src: '/favicon.ico', 
+                sizes: '96x96', 
+                type: 'image/png' 
+            }]
+        });
+        
+        navigator.mediaSession.playbackState = isPlaying ? "playing" : "paused";
     }
-    get().updateMediaSession();
-  },
-
-  playPause: () => {
-    const { isPlaying, isAdmin, audioElement } = get();
-    if (!isAdmin || !audioElement) return;
-    if (isPlaying) get()._emitStateUpdate({ isPlaying: false, pausedAt: audioElement.currentTime });
-    else get()._emitStateUpdate({ isPlaying: true, pausedAt: audioElement.currentTime });
-  },
-
-  selectTrack: (index: number) => {
-    if (!get().isAdmin) return;
-    get()._emitStateUpdate({ trackIndex: index, isPlaying: true, currentTime: 0 });
-  },
-
-  nextTrack: () => get().selectTrack((get().currentTrackIndex + 1) % get().playlist.length),
-  prevTrack: () => get().selectTrack((get().currentTrackIndex - 1 + get().playlist.length) % get().playlist.length),
-  
-  setVolume: (v) => {
-    set({ volume: v });
-    if (get().audioElement) get().audioElement!.volume = v / 100;
-  },
-
-  toggleCollaborative: (val: boolean) => {
-      if (!get().isAdmin) return;
-      get().socket?.emit('toggle_settings', { room_code: get().roomCode, setting: 'isCollaborative', value: val });
-  },
-
-  uploadFile: async (file, title, artist) => {
-      const fd = new FormData();
-      fd.append('file', file);
-      const res = await fetch(`${API_URL}/api/upload-local`, { method: 'POST', body: fd });
-      const { audioUrl } = await res.json();
-      
-      // SEND UUID (The Badge) instead of SID (The Wire)
-      const uuid = get().userId;
-      
-      await fetch(`${API_URL}/api/room/${get().roomCode}/add-upload`, {
-          method: 'POST', headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ title: title || file.name, artist: artist || 'Local', audioUrl, uuid })
-      });
-  },
-
-  _emitStateUpdate: (state) => {
-      get().socket?.emit('update_player_state', { room_code: get().roomCode, state });
-  },
-  
-  updateMediaSession: () => {
-      if (typeof navigator === 'undefined' || !('mediaSession' in navigator)) return;
-      const { playlist, currentTrackIndex, isPlaying } = get();
-      const track = playlist[currentTrackIndex];
-      if (!track) return;
-      navigator.mediaSession.metadata = new MediaMetadata({
-        title: track.name, artist: track.artist,
-        artwork: [{ src: '/favicon.ico', sizes: '96x96', type: 'image/png' }]
-      });
-      navigator.mediaSession.playbackState = isPlaying ? "playing" : "paused";
-  }
 }));
 
 ### ./client/tailwind.config.ts ###

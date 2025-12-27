@@ -1,3 +1,7 @@
+// FILE 2: room-store.ts
+// Location: /path/to/moodsync/client/src/lib/room-store.ts
+// Copy ALL of this and replace your current room-store.ts
+
 import { createWithEqualityFn } from 'zustand/traditional';
 import { io, Socket } from 'socket.io-client';
 
@@ -206,7 +210,6 @@ export const useRoomStore = createWithEqualityFn<RoomState>()((set, get) => ({
             }
         };
 
-        // Initialize audio context for visualization
         if (typeof window !== 'undefined' && window.AudioContext) {
             const audioContext = new (window.AudioContext || (window as any).webkitAudioContext)();
             
@@ -281,12 +284,10 @@ export const useRoomStore = createWithEqualityFn<RoomState>()((set, get) => ({
         const { audioElement, currentTrackIndex, isPlaying, clockOffset } = get();
         if (!audioElement) return;
 
-        // Update collaborative setting
         if (state.isCollaborative !== undefined) {
             set({ isCollaborative: state.isCollaborative });
         }
 
-        // Recalibrate clock offset
         if (state.serverTime) {
             const newOffset = (state.serverTime * 1000) - Date.now();
             set({ 
@@ -295,7 +296,6 @@ export const useRoomStore = createWithEqualityFn<RoomState>()((set, get) => ({
             });
         }
 
-        // Track index change
         if (state.trackIndex !== undefined && state.trackIndex !== currentTrackIndex) {
             set({ currentTrackIndex: state.trackIndex });
             if (get().playlist[state.trackIndex]?.audioUrl) {
@@ -305,7 +305,6 @@ export const useRoomStore = createWithEqualityFn<RoomState>()((set, get) => ({
             get().updateMediaSession();
         }
 
-        // Playback sync logic
         if (state.isPlaying === true) {
             set({ isPlaying: true });
             
@@ -313,7 +312,6 @@ export const useRoomStore = createWithEqualityFn<RoomState>()((set, get) => ({
                 const serverNow = (Date.now() + get().clockOffset) / 1000;
                 const expectedTime = serverNow - state.startTimestamp;
                 
-                // Only correct if drift is significant (> 500ms)
                 if (Math.abs(audioElement.currentTime - expectedTime) > 0.5) {
                     if (expectedTime >= 0 && expectedTime < (audioElement.duration || Infinity)) {
                         audioElement.currentTime = expectedTime;
@@ -336,7 +334,6 @@ export const useRoomStore = createWithEqualityFn<RoomState>()((set, get) => ({
             }
         }
         
-        // Volume sync
         if (state.volume !== undefined) {
             set({ volume: state.volume });
             audioElement.volume = state.volume / 100;

@@ -1,3 +1,7 @@
+# FILE 1: app.py
+# Location: /path/to/moodsync/app.py
+# Copy ALL of this and replace your current app.py
+
 import eventlet
 eventlet.monkey_patch()
 
@@ -205,8 +209,6 @@ def add_track_logic(room_code, rd, title, artist, url, art, lyrics):
         if len(fresh_rd['playlist']) == 1: 
             socketio.emit('sync_player_state', fresh_rd['current_state'], to=room_code)
 
-# --- SOCKET HANDLERS ---
-
 @socketio.on('join_room')
 def on_join(data):
     room = data['room_code'].upper()
@@ -312,7 +314,6 @@ def on_disconnect():
             user_list = [{'sid': k, **v} for k, v in rd['users'].items()]
             emit('update_user_list', user_list, to=room)
 
-# --- HEARTBEAT SYNC LOOP ---
 def sync_heartbeat():
     """Emit sync pulses to all active rooms every 300ms"""
     while True:
@@ -348,7 +349,6 @@ def sync_heartbeat():
             logger.error(f"Heartbeat thread error: {e}")
             eventlet.sleep(1)
 
-# Start heartbeat in background thread
 heartbeat_thread = threading.Thread(target=sync_heartbeat, daemon=True)
 heartbeat_thread.start()
 
