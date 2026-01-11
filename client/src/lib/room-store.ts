@@ -1,7 +1,11 @@
 import { createWithEqualityFn } from 'zustand/traditional';
 import { io, Socket } from 'socket.io-client';
 
-const API_URL = process.env.NEXT_PUBLIC_API_URL || 'http://localhost:5001';
+const API_URL = process.env.NEXT_PUBLIC_API_URL;
+
+if (!API_URL) {
+    console.error("CRITICAL ERROR: NEXT_PUBLIC_API_URL is not set!");
+}
 
 export interface Song { 
     name: string; 
@@ -121,15 +125,19 @@ export const useRoomStore = createWithEqualityFn<RoomState>()((set, get) => ({
         if (get().socket) return;
         set({ username: name, roomCode: code });
         
-        const socket = io(API_URL, { 
-            transports: ['polling', 'websocket'],
+        console.log(`Connecting to Backend at: ${API_URL}`);
+
+        // 2. Updated Socket Config for Cloud (Vercel -> Render)
+        const socket = io(API_URL!, { 
+            transports: ['polling', 'websocket'], // Polling first is safer for Cloud
+            withCredentials: true,
             reconnection: true,
+            reconnectionAttempts: 10,
             reconnectionDelay: 1000,
-            reconnectionDelayMax: 5000,
-            reconnectionAttempts: 5
         });
         
         set({ socket });
+
 
         socket.on('connect', () => {
             socket.emit('join_room', { 

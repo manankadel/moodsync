@@ -23,8 +23,17 @@ app = Flask(__name__)
 app.wsgi_app = ProxyFix(app.wsgi_app, x_for=1, x_proto=1, x_host=1, x_prefix=1)
 app.config['MAX_CONTENT_LENGTH'] = 100 * 1024 * 1024
 
+# ALLOW ALL ORIGINS FOR VERCEL
 CORS(app, resources={r"/*": {"origins": "*"}})
-socketio = SocketIO(app, cors_allowed_origins="*", async_mode='eventlet', ping_timeout=60, ping_interval=25)
+
+# Increase ping timeout for mobile networks (4G/5G)
+socketio = SocketIO(app, 
+    cors_allowed_origins="*", 
+    async_mode='eventlet', 
+    ping_timeout=90, 
+    ping_interval=25,
+    transports=['websocket', 'polling'] 
+)
 
 UPLOAD_FOLDER = os.path.abspath('uploads')
 os.makedirs(UPLOAD_FOLDER, exist_ok=True)
