@@ -1,7 +1,3 @@
-// FILE 3: player.tsx
-// Location: /path/to/moodsync/client/src/components/player.tsx
-// Copy ALL of this and replace your current player.tsx
-
 "use client";
 import { useState, useEffect } from "react";
 import { motion, AnimatePresence } from "framer-motion";
@@ -71,7 +67,8 @@ export default function Player({
         const driftCheck = setInterval(() => {
             const timeSinceLastSync = Date.now() - lastSyncTime;
             
-            if (timeSinceLastSync > 2000) {
+            // INCREASED THRESHOLD: NTP runs every 5000ms, so we warn if > 6000ms
+            if (timeSinceLastSync > 6000) {
                 setDriftWarning('Syncing...');
             } else {
                 setDriftWarning(null);
@@ -87,10 +84,14 @@ export default function Player({
         const seekTime = (Number(e.currentTarget.value) / 100) * duration;
         
         audioElement.currentTime = seekTime;
+        // Production sync: Send timestamp relative to server time
+        const serverNow = (Date.now() + clockOffset) / 1000;
+        const startTimestamp = serverNow - seekTime;
+
         _emitStateUpdate({ 
             currentTime: seekTime, 
             isPlaying: true,
-            startTimestamp: (Date.now() + clockOffset) / 1000 - seekTime
+            startTimestamp: startTimestamp
         });
         setIsSeeking(false);
     };
