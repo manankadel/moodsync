@@ -1,14 +1,16 @@
 flask==3.0.2
+requests==2.31.0
+boto3==1.34.69
 flask-socketio==5.3.6
 flask-cors==4.0.0
 python-dotenv==1.0.1
 redis==5.0.1
 eventlet==0.34.3
+dnspython>=2.0.0
 gunicorn==21.2.0
 ytmusicapi==1.4.2
 syncedlyrics==0.7.0
 google-api-python-client==2.118.0
 werkzeug==3.0.1
 ffmpeg-python==0.2.0
-# We install yt-dlp from source to fix the "Sign in" error
 yt-dlp @ git+https://github.com/yt-dlp/yt-dlp.git@master

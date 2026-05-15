@@ -7,7 +7,7 @@ import { motion, AnimatePresence } from 'framer-motion';
 import Player from '@/components/player';
 import { useRoomStore } from '@/lib/room-store';
 import { shallow } from 'zustand/shallow';
-import { Crown, Copy, Link as LinkIcon, Upload, WifiOff, Search, Music2, Loader2, PlusCircle, Sparkles, User, Settings, ToggleLeft, ToggleRight, PlayCircle } from 'lucide-react';
+import { Crown, Copy, Link as LinkIcon, Upload, WifiOff, Search, Music2, Loader2, PlusCircle, Sparkles, User, Settings, ToggleLeft, ToggleRight, PlayCircle, Trash2, UserCheck } from 'lucide-react';
 import FileUploadModal from '@/components/FileUploadModal';
 import SearchModal from '@/components/SearchModal';
 import Lyrics from '@/components/Lyrics';
@@ -125,13 +125,17 @@ const DisconnectedOverlay = () => (
 );
 
 const RoomSidebar = memo(function RoomSidebar({ roomCode, onOpenUpload, onOpenSearch, onOpenSettings }: { roomCode: string, onOpenUpload: () => void, onOpenSearch: () => void, onOpenSettings: () => void }) {
-    const { users, isAdmin, isCollaborative } = useRoomStore(state => ({ users: state.users, isAdmin: state.isAdmin, isCollaborative: state.isCollaborative }), shallow);
+    const { users, isAdmin, isCollaborative, socket } = useRoomStore(state => ({ users: state.users, isAdmin: state.isAdmin, isCollaborative: state.isCollaborative, socket: state.socket }), shallow);
     const [copied, setCopied] = useState(false);
-    
+
     const copyToClipboard = () => {
         navigator.clipboard.writeText(`${window.location.protocol}//${window.location.host}/room/${roomCode}`);
         setCopied(true);
         setTimeout(() => setCopied(false), 2000);
+    };
+
+    const transferAdmin = (userSid: string) => {
+        socket?.emit('transfer_admin', { room_code: roomCode, new_sid: userSid });
     };
 
     const canAdd = isAdmin || isCollaborative;
@@ -149,18 +153,27 @@ const RoomSidebar = memo(function RoomSidebar({ roomCode, onOpenUpload, onOpenSe
                     <button onClick={copyToClipboard} className="p-2 rounded-lg hover:bg-white/10 transition-colors"><Copy size={16} className={copied ? "text-cyan-400" : "text-gray-500"} /></button>
                 </div>
             </motion.div>
-            
+
             <motion.div initial={{opacity: 0, x: 20}} animate={{opacity: 1, x: 0}} className="flex-1 flex flex-col min-h-0">
                 <h2 className="text-xs font-bold tracking-widest text-gray-500 mb-3 uppercase flex justify-between">
                     <span>Listeners</span><span className="bg-white/10 px-2 rounded-full text-white">{users.length}</span>
                 </h2>
                 <div className="space-y-2 overflow-y-auto pr-2 custom-scrollbar">
                     {users.map((user, idx) => (
-                        <div key={idx} className="flex items-center gap-3 p-2 rounded-lg bg-white/5 border border-transparent hover:border-white/10 transition-colors">
-                            <div className={`w-8 h-8 rounded-full flex items-center justify-center ${user.isAdmin ? 'bg-amber-500/20 text-amber-400' : 'bg-gray-800 text-gray-400'}`}>
+                        <div key={idx} className="group flex items-center gap-3 p-2 rounded-lg bg-white/5 border border-transparent hover:border-white/10 transition-colors">
+                            <div className={`w-8 h-8 rounded-full flex items-center justify-center flex-shrink-0 ${user.isAdmin ? 'bg-amber-500/20 text-amber-400' : 'bg-gray-800 text-gray-400'}`}>
                                 {user.isAdmin ? <Crown size={14} /> : <User size={14} />}
                             </div>
-                            <span className="text-sm truncate text-gray-200 font-medium">{user.name}</span>
+                            <span className="text-sm truncate text-gray-200 font-medium flex-1">{user.name}</span>
+                            {isAdmin && !user.isAdmin && (
+                                <button
+                                    onClick={() => transferAdmin(user.sid)}
+                                    title="Make Admin"
+                                    className="opacity-0 group-hover:opacity-100 p-1 rounded hover:bg-amber-400/10 text-gray-600 hover:text-amber-400 transition-all"
+                                >
+                                    <UserCheck size={14} />
+                                </button>
+                            )}
                         </div>
                     ))}
                 </div>
@@ -201,7 +214,7 @@ function RoomPageContent() {
     playlist: s.playlist, currentTrackIndex: s.currentTrackIndex, playlistTitle: s.playlistTitle,
     isAdmin: s.isAdmin, isDisconnected: s.isDisconnected, isCollaborative: s.isCollaborative
   }), shallow);
-  const playerControls = useRoomStore(s => ({ playPause: s.playPause, nextTrack: s.nextTrack, prevTrack: s.prevTrack, setVolume: s.setVolume, selectTrack: s.selectTrack }), shallow);
+  const playerControls = useRoomStore(s => ({ playPause: s.playPause, nextTrack: s.nextTrack, prevTrack: s.prevTrack, setVolume: s.setVolume, selectTrack: s.selectTrack, removeTrack: s.removeTrack }), shallow);
   const playerState = useRoomStore(s => ({ isPlaying: s.isPlaying, volume: s.volume, duration: s.duration }), shallow);
 
   const currentTrack = state.playlist[state.currentTrackIndex];
@@ -297,6 +310,15 @@ function RoomPageContent() {
                                         <p className={`font-bold text-lg truncate ${state.currentTrackIndex === index ? 'text-cyan-400' : 'text-gray-100 group-hover:text-white'}`}>{song.name}</p>
                                         <p className="text-sm text-gray-500 truncate font-medium">{song.artist}</p>
                                     </div>
+                                    {state.isAdmin && (
+                                        <button
+                                            onClick={e => { e.stopPropagation(); playerControls.removeTrack(index); }}
+                                            className="opacity-0 group-hover:opacity-100 p-2 rounded-lg text-gray-600 hover:text-red-400 hover:bg-red-400/10 transition-all flex-shrink-0"
+                                            title="Remove track"
+                                        >
+                                            <Trash2 size={16} />
+                                        </button>
+                                    )}
                                 </motion.div>
                             ))}
                         </div>

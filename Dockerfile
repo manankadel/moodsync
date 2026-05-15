@@ -1,3 +1,4 @@
+# ./Dockerfile
 FROM python:3.11-slim
 
 # Install FFmpeg and Git
@@ -7,7 +8,7 @@ RUN apt-get update && \
 
 WORKDIR /app
 
-# Upgrade pip first (Critical fix for package finding)
+# Upgrade pip first
 RUN pip install --upgrade pip
 
 # Install dependencies

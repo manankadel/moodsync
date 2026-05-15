@@ -1,7 +1,7 @@
 "use client";
 import { useState, useEffect } from "react";
 import { motion, AnimatePresence } from "framer-motion";
-import { Play, Pause, SkipBack, SkipForward, Volume1, Volume2, VolumeX, SlidersHorizontal, Loader2 } from "lucide-react";
+import { Play, Pause, SkipBack, SkipForward, Volume1, Volume2, VolumeX, SlidersHorizontal, Loader2, Shuffle, Repeat, Repeat1 } from "lucide-react";
 import BeatVisualizer from "./visualizer";
 import Equalizer from "./Equalizer";
 import { useRoomStore } from '@/lib/room-store';
@@ -25,9 +25,10 @@ export default function Player({
     const VolumeIcon = volume === 0 ? VolumeX : volume < 50 ? Volume1 : Volume2;
     const [showEqualizer, setShowEqualizer] = useState(false);
     
-    const { 
-        currentTime, isAdmin, isSeeking, setIsSeeking, _emitStateUpdate, 
-        audioElement, statusMessage, clockOffset, lastSyncTime
+    const {
+        currentTime, isAdmin, isSeeking, setIsSeeking, _emitStateUpdate,
+        audioElement, statusMessage, clockOffset, lastSyncTime,
+        repeatMode, isShuffle, toggleRepeat, toggleShuffle,
     } = useRoomStore();
     
     const [seekValue, setSeekValue] = useState(0);
@@ -88,10 +89,11 @@ export default function Player({
         const serverNow = (Date.now() + clockOffset) / 1000;
         const startTimestamp = serverNow - seekTime;
 
-        _emitStateUpdate({ 
-            currentTime: seekTime, 
-            isPlaying: true,
-            startTimestamp: startTimestamp
+        _emitStateUpdate({
+            currentTime: seekTime,
+            isPlaying,
+            startTimestamp: startTimestamp,
+            pausedAt: isPlaying ? undefined : seekTime,
         });
         setIsSeeking(false);
     };
@@ -156,18 +158,27 @@ export default function Player({
                             </span>
                         )}
 
-                        <div className="flex items-center gap-4 sm:gap-6">
-                            <button 
-                                onClick={onPrev} 
-                                disabled={!isAdmin} 
+                        <div className="flex items-center gap-2 sm:gap-4">
+                            <button
+                                onClick={() => isAdmin && toggleShuffle()}
+                                disabled={!isAdmin}
+                                title="Shuffle"
+                                className={`disabled:opacity-30 p-2 transition-colors active:scale-95 ${isShuffle ? 'text-cyan-400' : 'text-gray-500 hover:text-white'}`}
+                            >
+                                <Shuffle size={18} />
+                            </button>
+
+                            <button
+                                onClick={onPrev}
+                                disabled={!isAdmin}
                                 className="disabled:opacity-30 text-gray-400 hover:text-white transition-colors p-2 active:scale-95"
                             >
                                 <SkipBack size={24} />
                             </button>
-                            
-                            <button 
-                                onClick={onPlayPause} 
-                                disabled={!isAdmin} 
+
+                            <button
+                                onClick={onPlayPause}
+                                disabled={!isAdmin}
                                 className="h-12 w-12 sm:h-14 sm:w-14 flex items-center justify-center rounded-full bg-white text-black disabled:opacity-50 hover:scale-105 active:scale-95 transition-all shadow-lg shadow-white/10"
                             >
                                 {isPlaying ? (
@@ -176,13 +187,22 @@ export default function Player({
                                     <Play fill="black" className="translate-x-0.5" size={24} />
                                 )}
                             </button>
-                            
-                            <button 
-                                onClick={onNext} 
-                                disabled={!isAdmin} 
+
+                            <button
+                                onClick={onNext}
+                                disabled={!isAdmin}
                                 className="disabled:opacity-30 text-gray-400 hover:text-white transition-colors p-2 active:scale-95"
                             >
                                 <SkipForward size={24} />
+                            </button>
+
+                            <button
+                                onClick={() => isAdmin && toggleRepeat()}
+                                disabled={!isAdmin}
+                                title={`Repeat: ${repeatMode}`}
+                                className={`disabled:opacity-30 p-2 transition-colors active:scale-95 ${repeatMode !== 'off' ? 'text-cyan-400' : 'text-gray-500 hover:text-white'}`}
+                            >
+                                {repeatMode === 'one' ? <Repeat1 size={18} /> : <Repeat size={18} />}
                             </button>
                         </div>
 

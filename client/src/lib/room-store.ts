@@ -46,7 +46,9 @@ interface RoomState {
     audioNodes: AudioNodes;
     equalizer: { bass: number; mids: number; treble: number };
     isSeeking: boolean;
-    
+    repeatMode: 'off' | 'one' | 'all';
+    isShuffle: boolean;
+
     // Actions
     connect: (code: string, name: string) => void;
     disconnect: () => void;
@@ -57,13 +59,16 @@ interface RoomState {
     setNeedsInteraction: (n: boolean) => void;
     setIsSeeking: (s: boolean) => void;
     setEqualizer: (eq: { bass: number; mids: number; treble: number }) => void;
-    
+
     syncLoop: () => void;
     playPause: () => void;
     nextTrack: () => void;
     prevTrack: () => void;
     setVolume: (v: number) => void;
     selectTrack: (index: number) => void;
+    removeTrack: (index: number) => void;
+    toggleRepeat: () => void;
+    toggleShuffle: () => void;
     uploadFile: (file: File, title?: string, artist?: string) => Promise<any>;
     toggleCollaborative: (val: boolean) => void;
     _emitStateUpdate: (s: any) => void;
@@ -99,6 +104,8 @@ export const useRoomStore = createWithEqualityFn<RoomState>()((set, get) => ({
     error: null,
     isDisconnected: false,
     isSeeking: false,
+    repeatMode: 'off',
+    isShuffle: false,
     equalizer: { bass: 0, mids: 0, treble: 0 },
     audioNodes: { context: null, source: null, bass: null, mids: null, treble: null },
 
@@ -201,6 +208,10 @@ export const useRoomStore = createWithEqualityFn<RoomState>()((set, get) => ({
         socket.on('role_update', (d) => set({ isAdmin: d.isAdmin }));
         socket.on('update_user_list', (u) => set({ users: u }));
         socket.on('disconnect', () => set({ isDisconnected: true }));
+        socket.on('admin_transferred', (d) => {
+            if (d.new_admin_uuid === get().userId) set({ isAdmin: true });
+            else set({ isAdmin: false });
+        });
     },
 
     disconnect: () => {
@@ -350,9 +361,37 @@ export const useRoomStore = createWithEqualityFn<RoomState>()((set, get) => ({
         });
     },
 
-    nextTrack: () => { const p = get().playlist; if (p.length) get().selectTrack((get().currentTrackIndex + 1) % p.length); },
+    nextTrack: () => {
+        const { playlist, currentTrackIndex, repeatMode, isShuffle } = get();
+        if (!playlist.length) return;
+        if (repeatMode === 'one') { get().selectTrack(currentTrackIndex); return; }
+        if (isShuffle) {
+            let next = Math.floor(Math.random() * playlist.length);
+            if (playlist.length > 1) while (next === currentTrackIndex) next = Math.floor(Math.random() * playlist.length);
+            get().selectTrack(next);
+            return;
+        }
+        const isLast = currentTrackIndex >= playlist.length - 1;
+        if (isLast) {
+            if (repeatMode === 'all') { get().selectTrack(0); }
+            else { get()._emitStateUpdate({ isPlaying: false, pausedAt: 0, trackIndex: 0 }); }
+        } else {
+            get().selectTrack(currentTrackIndex + 1);
+        }
+    },
     prevTrack: () => { const p = get().playlist; if (p.length) get().selectTrack((get().currentTrackIndex - 1 + p.length) % p.length); },
     setVolume: (v) => { set({ volume: v }); if (get().audioElement) get().audioElement!.volume = v / 100; },
+    removeTrack: (index) => {
+        if (!get().isAdmin) return;
+        get().socket?.emit('remove_track', { room_code: get().roomCode, track_index: index });
+    },
+    toggleRepeat: () => {
+        const modes: Array<'off' | 'one' | 'all'> = ['off', 'all', 'one'];
+        const current = get().repeatMode;
+        const next = modes[(modes.indexOf(current) + 1) % modes.length];
+        set({ repeatMode: next });
+    },
+    toggleShuffle: () => set(s => ({ isShuffle: !s.isShuffle })),
     toggleCollaborative: (val) => get().socket?.emit('toggle_settings', { room_code: get().roomCode, value: val }),
     _emitStateUpdate: (state) => get().socket?.emit('update_player_state', { room_code: get().roomCode, state }),
     updateMediaSession: () => {
