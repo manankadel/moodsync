@@ -16,17 +16,23 @@ logger = logging.getLogger(__name__)
 
 app = Flask(__name__)
 
-# Allow CORS for local network (192.168.x.x)
-CORS(app, resources={r"/*": {"origins": "*"}}, supports_credentials=True)
+CORS(app, resources={r"/*": {"origins": "*"}})
+
+@app.after_request
+def add_cors_headers(response):
+    response.headers['Access-Control-Allow-Origin'] = '*'
+    response.headers['Access-Control-Allow-Headers'] = 'Content-Type, Authorization'
+    response.headers['Access-Control-Allow-Methods'] = 'GET, POST, PUT, DELETE, OPTIONS'
+    return response
 
 app.wsgi_app = ProxyFix(app.wsgi_app, x_for=1, x_proto=1, x_host=1, x_prefix=1)
 app.config['MAX_CONTENT_LENGTH'] = 100 * 1024 * 1024
 app.config['SECRET_KEY'] = os.environ.get('SECRET_KEY', 'moodsync-dev-secret')
 
-socketio = SocketIO(app, 
-    cors_allowed_origins="*", 
-    async_mode='eventlet', 
-    ping_timeout=60, 
+socketio = SocketIO(app,
+    cors_allowed_origins="*",
+    async_mode='eventlet',
+    ping_timeout=60,
     ping_interval=25,
     transports=['websocket', 'polling']
 )
