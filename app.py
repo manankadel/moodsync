@@ -99,31 +99,35 @@ try:
 except:
     ytmusic = None
 
-# --- REDIS CONNECTION WITH RETRY ---
+# --- REDIS CONNECTION ---
 r = None
-# We use the service name 'redis' which Docker resolves
 redis_url = os.environ.get('REDIS_URL', 'redis://localhost:6379')
 
-def connect_redis():
+def _try_connect_redis():
     global r
-    attempts = 0
-    
-    while attempts < 20: # Increased attempts
-        try:
-            r = redis.from_url(redis_url, decode_responses=True)
-            r.ping()
-            logger.info(f"✅ Redis Online at {redis_url}")
-            return
-        except Exception as e:
-            attempts += 1
-            logger.warning(f"⚠️ Redis connection failed (Attempt {attempts}/20): {e}")
-            time.sleep(3) # Wait longer between retries
-    
-    logger.error("❌ Redis Offline - Could not connect after 20 attempts")
-    r = None
+    try:
+        client = redis.from_url(redis_url, decode_responses=True, socket_connect_timeout=5, socket_timeout=5)
+        client.ping()
+        r = client
+        logger.info(f"✅ Redis connected at {redis_url}")
+        return True
+    except Exception as e:
+        logger.warning(f"⚠️ Redis connection failed: {e}")
+        r = None
+        return False
 
-# Try to connect on startup
-connect_redis()
+def _redis_reconnect_loop():
+    """Background thread — keeps trying to reconnect if Redis is down."""
+    while True:
+        if r is None:
+            _try_connect_redis()
+        time.sleep(10)
+
+# Try once at startup (non-blocking — 5s timeout max)
+_try_connect_redis()
+
+# Background reconnect thread so the app heals automatically
+threading.Thread(target=_redis_reconnect_loop, daemon=True).start()
 
 # --- Helpers ---
 def safe_get(key): 
@@ -151,9 +155,9 @@ def serve_file(filename):
 @app.route('/generate', methods=['POST', 'OPTIONS'])
 def generate():
     if request.method == 'OPTIONS': return _build_cors_preflight_response()
-    if not r: 
-        connect_redis()
-        if not r: return jsonify({'error': 'DB Error: Redis is offline'}), 500
+    if not r:
+        _try_connect_redis()
+        if not r: return jsonify({'error': 'DB Error: Redis is offline'}), 503
     
     while True:
         code = ''.join(random.choices(string.ascii_uppercase + string.digits, k=6))
