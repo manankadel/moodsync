@@ -106,7 +106,10 @@ redis_url = os.environ.get('REDIS_URL', 'redis://localhost:6379')
 def _try_connect_redis():
     global r
     try:
-        client = redis.from_url(redis_url, decode_responses=True, socket_connect_timeout=5, socket_timeout=5)
+        kwargs = dict(decode_responses=True, socket_connect_timeout=5, socket_timeout=5)
+        if redis_url.startswith('rediss://'):
+            kwargs['ssl_cert_reqs'] = 'none'
+        client = redis.from_url(redis_url, **kwargs)
         client.ping()
         r = client
         logger.info(f"✅ Redis connected at {redis_url}")
