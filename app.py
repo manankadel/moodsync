@@ -252,8 +252,14 @@ def add_yt(code_in):
                     'format': 'bestaudio/best', 'outtmpl': local_path,
                     'postprocessors': [{'key': 'FFmpegExtractAudio', 'preferredcodec': 'mp3'}],
                     'quiet': True, 'nocheckcertificate': True,
-                    'extractor_args': {'youtube': {'player_client': ['android', 'web']}}
+                    'extractor_args': {'youtube': {'player_client': ['ios', 'android_music', 'tv_embedded']}},
+                    'http_headers': {
+                        'User-Agent': 'com.google.ios.youtube/19.29.1 (iPhone16,2; U; CPU iOS 17_5_1 like Mac OS X;)',
+                    },
                 }
+                cookies_path = '/etc/secrets/cookies.txt'
+                if os.path.exists(cookies_path):
+                    opts['cookiefile'] = cookies_path
                 with yt_dlp.YoutubeDL(opts) as ydl:
                     ydl.download([f"https://www.youtube.com/watch?v={vid}"])
             # Upload to R2 if configured, then clean up local copy
@@ -484,7 +490,13 @@ def yt_info():
     if request.method == 'OPTIONS': return _build_cors_preflight_response()
     url = request.json.get('url', '')
     try:
-        opts = {'quiet': True, 'skip_download': True}
+        opts = {
+            'quiet': True, 'skip_download': True, 'nocheckcertificate': True,
+            'extractor_args': {'youtube': {'player_client': ['ios', 'android_music', 'tv_embedded']}},
+        }
+        cookies_path = '/etc/secrets/cookies.txt'
+        if os.path.exists(cookies_path):
+            opts['cookiefile'] = cookies_path
         with yt_dlp.YoutubeDL(opts) as ydl:
             info = ydl.extract_info(url, download=False)
             return jsonify({
