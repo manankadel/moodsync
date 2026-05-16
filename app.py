@@ -1,5 +1,5 @@
-import eventlet
-# NOTE: Gunicorn automatically monkey-patches, so we don't need to do it here.
+from gevent import monkey
+monkey.patch_all()
 
 import os, random, string, logging, time, json, threading, socket, tempfile
 from flask import Flask, jsonify, request, send_from_directory
@@ -41,7 +41,7 @@ app.config['SECRET_KEY'] = os.environ.get('SECRET_KEY', 'moodsync-dev-secret')
 
 socketio = SocketIO(app,
     cors_allowed_origins="*",
-    async_mode='eventlet',
+    async_mode='gevent',
     ping_timeout=60,
     ping_interval=25,
     transports=['websocket', 'polling']

@@ -24,5 +24,5 @@ RUN mkdir -p uploads && chmod 777 uploads
 # Expose Port
 EXPOSE 5001
 
-# Run with Eventlet
-CMD ["gunicorn", "--worker-class", "eventlet", "--timeout", "120", "-w", "1", "--bind", "0.0.0.0:5001", "app:app"]
+# Run with Gevent
+CMD ["gunicorn", "--worker-class", "geventwebsocket.gunicorn.workers.GeventWebSocketWorker", "--timeout", "120", "-w", "1", "--bind", "0.0.0.0:5001", "app:app"]
