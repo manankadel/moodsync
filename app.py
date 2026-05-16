@@ -208,17 +208,50 @@ def upload_local():
 @app.route('/api/yt-search', methods=['POST', 'OPTIONS'])
 def search_yt():
     if request.method == 'OPTIONS': return _build_cors_preflight_response()
-    q = request.json.get('query')
-    try:
-        results = ytmusic.search(q, filter="songs", limit=5)
-        return jsonify({'results': [{
-            'id': i['videoId'], 
-            'title': i['title'], 
-            'artist': i['artists'][0]['name'] if 'artists' in i else 'Unknown', 
-            'thumbnail': i['thumbnails'][-1]['url'] if 'thumbnails' in i else None
-        } for i in results if 'videoId' in i]})
-    except:
-        return jsonify({'results': [], 'error': 'Search failed'})
+    q = request.json.get('query', '')
+    if not q:
+        return jsonify({'results': []})
+
+    api_key = os.environ.get('YOUTUBE_API_KEY')
+    if api_key:
+        try:
+            from googleapiclient.discovery import build
+            youtube = build('youtube', 'v3', developerKey=api_key)
+            resp = youtube.search().list(
+                part='snippet', q=q, type='video',
+                videoCategoryId='10', maxResults=8
+            ).execute()
+            results = []
+            for item in resp.get('items', []):
+                vid_id = item['id'].get('videoId')
+                if not vid_id:
+                    continue
+                snippet = item['snippet']
+                results.append({
+                    'id': vid_id,
+                    'title': snippet['title'],
+                    'artist': snippet['channelTitle'].replace(' - Topic', ''),
+                    'thumbnail': snippet['thumbnails'].get('high', {}).get('url')
+                               or snippet['thumbnails']['default']['url'],
+                })
+            return jsonify({'results': results})
+        except Exception as e:
+            logger.warning(f"YouTube Data API search failed: {e}")
+
+    # Fallback: ytmusicapi (scraping-based, less reliable)
+    if ytmusic:
+        try:
+            results = ytmusic.search(q, filter="songs", limit=5)
+            return jsonify({'results': [{
+                'id': i['videoId'],
+                'title': i['title'],
+                'artist': i['artists'][0]['name'] if 'artists' in i else 'Unknown',
+                'thumbnail': i['thumbnails'][-1]['url'] if 'thumbnails' in i else None
+            } for i in results if 'videoId' in i]})
+        except Exception as e:
+            logger.warning(f"ytmusicapi search failed: {e}")
+
+    return jsonify({'results': [], 'error': 'Search unavailable'})
 
 @app.route('/api/room/<code_in>/add-yt', methods=['POST', 'OPTIONS'])
 def add_yt(code_in):
