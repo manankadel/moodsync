@@ -281,19 +281,31 @@ def add_yt(code_in):
         else:
             # Download to local disk first
             if not os.path.exists(local_path):
-                cookies_path = _get_cookies_path()
-                opts = {
-                    'format': 'bestaudio/best', 'outtmpl': local_path,
-                    'postprocessors': [{'key': 'FFmpegExtractAudio', 'preferredcodec': 'mp3'}],
-                    'quiet': True, 'nocheckcertificate': True,
-                    # web client supports cookies (authenticated session bypasses bot check)
-                    # ios client works without cookies but is incompatible with cookiefile
-                    'extractor_args': {'youtube': {'player_client': ['web'] if cookies_path else ['ios']}},
-                }
-                if cookies_path:
-                    opts['cookiefile'] = cookies_path
-                with yt_dlp.YoutubeDL(opts) as ydl:
-                    ydl.download([f"https://www.youtube.com/watch?v={vid}"])
+                piped_url, piped_origin = _get_piped_audio(vid)
+                if piped_url:
+                    # Piped proxies through its own servers — bypasses YouTube's datacenter IP block
+                    dl_opts = {
+                        'format': 'bestaudio/best', 'outtmpl': local_path,
+                        'postprocessors': [{'key': 'FFmpegExtractAudio', 'preferredcodec': 'mp3'}],
+                        'quiet': True,
+                        'http_headers': {'Referer': f'{piped_origin}/'},
+                    }
+                    with yt_dlp.YoutubeDL(dl_opts) as ydl:
+                        ydl.download([piped_url])
+                else:
+                    # Fallback: direct yt-dlp with cookies
+                    logger.warning(f"All Piped instances failed, falling back to direct yt-dlp")
+                    cookies_path = _get_cookies_path()
+                    dl_opts = {
+                        'format': 'bestaudio/best', 'outtmpl': local_path,
+                        'postprocessors': [{'key': 'FFmpegExtractAudio', 'preferredcodec': 'mp3'}],
+                        'quiet': True, 'nocheckcertificate': True,
+                        'extractor_args': {'youtube': {'player_client': ['web'] if cookies_path else ['ios']}},
+                    }
+                    if cookies_path:
+                        dl_opts['cookiefile'] = cookies_path
+                    with yt_dlp.YoutubeDL(dl_opts) as ydl:
+                        ydl.download([f"https://www.youtube.com/watch?v={vid}"])
             # Upload to R2 if configured, then clean up local copy
             r2_url = r2_upload(local_path, filename)
             if r2_url:
@@ -367,6 +379,38 @@ def _get_cookies_path():
         except Exception as e:
             logger.warning(f"Could not copy cookies: {e}")
     return None
+
+_PIPED_APIS = [
+    'https://pipedapi.kavin.rocks',
+    'https://piped-api.garudalinux.org',
+    'https://api.piped.yt',
+]
+
+def _get_piped_audio(video_id):
+    """
+    Return (stream_url, api_base) from a Piped instance, or (None, None).
+    Piped proxies YouTube audio through its own servers, bypassing YouTube's
+    datacenter IP blocks that affect Render/cloud hosts.
+    """
+    import requests as req
+    from urllib.parse import urlparse
+    for api in _PIPED_APIS:
+        try:
+            r = req.get(f'{api}/streams/{video_id}', timeout=8)
+            if not r.ok:
+                continue
+            streams = r.json().get('audioStreams', [])
+            if not streams:
+                continue
+            best = max(streams, key=lambda s: s.get('bitrate', 0))
+            url = best.get('url', '')
+            # Only use if URL is proxied through Piped, not redirected to YouTube CDN
+            if 'googlevideo.com' not in url:
+                logger.info(f"Piped audio via {api}")
+                return url, api
+        except Exception as e:
+            logger.warning(f"Piped {api} failed: {e}")
+    return None, None
 
 def _build_cors_preflight_response():
     response = jsonify({})
