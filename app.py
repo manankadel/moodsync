@@ -248,16 +248,15 @@ def add_yt(code_in):
         else:
             # Download to local disk first
             if not os.path.exists(local_path):
+                cookies_path = _get_cookies_path()
                 opts = {
                     'format': 'bestaudio/best', 'outtmpl': local_path,
                     'postprocessors': [{'key': 'FFmpegExtractAudio', 'preferredcodec': 'mp3'}],
                     'quiet': True, 'nocheckcertificate': True,
-                    'extractor_args': {'youtube': {'player_client': ['ios', 'android_music', 'tv_embedded']}},
-                    'http_headers': {
-                        'User-Agent': 'com.google.ios.youtube/19.29.1 (iPhone16,2; U; CPU iOS 17_5_1 like Mac OS X;)',
-                    },
+                    # web client supports cookies (authenticated session bypasses bot check)
+                    # ios client works without cookies but is incompatible with cookiefile
+                    'extractor_args': {'youtube': {'player_client': ['web'] if cookies_path else ['ios']}},
                 }
-                cookies_path = _get_cookies_path()
                 if cookies_path:
                     opts['cookiefile'] = cookies_path
                 with yt_dlp.YoutubeDL(opts) as ydl:
@@ -502,11 +501,11 @@ def yt_info():
     if request.method == 'OPTIONS': return _build_cors_preflight_response()
     url = request.json.get('url', '')
     try:
+        cookies_path = _get_cookies_path()
         opts = {
             'quiet': True, 'skip_download': True, 'nocheckcertificate': True,
-            'extractor_args': {'youtube': {'player_client': ['ios', 'android_music', 'tv_embedded']}},
+            'extractor_args': {'youtube': {'player_client': ['web'] if cookies_path else ['ios']}},
         }
-        cookies_path = _get_cookies_path()
         if cookies_path:
             opts['cookiefile'] = cookies_path
         with yt_dlp.YoutubeDL(opts) as ydl:
