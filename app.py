@@ -281,23 +281,27 @@ def add_yt(code_in):
         else:
             # Download to local disk first
             if not os.path.exists(local_path):
-                # Try Piped first, then Invidious — both proxy through non-blocked IPs
-                stream_url = _get_piped_audio(vid) or _get_invidious_audio(vid)
-                if stream_url:
-                    mp3_tmp = _download_stream(stream_url)
-                    import shutil as _shutil
-                    _shutil.move(mp3_tmp, local_path)
+                # 1. cobalt.tools — dedicated service, handles YouTube bot detection
+                if _cobalt_download(vid, local_path):
+                    pass
                 else:
-                    logger.warning("All proxy instances failed, falling back to direct yt-dlp ios")
-                    dl_opts = {
-                        'format': 'bestaudio/best', 'outtmpl': local_path,
-                        'postprocessors': [{'key': 'FFmpegExtractAudio', 'preferredcodec': 'mp3'}],
-                        'quiet': True, 'nocheckcertificate': True,
-                        'extractor_args': {'youtube': {'player_client': ['ios']}},
-                        'no_cookies': True,
-                    }
-                    with yt_dlp.YoutubeDL(dl_opts) as ydl:
-                        ydl.download([f"https://www.youtube.com/watch?v={vid}"])
+                    # 2. Piped → 3. Invidious — community proxy instances
+                    stream_url = _get_piped_audio(vid) or _get_invidious_audio(vid)
+                    if stream_url:
+                        mp3_tmp = _download_stream(stream_url)
+                        shutil.move(mp3_tmp, local_path)
+                    else:
+                        # 4. Last resort: direct yt-dlp (will fail on Render but try anyway)
+                        logger.warning("All methods failed, attempting direct yt-dlp ios")
+                        dl_opts = {
+                            'format': 'bestaudio/best', 'outtmpl': local_path,
+                            'postprocessors': [{'key': 'FFmpegExtractAudio', 'preferredcodec': 'mp3'}],
+                            'quiet': True, 'nocheckcertificate': True,
+                            'extractor_args': {'youtube': {'player_client': ['ios']}},
+                            'no_cookies': True,
+                        }
+                        with yt_dlp.YoutubeDL(dl_opts) as ydl:
+                            ydl.download([f"https://www.youtube.com/watch?v={vid}"])
             # Upload to R2 if configured, then clean up local copy
             r2_url = r2_upload(local_path, filename)
             if r2_url:
@@ -392,8 +396,7 @@ _INVIDIOUS_APIS = [
 def _download_stream(stream_url):
     """Download a raw audio stream URL and convert to mp3. Returns local_mp3_path or raises."""
     import requests as req, subprocess, tempfile
-    suffix = '.webm' if 'webm' in stream_url else '.m4a'
-    with tempfile.NamedTemporaryFile(suffix=suffix, delete=False) as tmp:
+    with tempfile.NamedTemporaryFile(suffix='.tmp', delete=False) as tmp:
         raw_path = tmp.name
     try:
         with req.get(stream_url, stream=True, timeout=180,
@@ -411,6 +414,47 @@ def _download_stream(stream_url):
     finally:
         try: os.remove(raw_path)
         except: pass
+
+def _cobalt_download(video_id, output_path):
+    """
+    cobalt.tools: dedicated download service that handles YouTube bot detection.
+    Returns True and writes mp3 directly to output_path on success.
+    """
+    import requests as req
+    try:
+        resp = req.post(
+            'https://api.cobalt.tools/',
+            json={
+                'url': f'https://www.youtube.com/watch?v={video_id}',
+                'downloadMode': 'audio',
+                'audioFormat': 'mp3',
+            },
+            headers={
+                'Accept': 'application/json',
+                'Content-Type': 'application/json',
+                'User-Agent': 'Mozilla/5.0',
+            },
+            timeout=30
+        )
+        if not resp.ok:
+            logger.warning(f"cobalt.tools → {resp.status_code}: {resp.text[:200]}")
+            return False
+        data = resp.json()
+        status = data.get('status')
+        url = data.get('url')
+        if status in ('tunnel', 'redirect', 'stream') and url:
+            with req.get(url, stream=True, timeout=180,
+                         headers={'User-Agent': 'Mozilla/5.0'}) as dl:
+                dl.raise_for_status()
+                with open(output_path, 'wb') as f:
+                    for chunk in dl.iter_content(chunk_size=65536):
+                        f.write(chunk)
+            logger.info(f"✅ cobalt.tools → {status}")
+            return True
+        logger.warning(f"cobalt.tools → unexpected response: {data}")
+    except Exception as e:
+        logger.warning(f"cobalt.tools failed: {e}")
+    return False
 
 def _get_piped_audio(video_id):
     """Return stream URL from a Piped instance, or None."""
