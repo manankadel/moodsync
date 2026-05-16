@@ -1,7 +1,7 @@
 from gevent import monkey
 monkey.patch_all()
 
-import os, random, string, logging, time, json, threading, socket, tempfile
+import os, random, string, logging, time, json, threading, socket, tempfile, shutil
 from flask import Flask, jsonify, request, send_from_directory
 from flask_socketio import SocketIO, join_room, emit
 from flask_cors import CORS
@@ -257,8 +257,8 @@ def add_yt(code_in):
                         'User-Agent': 'com.google.ios.youtube/19.29.1 (iPhone16,2; U; CPU iOS 17_5_1 like Mac OS X;)',
                     },
                 }
-                cookies_path = '/etc/secrets/cookies.txt'
-                if os.path.exists(cookies_path):
+                cookies_path = _get_cookies_path()
+                if cookies_path:
                     opts['cookiefile'] = cookies_path
                 with yt_dlp.YoutubeDL(opts) as ydl:
                     ydl.download([f"https://www.youtube.com/watch?v={vid}"])
@@ -323,6 +323,18 @@ def add_track_logic(room_code, rd, title, artist, url, art, lyrics):
         socketio.emit('refresh_playlist', fresh_rd, to=room_code)
         if len(fresh_rd['playlist']) == 1: 
             socketio.emit('sync_player_state', fresh_rd['current_state'], to=room_code)
+
+def _get_cookies_path():
+    """Copy secret cookies to /tmp so yt-dlp can write back to it."""
+    secret = '/etc/secrets/cookies.txt'
+    writable = '/tmp/yt_cookies.txt'
+    if os.path.exists(secret):
+        try:
+            shutil.copy2(secret, writable)
+            return writable
+        except Exception as e:
+            logger.warning(f"Could not copy cookies: {e}")
+    return None
 
 def _build_cors_preflight_response():
     response = jsonify({})
@@ -494,8 +506,8 @@ def yt_info():
             'quiet': True, 'skip_download': True, 'nocheckcertificate': True,
             'extractor_args': {'youtube': {'player_client': ['ios', 'android_music', 'tv_embedded']}},
         }
-        cookies_path = '/etc/secrets/cookies.txt'
-        if os.path.exists(cookies_path):
+        cookies_path = _get_cookies_path()
+        if cookies_path:
             opts['cookiefile'] = cookies_path
         with yt_dlp.YoutubeDL(opts) as ydl:
             info = ydl.extract_info(url, download=False)
