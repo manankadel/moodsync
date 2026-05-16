@@ -281,32 +281,20 @@ def add_yt(code_in):
         else:
             # Download to local disk first
             if not os.path.exists(local_path):
-                piped_url, piped_origin = _get_piped_audio(vid)
-                if piped_url:
-                    # Stream directly from the signed CDN URL Piped returned (no yt-dlp extractor)
-                    import requests as req, subprocess
-                    raw_path = local_path + '.raw'
-                    with req.get(piped_url, stream=True, timeout=180,
-                                 headers={'User-Agent': 'Mozilla/5.0'}) as resp:
-                        resp.raise_for_status()
-                        with open(raw_path, 'wb') as fout:
-                            for chunk in resp.iter_content(chunk_size=65536):
-                                fout.write(chunk)
-                    subprocess.run(
-                        ['ffmpeg', '-y', '-i', raw_path, '-vn',
-                         '-acodec', 'libmp3lame', '-q:a', '2', local_path],
-                        check=True, capture_output=True
-                    )
-                    try: os.remove(raw_path)
-                    except: pass
+                # Try Piped first, then Invidious — both proxy through non-blocked IPs
+                stream_url = _get_piped_audio(vid) or _get_invidious_audio(vid)
+                if stream_url:
+                    mp3_tmp = _download_stream(stream_url)
+                    import shutil as _shutil
+                    _shutil.move(mp3_tmp, local_path)
                 else:
-                    # Fallback: direct yt-dlp, ios client only (cookies are stale and web needs poToken)
-                    logger.warning("All Piped instances failed, falling back to direct yt-dlp")
+                    logger.warning("All proxy instances failed, falling back to direct yt-dlp ios")
                     dl_opts = {
                         'format': 'bestaudio/best', 'outtmpl': local_path,
                         'postprocessors': [{'key': 'FFmpegExtractAudio', 'preferredcodec': 'mp3'}],
                         'quiet': True, 'nocheckcertificate': True,
                         'extractor_args': {'youtube': {'player_client': ['ios']}},
+                        'no_cookies': True,
                     }
                     with yt_dlp.YoutubeDL(dl_opts) as ydl:
                         ydl.download([f"https://www.youtube.com/watch?v={vid}"])
@@ -384,40 +372,93 @@ def _get_cookies_path():
             logger.warning(f"Could not copy cookies: {e}")
     return None
 
-# (api_url, timeout_seconds) — kavin.rocks resolves on Render but is slow, needs 25s
 _PIPED_APIS = [
     ('https://pipedapi.kavin.rocks', 25),
-    ('https://pipedapi.reallyaweso.me', 15),
-    ('https://piped-api.projectsegfau.lt', 15),
-    ('https://pipedapi.tokhmi.xyz', 15),
+    ('https://pipedapi.adminforge.de', 20),
+    ('https://pipedapi.reallyaweso.me', 20),
+    ('https://piped-api.projectsegfau.lt', 20),
+    ('https://pipedapi.tokhmi.xyz', 20),
+    ('https://piped-api.garudalinux.org', 20),
 ]
 
+_INVIDIOUS_APIS = [
+    ('https://inv.nadeko.net', 25),
+    ('https://invidious.snopyta.org', 25),
+    ('https://invidious.kavin.rocks', 25),
+    ('https://invidious.flokinet.to', 20),
+    ('https://vid.puffyan.us', 20),
+]
+
+def _download_stream(stream_url):
+    """Download a raw audio stream URL and convert to mp3. Returns local_mp3_path or raises."""
+    import requests as req, subprocess, tempfile
+    suffix = '.webm' if 'webm' in stream_url else '.m4a'
+    with tempfile.NamedTemporaryFile(suffix=suffix, delete=False) as tmp:
+        raw_path = tmp.name
+    try:
+        with req.get(stream_url, stream=True, timeout=180,
+                     headers={'User-Agent': 'Mozilla/5.0'}) as resp:
+            resp.raise_for_status()
+            with open(raw_path, 'wb') as fout:
+                for chunk in resp.iter_content(chunk_size=65536):
+                    fout.write(chunk)
+        mp3_path = raw_path + '.mp3'
+        subprocess.run(
+            ['ffmpeg', '-y', '-i', raw_path, '-vn', '-acodec', 'libmp3lame', '-q:a', '2', mp3_path],
+            check=True, capture_output=True
+        )
+        return mp3_path
+    finally:
+        try: os.remove(raw_path)
+        except: pass
+
 def _get_piped_audio(video_id):
-    """
-    Return (stream_url, api_base) from a Piped instance, or (None, None).
-    Piped calls YouTube's InnerTube API using its own servers (not Render's blocked IP)
-    and returns signed googlevideo.com CDN URLs. These URLs are token-signed, not
-    IP-locked, so we can download them directly from any IP.
-    """
+    """Return stream URL from a Piped instance, or None."""
     import requests as req
     for api, timeout in _PIPED_APIS:
         try:
-            r = req.get(f'{api}/streams/{video_id}', timeout=timeout)
+            r = req.get(f'{api}/streams/{video_id}', timeout=timeout,
+                        headers={'User-Agent': 'Mozilla/5.0'})
             if not r.ok:
-                logger.warning(f"Piped {api} returned {r.status_code}")
+                logger.warning(f"Piped {api} → {r.status_code}")
                 continue
             streams = r.json().get('audioStreams', [])
             if not streams:
-                logger.warning(f"Piped {api} returned no audioStreams")
+                logger.warning(f"Piped {api} → no audioStreams")
                 continue
             best = max(streams, key=lambda s: s.get('bitrate', 0))
             url = best.get('url', '')
             if url:
-                logger.info(f"Piped audio via {api} ({best.get('mimeType','?')}, {best.get('bitrate',0)}bps)")
-                return url, api
+                logger.info(f"✅ Piped {api} ({best.get('mimeType','?')}, {best.get('bitrate',0)}bps)")
+                return url
         except Exception as e:
             logger.warning(f"Piped {api} failed: {e}")
-    return None, None
+    return None
+
+def _get_invidious_audio(video_id):
+    """Return stream URL from an Invidious instance, or None."""
+    import requests as req
+    for api, timeout in _INVIDIOUS_APIS:
+        try:
+            r = req.get(f'{api}/api/v1/videos/{video_id}', timeout=timeout,
+                        headers={'User-Agent': 'Mozilla/5.0'})
+            if not r.ok:
+                logger.warning(f"Invidious {api} → {r.status_code}")
+                continue
+            data = r.json()
+            formats = [f for f in data.get('adaptiveFormats', [])
+                       if 'audio' in f.get('type', '')]
+            if not formats:
+                logger.warning(f"Invidious {api} → no audio formats")
+                continue
+            best = max(formats, key=lambda f: int(f.get('bitrate', 0)))
+            url = best.get('url', '')
+            if url:
+                logger.info(f"✅ Invidious {api} ({best.get('type','?')}, {best.get('bitrate',0)}bps)")
+                return url
+        except Exception as e:
+            logger.warning(f"Invidious {api} failed: {e}")
+    return None
 
 def _build_cors_preflight_response():
     response = jsonify({})
