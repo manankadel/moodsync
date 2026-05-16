@@ -283,15 +283,22 @@ def add_yt(code_in):
             if not os.path.exists(local_path):
                 piped_url, piped_origin = _get_piped_audio(vid)
                 if piped_url:
-                    # Piped proxies through its own servers — bypasses YouTube's datacenter IP block
-                    dl_opts = {
-                        'format': 'bestaudio/best', 'outtmpl': local_path,
-                        'postprocessors': [{'key': 'FFmpegExtractAudio', 'preferredcodec': 'mp3'}],
-                        'quiet': True,
-                        'http_headers': {'Referer': f'{piped_origin}/'},
-                    }
-                    with yt_dlp.YoutubeDL(dl_opts) as ydl:
-                        ydl.download([piped_url])
+                    # Stream directly from the signed CDN URL Piped returned (no yt-dlp extractor)
+                    import requests as req, subprocess
+                    raw_path = local_path + '.raw'
+                    with req.get(piped_url, stream=True, timeout=180,
+                                 headers={'User-Agent': 'Mozilla/5.0'}) as resp:
+                        resp.raise_for_status()
+                        with open(raw_path, 'wb') as fout:
+                            for chunk in resp.iter_content(chunk_size=65536):
+                                fout.write(chunk)
+                    subprocess.run(
+                        ['ffmpeg', '-y', '-i', raw_path, '-vn',
+                         '-acodec', 'libmp3lame', '-q:a', '2', local_path],
+                        check=True, capture_output=True
+                    )
+                    try: os.remove(raw_path)
+                    except: pass
                 else:
                     # Fallback: direct yt-dlp, ios client only (cookies are stale and web needs poToken)
                     logger.warning("All Piped instances failed, falling back to direct yt-dlp")
@@ -388,22 +395,25 @@ _PIPED_APIS = [
 def _get_piped_audio(video_id):
     """
     Return (stream_url, api_base) from a Piped instance, or (None, None).
-    Piped proxies YouTube audio through its own servers, bypassing YouTube's
-    datacenter IP blocks that affect Render/cloud hosts.
+    Piped calls YouTube's InnerTube API using its own servers (not Render's blocked IP)
+    and returns signed googlevideo.com CDN URLs. These URLs are token-signed, not
+    IP-locked, so we can download them directly from any IP.
     """
     import requests as req
     for api, timeout in _PIPED_APIS:
         try:
             r = req.get(f'{api}/streams/{video_id}', timeout=timeout)
             if not r.ok:
+                logger.warning(f"Piped {api} returned {r.status_code}")
                 continue
             streams = r.json().get('audioStreams', [])
             if not streams:
+                logger.warning(f"Piped {api} returned no audioStreams")
                 continue
             best = max(streams, key=lambda s: s.get('bitrate', 0))
             url = best.get('url', '')
-            if 'googlevideo.com' not in url:
-                logger.info(f"Piped audio via {api}")
+            if url:
+                logger.info(f"Piped audio via {api} ({best.get('mimeType','?')}, {best.get('bitrate',0)}bps)")
                 return url, api
         except Exception as e:
             logger.warning(f"Piped {api} failed: {e}")
