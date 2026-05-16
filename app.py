@@ -293,17 +293,14 @@ def add_yt(code_in):
                     with yt_dlp.YoutubeDL(dl_opts) as ydl:
                         ydl.download([piped_url])
                 else:
-                    # Fallback: direct yt-dlp with cookies
-                    logger.warning(f"All Piped instances failed, falling back to direct yt-dlp")
-                    cookies_path = _get_cookies_path()
+                    # Fallback: direct yt-dlp, ios client only (cookies are stale and web needs poToken)
+                    logger.warning("All Piped instances failed, falling back to direct yt-dlp")
                     dl_opts = {
                         'format': 'bestaudio/best', 'outtmpl': local_path,
                         'postprocessors': [{'key': 'FFmpegExtractAudio', 'preferredcodec': 'mp3'}],
                         'quiet': True, 'nocheckcertificate': True,
-                        'extractor_args': {'youtube': {'player_client': ['web'] if cookies_path else ['ios']}},
+                        'extractor_args': {'youtube': {'player_client': ['ios']}},
                     }
-                    if cookies_path:
-                        dl_opts['cookiefile'] = cookies_path
                     with yt_dlp.YoutubeDL(dl_opts) as ydl:
                         ydl.download([f"https://www.youtube.com/watch?v={vid}"])
             # Upload to R2 if configured, then clean up local copy
@@ -380,10 +377,12 @@ def _get_cookies_path():
             logger.warning(f"Could not copy cookies: {e}")
     return None
 
+# (api_url, timeout_seconds) — kavin.rocks resolves on Render but is slow, needs 25s
 _PIPED_APIS = [
-    'https://pipedapi.kavin.rocks',
-    'https://piped-api.garudalinux.org',
-    'https://api.piped.yt',
+    ('https://pipedapi.kavin.rocks', 25),
+    ('https://pipedapi.reallyaweso.me', 15),
+    ('https://piped-api.projectsegfau.lt', 15),
+    ('https://pipedapi.tokhmi.xyz', 15),
 ]
 
 def _get_piped_audio(video_id):
@@ -393,10 +392,9 @@ def _get_piped_audio(video_id):
     datacenter IP blocks that affect Render/cloud hosts.
     """
     import requests as req
-    from urllib.parse import urlparse
-    for api in _PIPED_APIS:
+    for api, timeout in _PIPED_APIS:
         try:
-            r = req.get(f'{api}/streams/{video_id}', timeout=8)
+            r = req.get(f'{api}/streams/{video_id}', timeout=timeout)
             if not r.ok:
                 continue
             streams = r.json().get('audioStreams', [])
@@ -404,7 +402,6 @@ def _get_piped_audio(video_id):
                 continue
             best = max(streams, key=lambda s: s.get('bitrate', 0))
             url = best.get('url', '')
-            # Only use if URL is proxied through Piped, not redirected to YouTube CDN
             if 'googlevideo.com' not in url:
                 logger.info(f"Piped audio via {api}")
                 return url, api
