@@ -336,27 +336,31 @@ def add_yt(code_in):
         else:
             # Download to local disk first
             if not os.path.exists(local_path):
-                # 1. cobalt.tools — dedicated service, handles YouTube bot detection
-                if _cobalt_download(vid, local_path):
-                    pass
-                else:
-                    # 2. Piped → 3. Invidious — community proxy instances
-                    stream_url = _get_piped_audio(vid) or _get_invidious_audio(vid)
-                    if stream_url:
-                        mp3_tmp = _download_stream(stream_url)
-                        shutil.move(mp3_tmp, local_path)
+                cookies_path = _get_cookies_path()
+                downloaded = False
+
+                # Cookies present → yt-dlp directly is the reliable path
+                if cookies_path:
+                    downloaded = _ytdlp_download(vid, local_path, cookies_path)
+                    if not downloaded:
+                        logger.warning("yt-dlp with cookies failed — cookies may be stale")
+
+                # No cookies (or cookies failed) → try community proxies
+                if not downloaded:
+                    if _cobalt_download(vid, local_path):
+                        downloaded = True
                     else:
-                        # 4. Last resort: direct yt-dlp (will fail on Render but try anyway)
-                        logger.warning("All methods failed, attempting direct yt-dlp ios")
-                        dl_opts = {
-                            'format': 'bestaudio/best', 'outtmpl': local_path,
-                            'postprocessors': [{'key': 'FFmpegExtractAudio', 'preferredcodec': 'mp3'}],
-                            'quiet': True, 'nocheckcertificate': True,
-                            'extractor_args': {'youtube': {'player_client': ['ios']}},
-                            'no_cookies': True,
-                        }
-                        with yt_dlp.YoutubeDL(dl_opts) as ydl:
-                            ydl.download([f"https://www.youtube.com/watch?v={vid}"])
+                        stream_url = _get_piped_audio(vid) or _get_invidious_audio(vid)
+                        if stream_url:
+                            mp3_tmp = _download_stream(stream_url)
+                            shutil.move(mp3_tmp, local_path)
+                            downloaded = True
+
+                # Final fallback: yt-dlp without cookies (usually fails on datacenter IPs)
+                if not downloaded:
+                    logger.warning("All methods failed, attempting bare yt-dlp")
+                    if not _ytdlp_download(vid, local_path, None):
+                        raise RuntimeError("Could not download audio — all methods failed (cookies may be expired)")
             # Upload to R2 if configured, then clean up local copy
             r2_url = r2_upload(local_path, filename)
             if r2_url:
@@ -469,6 +473,30 @@ def _download_stream(stream_url):
     finally:
         try: os.remove(raw_path)
         except: pass
+
+def _ytdlp_download(video_id, output_path, cookies_path):
+    """Direct yt-dlp download. With cookies, uses the 'web' client; without, falls back to 'ios'."""
+    dl_opts = {
+        'format': 'bestaudio/best',
+        'outtmpl': output_path,
+        'postprocessors': [{'key': 'FFmpegExtractAudio', 'preferredcodec': 'mp3'}],
+        'quiet': True,
+        'nocheckcertificate': True,
+        'extractor_args': {'youtube': {'player_client': ['web'] if cookies_path else ['ios']}},
+    }
+    if cookies_path:
+        dl_opts['cookiefile'] = cookies_path
+    else:
+        dl_opts['no_cookies'] = True
+    try:
+        with yt_dlp.YoutubeDL(dl_opts) as ydl:
+            ydl.download([f"https://www.youtube.com/watch?v={video_id}"])
+        if os.path.exists(output_path):
+            logger.info(f"✅ yt-dlp ({'cookies' if cookies_path else 'no-cookies'}) → {video_id}")
+            return True
+    except Exception as e:
+        logger.warning(f"yt-dlp ({'cookies' if cookies_path else 'no-cookies'}) failed: {e}")
+    return False
 
 def _cobalt_download(video_id, output_path):
     """
