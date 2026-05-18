@@ -1,10 +1,10 @@
 # ./Dockerfile
 FROM python:3.11-slim
 
-# Install FFmpeg and Git
+# Install FFmpeg, Git, and Node.js (yt-dlp needs Node to solve YouTube's n-challenge)
 RUN apt-get update && \
-    apt-get install -y ffmpeg git && \
-    apt-get clean
+    apt-get install -y ffmpeg git nodejs && \
+    apt-get clean && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app
 
