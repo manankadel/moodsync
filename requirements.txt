@@ -13,4 +13,4 @@ syncedlyrics==0.7.0
 google-api-python-client==2.118.0
 werkzeug==3.0.1
 ffmpeg-python==0.2.0
-yt-dlp @ git+https://github.com/yt-dlp/yt-dlp.git@master
+yt-dlp==2025.10.14
