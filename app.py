@@ -2,7 +2,7 @@ from gevent import monkey
 monkey.patch_all()
 
 import os, random, string, logging, time, json, threading, socket, tempfile, shutil
-from flask import Flask, jsonify, request, send_from_directory
+from flask import Flask, jsonify, request, send_from_directory, Response, stream_with_context
 from flask_socketio import SocketIO, join_room, emit
 from flask_cors import CORS
 import redis
@@ -94,6 +94,30 @@ def r2_exists(filename):
         return True
     except: return False
 
+def r2_ensure_cors():
+    """Allow any origin to fetch audio — runs once at startup."""
+    client, bucket = _r2_client()
+    if not client:
+        return
+    try:
+        client.put_bucket_cors(
+            Bucket=bucket,
+            CORSConfiguration={
+                'CORSRules': [{
+                    'AllowedHeaders': ['*'],
+                    'AllowedMethods': ['GET', 'HEAD'],
+                    'AllowedOrigins': ['*'],
+                    'ExposeHeaders': ['Content-Length', 'Content-Type', 'ETag'],
+                    'MaxAgeSeconds': 86400,
+                }]
+            }
+        )
+        logger.info("✅ R2 CORS configured")
+    except Exception as e:
+        logger.warning(f"R2 CORS setup skipped: {e}")
+
+r2_ensure_cors()
+
 try:
     ytmusic = YTMusic(language='en')
 except:
@@ -140,12 +164,9 @@ def safe_set(key, val):
     if r: r.set(key, val, ex=86400)
 
 def get_file_url(filename):
-    r2_public = os.environ.get('R2_PUBLIC_URL', '').rstrip('/')
-    if r2_public:
-        return f"{r2_public}/{filename}"
     host = request.headers.get('Host')
-    protocol = 'https' if 'onrender' in host or 'moodsync' in host else 'http'
-    return f"{protocol}://{host}/uploads/{filename}"
+    protocol = 'https' if 'onrender' in (host or '') or 'moodsync' in (host or '') else 'http'
+    return f"{protocol}://{host}/api/audio/{filename}"
 
 # --- Routes ---
 
@@ -154,6 +175,37 @@ def serve_file(filename):
     response = send_from_directory(UPLOAD_FOLDER, filename)
     response.headers['Access-Control-Allow-Origin'] = '*'
     return response
+
+@app.route('/api/audio/<path:filename>')
+def proxy_audio(filename):
+    """Stream audio from R2 through Flask so CORS headers are present regardless of bucket settings."""
+    import requests as req
+    r2_public = os.environ.get('R2_PUBLIC_URL', '').rstrip('/')
+    if not r2_public:
+        return serve_file(filename)
+    url = f"{r2_public}/{filename}"
+    range_header = request.headers.get('Range')
+    headers = {'User-Agent': 'Mozilla/5.0'}
+    if range_header:
+        headers['Range'] = range_header
+    try:
+        upstream = req.get(url, headers=headers, stream=True, timeout=10)
+        def generate():
+            for chunk in upstream.iter_content(chunk_size=65536):
+                if chunk:
+                    yield chunk
+        resp_headers = {
+            'Content-Type': upstream.headers.get('Content-Type', 'audio/mpeg'),
+            'Accept-Ranges': 'bytes',
+            'Access-Control-Allow-Origin': '*',
+        }
+        for h in ('Content-Length', 'Content-Range'):
+            if h in upstream.headers:
+                resp_headers[h] = upstream.headers[h]
+        return Response(stream_with_context(generate()), status=upstream.status_code, headers=resp_headers)
+    except Exception as e:
+        logger.error(f"Audio proxy error: {e}")
+        return jsonify({'error': 'Audio unavailable'}), 502
 
 @app.route('/generate', methods=['POST', 'OPTIONS'])
 def generate():
@@ -277,7 +329,7 @@ def add_yt(code_in):
 
         # If R2 is configured, check if already uploaded (avoid re-download)
         if r2_public and r2_exists(filename):
-            audio_url = f"{r2_public}/{filename}"
+            audio_url = get_file_url(filename)
         else:
             # Download to local disk first
             if not os.path.exists(local_path):
@@ -305,7 +357,7 @@ def add_yt(code_in):
             # Upload to R2 if configured, then clean up local copy
             r2_url = r2_upload(local_path, filename)
             if r2_url:
-                audio_url = r2_url
+                audio_url = get_file_url(filename)
                 try: os.remove(local_path)
                 except: pass
             else:
