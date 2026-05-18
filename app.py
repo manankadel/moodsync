@@ -322,61 +322,32 @@ def add_yt(code_in):
     if rd.get('admin_uuid') != uuid and not rd['current_state'].get('isCollaborative'):
         return jsonify({'error': 'Permission Denied'}), 403
 
-    socketio.emit('status_update', {'message': f"Downloading {data['title']}..."}, to=room)
     try:
         vid = data['id']
-        filename = f"{vid}.mp3"
-        local_path = os.path.join(UPLOAD_FOLDER, filename)
-        r2_public = os.environ.get('R2_PUBLIC_URL', '').rstrip('/')
-        audio_url = None
-
-        # If R2 is configured, check if already uploaded (avoid re-download)
-        if r2_public and r2_exists(filename):
-            audio_url = f"{r2_public}/{filename}"
-        else:
-            # Download to local disk first
-            if not os.path.exists(local_path):
+        # Resolve duration if not supplied. Search results don't include it; URL-paste does.
+        duration = data.get('duration')
+        if not duration:
+            try:
                 cookies_path = _get_cookies_path()
-                downloaded = False
-
-                # Cookies present → yt-dlp directly is the reliable path
-                if cookies_path:
-                    downloaded = _ytdlp_download(vid, local_path, cookies_path)
-                    if not downloaded:
-                        logger.warning("yt-dlp with cookies failed — cookies may be stale")
-
-                # No cookies (or cookies failed) → try community proxies
-                if not downloaded:
-                    if _cobalt_download(vid, local_path):
-                        downloaded = True
-                    else:
-                        stream_url = _get_piped_audio(vid) or _get_invidious_audio(vid)
-                        if stream_url:
-                            mp3_tmp = _download_stream(stream_url)
-                            shutil.move(mp3_tmp, local_path)
-                            downloaded = True
-
-                # Final fallback: yt-dlp without cookies (usually fails on datacenter IPs)
-                if not downloaded:
-                    logger.warning("All methods failed, attempting bare yt-dlp")
-                    if not _ytdlp_download(vid, local_path, None):
-                        raise RuntimeError("Could not download audio — all methods failed (cookies may be expired)")
-            # Upload to R2 if configured, then clean up local copy
-            r2_url = r2_upload(local_path, filename)
-            if r2_url:
-                audio_url = r2_url
-                try: os.remove(local_path)
-                except: pass
-            else:
-                audio_url = get_file_url(filename)
+                opts = {'quiet': True, 'skip_download': True, 'nocheckcertificate': True,
+                        'extractor_args': {'youtube': {'player_client': ['tv'] if cookies_path else ['ios']}}}
+                if cookies_path: opts['cookiefile'] = cookies_path
+                with yt_dlp.YoutubeDL(opts) as ydl:
+                    info = ydl.extract_info(f"https://www.youtube.com/watch?v={vid}", download=False)
+                    duration = info.get('duration')
+            except Exception as e:
+                logger.warning(f"Could not resolve duration for {vid}: {e}")
 
         lrc = fetch_lyrics(data['title'], data.get('artist', ''))
-        add_track_logic(room, rd, data['title'], data['artist'], audio_url, data['thumbnail'], lrc)
-        socketio.emit('status_update', {'message': None}, to=room)
+        add_track_logic(
+            room, rd, data['title'], data['artist'],
+            url=None, art=data.get('thumbnail'), lyrics=lrc,
+            video_id=vid, duration=duration,
+        )
         return jsonify({'success': True})
     except Exception as e:
-        logger.error(f"Download Error: {e}")
-        socketio.emit('status_update', {'message': "Download failed", 'error': True}, to=room)
+        logger.error(f"add_yt error: {e}")
+        socketio.emit('status_update', {'message': "Couldn't add track", 'error': True}, to=room)
         return jsonify({'error': str(e)}), 500
 
 @app.route('/api/room/<code_in>/add-upload', methods=['POST', 'OPTIONS'])
@@ -405,12 +376,13 @@ def fetch_lyrics(title, artist=''):
         logger.debug(f"Lyrics fetch skipped: {e}")
     return None
 
-def add_track_logic(room_code, rd, title, artist, url, art, lyrics):
+def add_track_logic(room_code, rd, title, artist, url, art, lyrics, video_id=None, duration=None):
     key = f"room:{room_code}"
     with r.lock(f"lock:{key}", timeout=5):
         fresh_rd = json.loads(safe_get(key))
         fresh_rd['playlist'].append({
-            'name': title, 'artist': artist, 'audioUrl': url, 'albumArt': art, 'lyrics': lyrics
+            'name': title, 'artist': artist, 'audioUrl': url, 'albumArt': art,
+            'lyrics': lyrics, 'videoId': video_id, 'duration': duration,
         })
         if len(fresh_rd['playlist']) == 1:
             start_time = time.time() + 2.0

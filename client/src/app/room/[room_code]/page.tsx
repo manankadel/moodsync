@@ -2,7 +2,7 @@
 
 import { useParams } from 'next/navigation';
 import Link from 'next/link';
-import { useEffect, useState, memo, Suspense } from 'react';
+import { useEffect, useState, useRef, memo, Suspense } from 'react';
 import { motion, AnimatePresence } from 'framer-motion';
 import Player from '@/components/player';
 import { useRoomStore } from '@/lib/room-store';
@@ -56,39 +56,26 @@ const SettingsModal = ({ onClose }: { onClose: () => void }) => {
 };
 
 const InteractionOverlay = () => {
-    const { needsInteraction, setNeedsInteraction, audioElement } = useRoomStore();
+    const { needsInteraction, setNeedsInteraction, player } = useRoomStore();
     const [isAttempting, setIsAttempting] = useState(false);
-    
+
     if (!needsInteraction) return null;
-    
+
     const handleUnlock = async () => {
-        if (isAttempting || !audioElement) return;
-        
+        if (isAttempting || !player) return;
         setIsAttempting(true);
-        
+
         try {
             const audioCtx = new (window.AudioContext || (window as any).webkitAudioContext)();
-            
-            if (audioCtx.state === 'suspended') {
-                await audioCtx.resume();
+            if (audioCtx.state === 'suspended') await audioCtx.resume();
+
+            try {
+                await player.play();
+                setTimeout(() => player.pause(), 100);
+            } catch (e: any) {
+                if (e.name !== 'AbortError') console.error('[TAP] Play error:', e);
             }
-            
-            if (audioElement && audioElement.src) {
-                try {
-                    const playPromise = audioElement.play();
-                    if (playPromise instanceof Promise) {
-                        await playPromise;
-                        setTimeout(() => {
-                            audioElement.pause();
-                        }, 100);
-                    }
-                } catch (e: any) {
-                    if (e.name !== 'AbortError') {
-                        console.error('[TAP] Play error:', e);
-                    }
-                }
-            }
-            
+
             setNeedsInteraction(false);
         } catch (error) {
             console.error('[TAP] Unlock error:', error);
@@ -208,7 +195,12 @@ function RoomPageContent() {
   const [showSettingsModal, setShowSettingsModal] = useState(false);
   const [viewMode, setViewMode] = useState<'playlist' | 'lyrics'>('playlist');
 
-  const { setRoomData, setLoading, setError, connect, disconnect, primePlayer } = useRoomStore.getState();
+  const { setRoomData, setLoading, setError, connect, disconnect, primePlayer, initPlayer } = useRoomStore.getState();
+  const playerHostRef = useRef<HTMLDivElement>(null);
+
+  useEffect(() => {
+    if (playerHostRef.current) initPlayer(playerHostRef.current);
+  }, [initPlayer]);
   const state = useRoomStore(s => ({
     isLoading: s.isLoading, error: s.error,
     playlist: s.playlist, currentTrackIndex: s.currentTrackIndex, playlistTitle: s.playlistTitle,
@@ -341,6 +333,7 @@ function RoomPageContent() {
             />
         )}
       </AnimatePresence>
+      <div ref={playerHostRef} className="hidden" aria-hidden />
       <InteractionOverlay />
       <AnimatePresence>{state.isDisconnected && <DisconnectedOverlay />}</AnimatePresence>
       <FileUploadModal isOpen={showUploadModal} onClose={() => setShowUploadModal(false)} />

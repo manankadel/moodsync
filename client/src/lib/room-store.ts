@@ -1,5 +1,6 @@
 import { createWithEqualityFn } from 'zustand/traditional';
 import { io, Socket } from 'socket.io-client';
+import { PlayerController } from './player-controller';
 
 const API_URL = process.env.NEXT_PUBLIC_API_URL;
 
@@ -7,9 +8,10 @@ if (!API_URL) {
     console.error("CRITICAL: NEXT_PUBLIC_API_URL is missing. Please set it in Vercel.");
 }
 
-export interface Song { 
-    name: string; artist: string; isUpload: boolean; 
+export interface Song {
+    name: string; artist: string; isUpload?: boolean;
     audioUrl: string | null; albumArt: string | null; lyrics?: string | null;
+    videoId?: string | null; duration?: number | null;
 }
 
 interface AudioNodes {
@@ -21,8 +23,9 @@ interface AudioNodes {
 }
 
 interface RoomState {
-    socket: Socket | null; 
-    audioElement: HTMLAudioElement | null;
+    socket: Socket | null;
+    player: PlayerController | null;
+    audioElement: HTMLAudioElement | null;  // kept for Web Audio EQ routing on upload tracks
     playlist: Song[]; 
     currentTrackIndex: number; 
     isPlaying: boolean; 
@@ -52,6 +55,7 @@ interface RoomState {
     // Actions
     connect: (code: string, name: string) => void;
     disconnect: () => void;
+    initPlayer: (container: HTMLElement) => void;
     primePlayer: () => void;
     setRoomData: (data: any) => void;
     setLoading: (l: boolean) => void;
@@ -93,7 +97,8 @@ let isActuallyPlaying = false;
 
 export const useRoomStore = createWithEqualityFn<RoomState>()((set, get) => ({
     socket: null,
-    audioElement: (typeof window !== 'undefined') ? new Audio() : null,
+    player: null,
+    audioElement: null,
     playlist: [], currentTrackIndex: 0, isPlaying: false, 
     roomCode: '', playlistTitle: '', users: [], username: '',
     isAdmin: false, volume: 80, isLoading: false, 
@@ -156,25 +161,20 @@ export const useRoomStore = createWithEqualityFn<RoomState>()((set, get) => ({
         });
 
         const handleState = (state: any) => {
-            const { audioElement, currentTrackIndex, playlist } = get();
-            
-            // Mark sync as active
-            set({ lastSyncTime: Date.now() });
+            const { player, currentTrackIndex } = get();
 
-            if (!audioElement) return;
+            set({ lastSyncTime: Date.now() });
+            if (!player) return;
 
             if (state.isCollaborative !== undefined) set({ isCollaborative: state.isCollaborative });
 
             if (state.trackIndex !== undefined) {
                 const freshPlaylist = get().playlist;
                 const track = freshPlaylist[state.trackIndex];
-                const srcMissing = !audioElement.src;
-                if (state.trackIndex !== currentTrackIndex || srcMissing) {
+                const sourceMissing = player.activeSource === 'none';
+                if (state.trackIndex !== currentTrackIndex || sourceMissing) {
                     set({ currentTrackIndex: state.trackIndex });
-                    if (track?.audioUrl) {
-                        audioElement.src = track.audioUrl;
-                        audioElement.load();
-                    }
+                    if (track) player.loadTrack(track);
                     get().updateMediaSession();
                 }
             }
@@ -182,10 +182,10 @@ export const useRoomStore = createWithEqualityFn<RoomState>()((set, get) => ({
             if (state.isPlaying !== undefined) {
                 isActuallyPlaying = state.isPlaying;
                 set({ isPlaying: state.isPlaying });
-                
+
                 if (!state.isPlaying) {
-                    audioElement.pause();
-                    audioElement.playbackRate = 1.0;
+                    player.pause();
+                    player.playbackRate = 1.0;
                     lastKnownServerStart = null;
                 }
             }
@@ -195,7 +195,7 @@ export const useRoomStore = createWithEqualityFn<RoomState>()((set, get) => ({
             }
 
             if (state.volume !== undefined) {
-                audioElement.volume = state.volume / 100;
+                player.volume = state.volume / 100;
                 set({ volume: state.volume });
             }
         };
@@ -221,7 +221,7 @@ export const useRoomStore = createWithEqualityFn<RoomState>()((set, get) => ({
 
     disconnect: () => {
         get().socket?.disconnect();
-        get().audioElement?.pause();
+        get().player?.pause();
         if (syncInterval) clearInterval(syncInterval);
         if (ntpInterval) clearInterval(ntpInterval);
         set({ socket: null });
@@ -240,36 +240,38 @@ export const useRoomStore = createWithEqualityFn<RoomState>()((set, get) => ({
                 set({ isPlaying: data.current_state.isPlaying });
             }
         }
-        // Set audio src if it isn't loaded yet (handles joining a room that already has a song)
-        const audio = get().audioElement;
+        const player = get().player;
         const trackIdx = data.current_state?.trackIndex ?? 0;
         const track = data.playlist?.[trackIdx];
-        if (audio && track?.audioUrl && !audio.src) {
+        if (player && track && player.activeSource === 'none') {
             set({ currentTrackIndex: trackIdx });
-            audio.src = track.audioUrl;
-            audio.load();
+            player.loadTrack(track);
         }
     },
 
-    primePlayer: () => {
-        const audio = get().audioElement;
-        if (!audio) return;
-        
-        audio.crossOrigin = "anonymous";
-        audio.ontimeupdate = () => set({ currentTime: audio.currentTime });
-        
-        audio.onloadedmetadata = () => {
-            set({ duration: audio.duration });
+    initPlayer: (container: HTMLElement) => {
+        if (get().player) return;
+        const player = new PlayerController(container);
+        const audio = player.audioElement;
+
+        player.on('timeupdate', () => set({ currentTime: player.currentTime }));
+        player.on('loadedmetadata', () => {
+            set({ duration: player.duration });
             get().updateMediaSession();
-        };
-        
-        audio.onended = () => { if (get().isAdmin) get().nextTrack(); };
+        });
+        player.on('ended', () => { if (get().isAdmin) get().nextTrack(); });
+
+        set({ player, audioElement: audio });
+    },
+
+    primePlayer: () => {
+        const { player } = get();
+        if (!player) return;
+        const audio = player.audioElement;
 
         if (typeof window !== 'undefined' && window.AudioContext) {
             const audioContext = new (window.AudioContext || (window as any).webkitAudioContext)();
-            if (audioContext.state === 'suspended') {
-                audioContext.resume().catch(() => {});
-            }
+            if (audioContext.state === 'suspended') audioContext.resume().catch(() => {});
 
             try {
                 if (!get().audioNodes.context) {
@@ -292,57 +294,62 @@ export const useRoomStore = createWithEqualityFn<RoomState>()((set, get) => ({
             } catch (e) { console.error("Audio nodes setup error:", e); }
         }
 
-        audio.play().then(() => { 
-            if (!isActuallyPlaying) audio.pause(); 
-            set({ needsInteraction: false }); 
-        })
-        .catch(() => set({ needsInteraction: true }));
+        // Best-effort unlock via the audio element. The YT iframe unlocks on first playVideo() call.
+        audio.play().then(() => {
+            if (!isActuallyPlaying) audio.pause();
+            set({ needsInteraction: false });
+        }).catch(() => set({ needsInteraction: true }));
     },
 
     syncLoop: () => {
-        const { audioElement, clockOffset, isSeeking } = get();
-        if (!audioElement || !isActuallyPlaying || !lastKnownServerStart || isSeeking) return;
+        const { player, clockOffset, isSeeking } = get();
+        if (!player || !isActuallyPlaying || !lastKnownServerStart || isSeeking) return;
 
         const serverNow = (Date.now() + clockOffset) / 1000;
         const expectedTime = serverNow - lastKnownServerStart;
-        const actualTime = audioElement.currentTime;
+        const actualTime = player.currentTime;
         const diff = expectedTime - actualTime;
+        const isYT = player.activeSource === 'yt';
 
         set({ currentTime: actualTime });
 
-        if (expectedTime >= audioElement.duration && audioElement.duration > 0) {
+        if (expectedTime >= player.duration && player.duration > 0) {
             if (get().isAdmin) get().nextTrack();
             return;
         }
 
-        if (audioElement.paused) {
-            if (expectedTime > 0 && expectedTime < (audioElement.duration || 1000)) {
-                audioElement.currentTime = expectedTime;
-                audioElement.play().catch(() => set({ needsInteraction: true }));
+        if (player.paused) {
+            if (expectedTime > 0 && expectedTime < (player.duration || 1000)) {
+                player.currentTime = expectedTime;
+                player.play().catch(() => set({ needsInteraction: true }));
             }
             return;
         }
 
-        if (Math.abs(diff) > 2.0) {
-            audioElement.currentTime = expectedTime;
-        } else if (diff > 0.15) {
-            if (audioElement.playbackRate !== 1.05) audioElement.playbackRate = 1.05;
-        } else if (diff < -0.15) {
-            if (audioElement.playbackRate !== 0.95) audioElement.playbackRate = 0.95;
-        } else {
-            if (audioElement.playbackRate !== 1.0) audioElement.playbackRate = 1.0;
+        // YT can't do micro rate-adjust → use a tighter seek-only threshold.
+        const seekThreshold = isYT ? 0.5 : 2.0;
+        if (Math.abs(diff) > seekThreshold) {
+            player.currentTime = expectedTime;
+        } else if (!isYT) {
+            if (diff > 0.15) {
+                if (player.playbackRate !== 1.05) player.playbackRate = 1.05;
+            } else if (diff < -0.15) {
+                if (player.playbackRate !== 0.95) player.playbackRate = 0.95;
+            } else if (player.playbackRate !== 1.0) {
+                player.playbackRate = 1.0;
+            }
         }
     },
 
     playPause: () => {
-        const { isPlaying, isAdmin, audioElement, clockOffset } = get();
-        if (!isAdmin || !audioElement) return;
+        const { isPlaying, isAdmin, player, clockOffset } = get();
+        if (!isAdmin || !player) return;
 
         if (isPlaying) {
-            get()._emitStateUpdate({ isPlaying: false, pausedAt: audioElement.currentTime });
+            get()._emitStateUpdate({ isPlaying: false, pausedAt: player.currentTime });
         } else {
             const serverNow = (Date.now() + clockOffset) / 1000;
-            const startTimestamp = (serverNow + 0.5) - audioElement.currentTime;
+            const startTimestamp = (serverNow + 0.5) - player.currentTime;
             get()._emitStateUpdate({ isPlaying: true, startTimestamp });
         }
     },
@@ -394,7 +401,7 @@ export const useRoomStore = createWithEqualityFn<RoomState>()((set, get) => ({
         }
     },
     prevTrack: () => { const p = get().playlist; if (p.length) get().selectTrack((get().currentTrackIndex - 1 + p.length) % p.length); },
-    setVolume: (v) => { set({ volume: v }); if (get().audioElement) get().audioElement!.volume = v / 100; },
+    setVolume: (v) => { set({ volume: v }); const p = get().player; if (p) p.volume = v / 100; },
     removeTrack: (index) => {
         if (!get().isAdmin) return;
         get().socket?.emit('remove_track', { room_code: get().roomCode, track_index: index });

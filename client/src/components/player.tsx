@@ -27,7 +27,7 @@ export default function Player({
     
     const {
         currentTime, isAdmin, isSeeking, setIsSeeking, _emitStateUpdate,
-        audioElement, statusMessage, clockOffset, lastSyncTime,
+        player, statusMessage, clockOffset, lastSyncTime,
         repeatMode, isShuffle, toggleRepeat, toggleShuffle,
     } = useRoomStore();
     
@@ -36,22 +36,12 @@ export default function Player({
     const [driftWarning, setDriftWarning] = useState<string | null>(null);
 
     useEffect(() => {
-        if (!audioElement) return;
-        
-        const onWaiting = () => setIsBuffering(true);
-        const onPlaying = () => setIsBuffering(false);
-        const onCanPlay = () => setIsBuffering(false);
-        
-        audioElement.addEventListener('waiting', onWaiting);
-        audioElement.addEventListener('playing', onPlaying);
-        audioElement.addEventListener('canplay', onCanPlay);
-        
-        return () => {
-            audioElement.removeEventListener('waiting', onWaiting);
-            audioElement.removeEventListener('playing', onPlaying);
-            audioElement.removeEventListener('canplay', onCanPlay);
-        };
-    }, [audioElement]);
+        if (!player) return;
+        const offW = player.on('waiting', () => setIsBuffering(true));
+        const offP = player.on('playing', () => setIsBuffering(false));
+        const offC = player.on('canplay', () => setIsBuffering(false));
+        return () => { offW(); offP(); offC(); };
+    }, [player]);
 
     useEffect(() => { 
         if (!isSeeking) {
@@ -60,39 +50,33 @@ export default function Player({
     }, [currentTime, duration, isSeeking]);
 
     useEffect(() => {
-        if (!isPlaying || !audioElement) {
+        if (!isPlaying || !player) {
             setDriftWarning(null);
             return;
         }
 
         const driftCheck = setInterval(() => {
             const timeSinceLastSync = Date.now() - lastSyncTime;
-            
-            // INCREASED THRESHOLD: NTP runs every 5000ms, so we warn if > 6000ms
-            if (timeSinceLastSync > 6000) {
-                setDriftWarning('Syncing...');
-            } else {
-                setDriftWarning(null);
-            }
+            if (timeSinceLastSync > 6000) setDriftWarning('Syncing...');
+            else setDriftWarning(null);
         }, 500);
 
         return () => clearInterval(driftCheck);
-    }, [isPlaying, audioElement, lastSyncTime]);
+    }, [isPlaying, player, lastSyncTime]);
 
     const handleSeekEnd = (e: React.MouseEvent<HTMLInputElement>) => {
-        if (!isAdmin || !audioElement) return;
-        
+        if (!isAdmin || !player) return;
+
         const seekTime = (Number(e.currentTarget.value) / 100) * duration;
-        
-        audioElement.currentTime = seekTime;
-        // Production sync: Send timestamp relative to server time
+
+        player.currentTime = seekTime;
         const serverNow = (Date.now() + clockOffset) / 1000;
         const startTimestamp = serverNow - seekTime;
 
         _emitStateUpdate({
             currentTime: seekTime,
             isPlaying,
-            startTimestamp: startTimestamp,
+            startTimestamp,
             pausedAt: isPlaying ? undefined : seekTime,
         });
         setIsSeeking(false);
