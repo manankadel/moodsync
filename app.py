@@ -482,7 +482,7 @@ def _ytdlp_download(video_id, output_path, cookies_path):
         'postprocessors': [{'key': 'FFmpegExtractAudio', 'preferredcodec': 'mp3'}],
         'quiet': True,
         'nocheckcertificate': True,
-        'extractor_args': {'youtube': {'player_client': ['tv', 'mweb', 'web_safari'] if cookies_path else ['ios']}},
+        'extractor_args': {'youtube': {'player_client': ['tv'] if cookies_path else ['ios']}},
     }
     if cookies_path:
         dl_opts['cookiefile'] = cookies_path
@@ -756,7 +756,7 @@ def yt_info():
         cookies_path = _get_cookies_path()
         opts = {
             'quiet': True, 'skip_download': True, 'nocheckcertificate': True,
-            'extractor_args': {'youtube': {'player_client': ['tv', 'mweb', 'web_safari'] if cookies_path else ['ios']}},
+            'extractor_args': {'youtube': {'player_client': ['tv'] if cookies_path else ['ios']}},
         }
         if cookies_path:
             opts['cookiefile'] = cookies_path
