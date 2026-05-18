@@ -164,9 +164,12 @@ def safe_set(key, val):
     if r: r.set(key, val, ex=86400)
 
 def get_file_url(filename):
+    r2_public = os.environ.get('R2_PUBLIC_URL', '').rstrip('/')
+    if r2_public:
+        return f"{r2_public}/{filename}"
     host = request.headers.get('Host')
     protocol = 'https' if 'onrender' in (host or '') or 'moodsync' in (host or '') else 'http'
-    return f"{protocol}://{host}/api/audio/{filename}"
+    return f"{protocol}://{host}/uploads/{filename}"
 
 # --- Routes ---
 
@@ -329,7 +332,7 @@ def add_yt(code_in):
 
         # If R2 is configured, check if already uploaded (avoid re-download)
         if r2_public and r2_exists(filename):
-            audio_url = get_file_url(filename)
+            audio_url = f"{r2_public}/{filename}"
         else:
             # Download to local disk first
             if not os.path.exists(local_path):
@@ -357,7 +360,7 @@ def add_yt(code_in):
             # Upload to R2 if configured, then clean up local copy
             r2_url = r2_upload(local_path, filename)
             if r2_url:
-                audio_url = get_file_url(filename)
+                audio_url = r2_url
                 try: os.remove(local_path)
                 except: pass
             else:
