@@ -165,13 +165,18 @@ export const useRoomStore = createWithEqualityFn<RoomState>()((set, get) => ({
 
             if (state.isCollaborative !== undefined) set({ isCollaborative: state.isCollaborative });
 
-            if (state.trackIndex !== undefined && state.trackIndex !== currentTrackIndex) {
-                set({ currentTrackIndex: state.trackIndex });
-                if (playlist[state.trackIndex]?.audioUrl) {
-                    audioElement.src = playlist[state.trackIndex].audioUrl!;
-                    audioElement.load();
+            if (state.trackIndex !== undefined) {
+                const freshPlaylist = get().playlist;
+                const track = freshPlaylist[state.trackIndex];
+                const srcMissing = !audioElement.src;
+                if (state.trackIndex !== currentTrackIndex || srcMissing) {
+                    set({ currentTrackIndex: state.trackIndex });
+                    if (track?.audioUrl) {
+                        audioElement.src = track.audioUrl;
+                        audioElement.load();
+                    }
+                    get().updateMediaSession();
                 }
-                get().updateMediaSession();
             }
 
             if (state.isPlaying !== undefined) {
@@ -234,6 +239,15 @@ export const useRoomStore = createWithEqualityFn<RoomState>()((set, get) => ({
                 isActuallyPlaying = data.current_state.isPlaying;
                 set({ isPlaying: data.current_state.isPlaying });
             }
+        }
+        // Set audio src if it isn't loaded yet (handles joining a room that already has a song)
+        const audio = get().audioElement;
+        const trackIdx = data.current_state?.trackIndex ?? 0;
+        const track = data.playlist?.[trackIdx];
+        if (audio && track?.audioUrl && !audio.src) {
+            set({ currentTrackIndex: trackIdx });
+            audio.src = track.audioUrl;
+            audio.load();
         }
     },
 
